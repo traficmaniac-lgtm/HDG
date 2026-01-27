@@ -488,7 +488,9 @@ class MainWindow(QMainWindow):
         self.request_set_strategy.connect(self.trade_engine.set_strategy)
         self.request_set_connection.connect(self.trade_engine.set_connection)
         self.request_end_cooldown.connect(self.trade_engine.end_cooldown)
-        self.request_ui_heartbeat.connect(self.trade_engine.update_ui_heartbeat)
+        self.request_ui_heartbeat.connect(
+            self.trade_engine.update_ui_heartbeat, Qt.ConnectionType.DirectConnection
+        )
         self.request_on_tick.connect(self.trade_engine.on_tick)
 
         self.trade_engine.tick_update.connect(self.on_price_update)

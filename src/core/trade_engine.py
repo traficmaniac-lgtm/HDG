@@ -49,6 +49,7 @@ class TradeEngine(QObject):
             emit_exposure=self._emit_exposure_status,
         )
         self._watchdog_stop = threading.Event()
+        self._heartbeat_lock = threading.Lock()
         self._ui_heartbeat = time.monotonic()
         self._watchdog_thread = threading.Thread(
             target=self._watchdog_loop, name="gui-watchdog", daemon=True
@@ -62,7 +63,8 @@ class TradeEngine(QObject):
 
     @Slot(float)
     def update_ui_heartbeat(self, timestamp: float) -> None:
-        self._ui_heartbeat = timestamp
+        with self._heartbeat_lock:
+            self._ui_heartbeat = timestamp
 
     @Slot(dict)
     def on_tick(self, payload: dict) -> None:
@@ -243,7 +245,9 @@ class TradeEngine(QObject):
     def _watchdog_loop(self) -> None:
         while not self._watchdog_stop.is_set():
             time.sleep(2.0)
-            lag = time.monotonic() - self._ui_heartbeat
+            with self._heartbeat_lock:
+                heartbeat = self._ui_heartbeat
+            lag = time.monotonic() - heartbeat
             if lag > 2.0:
                 dump = self._dump_threads()
                 self._emit_log("ERROR", "ERROR", "Фриз GUI", lag_s=f"{lag:.2f}", dump=dump)
