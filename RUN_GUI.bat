@@ -42,8 +42,23 @@ if %errorlevel% neq 0 (
 )
 
 echo [INFO] Starting GUI...
-.venv\Scripts\python.exe -m src.app.main
+set "LOG_FILE=%~dp0run_gui.log"
+if exist "%LOG_FILE%" del /f /q "%LOG_FILE%" >nul 2>&1
 
-echo [INFO] GUI exited.
+echo [INFO] Logs will be written to: %LOG_FILE%
+.venv\Scripts\python.exe -m src.app.main 1>"%LOG_FILE%" 2>&1
+set "EXIT_CODE=%errorlevel%"
+
+if not "%EXIT_CODE%"=="0" (
+  echo [ERROR] GUI failed to стартовать. Exit code: %EXIT_CODE%
+  echo [ERROR] Last output:
+  type "%LOG_FILE%"
+  echo.
+  echo [INFO] Full log: %LOG_FILE%
+  pause
+  exit /b %EXIT_CODE%
+)
+
+echo [INFO] GUI exited successfully.
 pause
 endlocal
