@@ -66,6 +66,23 @@ class BinanceRestClient:
         except Exception:
             return None
 
+    def place_order_margin(self, payload: dict[str, Any]) -> Optional[dict[str, Any]]:
+        return self.place_margin_order(payload)
+
+    def get_order(self, symbol: str, order_id: int) -> Optional[dict[str, Any]]:
+        payload = {"symbol": symbol, "orderId": order_id}
+        return self._signed_get(self.spot_base_url, "/sapi/v1/margin/order", payload)
+
+    def cancel_open_orders(self, symbol: str) -> None:
+        orders = self.get_open_margin_orders(symbol) or []
+        for order in orders:
+            order_id = order.get("orderId")
+            if order_id:
+                self.cancel_margin_order(symbol, int(order_id))
+
+    def margin_account(self) -> Optional[dict[str, Any]]:
+        return self.get_margin_account()
+
     def get_depth(self, symbol: str, limit: int = 20) -> Optional[dict[str, Any]]:
         try:
             resp = self._client.get(
@@ -101,35 +118,55 @@ class BinanceRestClient:
             return None
         self.last_error = None
         self.last_error_code = None
-        signed_params = {
-            **params,
-            "timestamp": int(time.time() * 1000),
-            "recvWindow": 5000,
-        }
-        query_string = "&".join(f"{key}={value}" for key, value in signed_params.items())
-        signature = hmac.new(
-            self.api_secret.encode("utf-8"),
-            query_string.encode("utf-8"),
-            hashlib.sha256,
-        ).hexdigest()
-        signed_params["signature"] = signature
-        headers = {"X-MBX-APIKEY": self.api_key}
-        try:
-            resp = self._client.request(
-                method, f"{base_url}{path}", params=signed_params, headers=headers
+        retries = 2
+        for attempt in range(retries + 1):
+            signed_params = {
+                **params,
+                "timestamp": int(time.time() * 1000),
+                "recvWindow": 5000,
+            }
+            query_string = "&".join(
+                f"{key}={value}" for key, value in signed_params.items()
             )
-            resp.raise_for_status()
-            return resp.json()
-        except httpx.HTTPStatusError as exc:
+            signature = hmac.new(
+                self.api_secret.encode("utf-8"),
+                query_string.encode("utf-8"),
+                hashlib.sha256,
+            ).hexdigest()
+            signed_params["signature"] = signature
+            headers = {"X-MBX-APIKEY": self.api_key}
             try:
-                payload = exc.response.json()
-                self.last_error_code = int(payload.get("code")) if "code" in payload else None
-                self.last_error = str(payload.get("msg", "HTTP error"))
-            except Exception:
+                resp = self._client.request(
+                    method, f"{base_url}{path}", params=signed_params, headers=headers
+                )
+                resp.raise_for_status()
+                return resp.json()
+            except httpx.HTTPStatusError as exc:
+                status = exc.response.status_code
+                try:
+                    payload = exc.response.json()
+                    self.last_error_code = (
+                        int(payload.get("code")) if "code" in payload else None
+                    )
+                    self.last_error = str(payload.get("msg", "HTTP error"))
+                except Exception:
+                    self.last_error = str(exc)
+                    self.last_error_code = None
+                if self.last_error_code == -1021:
+                    continue
+                if status >= 500 and attempt < retries:
+                    time.sleep(0.2 * (attempt + 1))
+                    continue
+                return None
+            except httpx.RequestError as exc:
                 self.last_error = str(exc)
                 self.last_error_code = None
-            return None
-        except Exception as exc:
-            self.last_error = str(exc)
-            self.last_error_code = None
-            return None
+                if attempt < retries:
+                    time.sleep(0.2 * (attempt + 1))
+                    continue
+                return None
+            except Exception as exc:
+                self.last_error = str(exc)
+                self.last_error_code = None
+                return None
+        return None

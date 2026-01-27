@@ -7,7 +7,11 @@ from typing import Optional
 class BotState(str, Enum):
     IDLE = "IDLE"
     READY = "READY"
-    RUNNING = "RUNNING"
+    ENTERING = "ENTERING"
+    DETECTING = "DETECTING"
+    CUT_LOSER = "CUT_LOSER"
+    HOLD_WINNER = "HOLD_WINNER"
+    EXIT_WINNER = "EXIT_WINNER"
     COOLDOWN = "COOLDOWN"
     ERROR = "ERROR"
 
@@ -33,19 +37,32 @@ class BotStateMachine:
 
     def start_cycle(self) -> bool:
         if self.state == BotState.READY:
-            self.state = BotState.RUNNING
+            self.state = BotState.ENTERING
             self.active_cycle = True
             self.cycle_id += 1
             return True
         return False
 
     def stop(self) -> None:
-        if self.state in {BotState.RUNNING, BotState.COOLDOWN}:
+        if self.state in {
+            BotState.ENTERING,
+            BotState.DETECTING,
+            BotState.CUT_LOSER,
+            BotState.HOLD_WINNER,
+            BotState.EXIT_WINNER,
+            BotState.COOLDOWN,
+        }:
             self.state = BotState.READY
             self.active_cycle = False
 
     def finish_cycle(self) -> None:
-        if self.state == BotState.RUNNING:
+        if self.state in {
+            BotState.ENTERING,
+            BotState.DETECTING,
+            BotState.CUT_LOSER,
+            BotState.HOLD_WINNER,
+            BotState.EXIT_WINNER,
+        }:
             self.state = BotState.COOLDOWN
             self.active_cycle = False
 

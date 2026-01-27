@@ -40,6 +40,11 @@ class StrategyParams:
     fee_total_bps: float = 7.0
     target_net_bps: int = 10
     max_spread_bps: float = 8.0
+    min_tick_rate: int = 5
+    detect_timeout_ms: int = 800
+    impulse_min_bps: float = 1.0
+    winner_threshold_bps_raw: float = 1.0
+    emergency_stop_bps: int = 10
     cooldown_s: int = 3
     direction_detect_window_ticks: int = 2
     burst_volume_threshold: float = 0.0

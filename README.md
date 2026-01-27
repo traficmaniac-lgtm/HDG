@@ -1,13 +1,14 @@
-# Directional Hedge Scalper — v0.2.1 (Cross Margin + Live Micro-Trade)
+# Directional Hedge Scalper — v0.3.0 (Cross Margin + Hedge Scalping)
 
-This repository contains the v0.2.1 GUI for the Directional Hedge Scalper. Live micro-trade (Cross Margin) is available when **LIVE ENABLED** is turned on.
+This repository contains the v0.3.0 GUI for the Directional Hedge Scalper. The bot runs a full hedge scalping cycle on Cross Margin when **LIVE ENABLED** is turned on.
 
-## What’s new in v0.2.1
+## What’s new in v0.3.0
 
-- Cross Margin only mode (no Spot/Futures selector).
-- Spot + Cross Margin USDT balance display with periodic refresh.
-- Live micro-trade execution (market/aggressive_limit) for $20 notional when LIVE ENABLED is on.
-- Borrow-based leverage target selector (1x–3x).
+- Full directional hedge scalping cycle: BUY + SELL market entry, cut the loser fast, hold the winner to target.
+- New impulse filters (spread, tick rate, impulse move) to avoid flat entries.
+- Auto-loop cycle support with cooldown timers.
+- Trade engine moved to a worker thread to keep the GUI responsive.
+- GUI localized to Russian.
 
 ## Requirements
 
@@ -40,4 +41,4 @@ python -m src.app.main
 ## Notes
 
 - Live trading is **OFF by default**. Enable via **LIVE ENABLED** in Settings.
-- The simulation uses orderbook-based fills for a single-side cycle (BUY or SELL).
+- The bot sends real margin orders. Use at your own risk.
