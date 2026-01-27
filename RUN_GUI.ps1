@@ -1,8 +1,10 @@
 Set-Location $PSScriptRoot
 
 $pyCmd = $null
+$pyCmdArgs = @()
 if (Get-Command py -ErrorAction SilentlyContinue) {
-    $pyCmd = "py -3"
+    $pyCmd = "py"
+    $pyCmdArgs = @("-3")
 } elseif (Get-Command python -ErrorAction SilentlyContinue) {
     $pyCmd = "python"
 }
@@ -13,12 +15,13 @@ if (-not $pyCmd) {
     exit 1
 }
 
-Write-Host "[INFO] Using Python: $pyCmd"
+$pyCmdDisplay = if ($pyCmdArgs.Count -gt 0) { "$pyCmd $($pyCmdArgs -join ' ')" } else { $pyCmd }
+Write-Host "[INFO] Using Python: $pyCmdDisplay"
 
 $venvPython = Join-Path -Path $PSScriptRoot -ChildPath ".venv\Scripts\python.exe"
 if (-not (Test-Path $venvPython)) {
     Write-Host "[INFO] Creating virtual environment in .venv..."
-    & $pyCmd -m venv .venv
+    & $pyCmd @pyCmdArgs -m venv .venv
     if ($LASTEXITCODE -ne 0) {
         Write-Host "[ERROR] Failed to create virtual environment."
         Read-Host "Press Enter to exit"
