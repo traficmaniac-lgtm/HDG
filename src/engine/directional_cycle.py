@@ -4,7 +4,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from typing import Any, Callable, Deque, Optional
 
 from src.core.models import CycleTelemetry, MarketDataMode, StrategyParams, SymbolFilters
@@ -836,11 +836,13 @@ class DirectionalCycle:
         if bid <= 0 or ask <= 0 or tick_size <= 0:
             return None
         if side == "BUY":
-            return (ask + tick_size) * (1 + self._strategy.slip_bps / 10_000)
+            raw_price = (ask + tick_size) * (1 + self._strategy.slip_bps / 10_000)
+            return self._normalize_price(side, raw_price)
         price = bid - tick_size
         if price <= 0:
             return None
-        return price * (1 - self._strategy.slip_bps / 10_000)
+        raw_price = price * (1 - self._strategy.slip_bps / 10_000)
+        return self._normalize_price(side, raw_price)
 
     def _place_ioc_aggressive_limit(
         self, side: str, qty: float, price: float, side_effect_type: Optional[str]
@@ -1249,8 +1251,35 @@ class DirectionalCycle:
             )
             return "market", None
         if side == "BUY":
-            return order_mode, ask * (1 + self._strategy.slip_bps / 10_000)
-        return order_mode, bid * (1 - self._strategy.slip_bps / 10_000)
+            raw_price = ask * (1 + self._strategy.slip_bps / 10_000)
+        else:
+            raw_price = bid * (1 - self._strategy.slip_bps / 10_000)
+        normalized = self._normalize_price(side, raw_price)
+        if not normalized or normalized <= 0:
+            self._emit_log(
+                "ERROR",
+                "ERROR",
+                "Aggressive limit fallback to market",
+                side=side,
+                reason="invalid_limit_price",
+            )
+            return "market", None
+        return order_mode, normalized
+
+    def _normalize_price(self, side: str, price: float) -> Optional[float]:
+        tick_size = self._filters.tick_size
+        if tick_size <= 0:
+            return price
+        price_dec = Decimal(str(price))
+        tick_dec = Decimal(str(tick_size))
+        if tick_dec <= 0 or price_dec <= 0:
+            return None
+        rounding = ROUND_CEILING if side == "BUY" else ROUND_FLOOR
+        steps = (price_dec / tick_dec).to_integral_value(rounding=rounding)
+        normalized = steps * tick_dec
+        if normalized <= 0:
+            return None
+        return float(normalized)
 
     def _place_order(
         self,
