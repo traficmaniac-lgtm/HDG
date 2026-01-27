@@ -949,9 +949,9 @@ class MainWindow(QMainWindow):
             self.margin_btc_borrowed = float(btc.get("borrowed", 0.0))
 
     def _update_market_labels(self) -> None:
-        self.mid_display.display(f"{self.market_tick.mid:,.2f}")
-        self.bid_value.setText(f"{self.market_tick.bid:,.2f}")
-        self.ask_value.setText(f"{self.market_tick.ask:,.2f}")
+        self.mid_display.display(f"{self.market_tick.mid:.2f}")
+        self.bid_value.setText(f"{self.market_tick.bid:.2f}")
+        self.ask_value.setText(f"{self.market_tick.ask:.2f}")
         self.spread_value.setText(f"{self.market_tick.spread_bps:.2f}")
         if self.effective_age_ms is None:
             now = datetime.now(timezone.utc)
