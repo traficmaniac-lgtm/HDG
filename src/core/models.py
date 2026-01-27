@@ -36,6 +36,8 @@ class StrategyParams:
     order_mode: str = "market"
     sim_side: str = "BUY"
     usd_notional: float = 20.0
+    leverage_max: int = 3
+    slip_bps: float = 2.0
     max_loss_bps: int = 5
     fee_total_bps: float = 7.0
     target_net_bps: int = 10

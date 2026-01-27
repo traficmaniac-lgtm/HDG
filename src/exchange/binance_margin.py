@@ -22,11 +22,17 @@ class BinanceMarginExecution:
     def get_margin_account(self) -> Optional[dict[str, Any]]:
         return self._client.get_margin_account()
 
+    def get_spot_account(self) -> Optional[dict[str, Any]]:
+        return self._client.get_spot_account()
+
     def get_open_orders(self) -> list[dict[str, Any]]:
         return self._client.get_open_margin_orders(self.symbol) or []
 
     def cancel_open_orders(self) -> None:
         self._client.cancel_open_orders(self.symbol)
+
+    def cancel_order(self, order_id: int) -> Optional[dict[str, Any]]:
+        return self._client.cancel_margin_order(self.symbol, order_id)
 
     def get_order(self, order_id: int) -> Optional[dict[str, Any]]:
         return self._client.get_order(self.symbol, order_id)
