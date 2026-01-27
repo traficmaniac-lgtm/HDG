@@ -104,6 +104,27 @@ class MarketDataService:
         with self._lock:
             return dict(self._last_effective_tick) if self._last_effective_tick else None
 
+    def get_mid_raw(self) -> Optional[Decimal]:
+        with self._lock:
+            tick = self._last_effective_tick or {}
+            mid_raw = tick.get("mid_raw")
+            if mid_raw is not None:
+                return Decimal(str(mid_raw))
+            bid_raw = tick.get("bid_raw")
+            ask_raw = tick.get("ask_raw")
+            if bid_raw is not None and ask_raw is not None:
+                bid = Decimal(str(bid_raw))
+                ask = Decimal(str(ask_raw))
+                if bid > 0 and ask > 0:
+                    return (bid + ask) / Decimal("2")
+            mid = tick.get("mid")
+            if mid is None:
+                return None
+            mid_dec = Decimal(str(mid))
+            if mid_dec > 0:
+                return mid_dec
+            return None
+
     def get_last_ws_rx_monotonic_ms(self) -> Optional[float]:
         with self._lock:
             return self._snapshot.last_ws_tick_ms

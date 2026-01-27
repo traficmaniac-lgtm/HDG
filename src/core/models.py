@@ -67,7 +67,7 @@ class StrategyParams:
     target_net_bps: int = 10
     max_spread_bps: float = 8.0
     min_tick_rate: int = 5
-    detect_timeout_ms: int = 2500
+    detect_timeout_ms: int = 6000
     use_impulse_filter: bool = True
     impulse_min_bps: float = 1.0
     impulse_grace_ms: int = 2000
@@ -77,6 +77,7 @@ class StrategyParams:
     cooldown_s: int = 3
     detect_window_ticks: int = 8
     allow_no_winner_flatten: bool = True
+    no_winner_policy: str = "NO_LOSS"
     burst_volume_threshold: float = 0.0
     auto_loop: bool = False
     max_cycles: int = 10
@@ -109,24 +110,65 @@ class CycleTelemetry:
     max_spread_bps: float = 0.0
     min_tick_rate: float = 0.0
     cooldown_s: float = 0.0
+    detect_window_ticks: int = 0
+    detect_timeout_ms: int = 0
     tick_rate: Optional[float] = None
     impulse_bps: Optional[float] = None
     spread_bps: Optional[float] = None
     ws_age_ms: Optional[float] = None
     effective_source: Optional[str] = None
+    last_mid: Optional[float] = None
     entry_mid: Optional[float] = None
     exit_mid: Optional[float] = None
     winner_side: Optional[str] = None
     loser_side: Optional[str] = None
+    long_raw_bps: Optional[float] = None
+    short_raw_bps: Optional[float] = None
     winner_raw_bps: Optional[float] = None
     loser_raw_bps: Optional[float] = None
     winner_net_bps: Optional[float] = None
     loser_net_bps: Optional[float] = None
     total_raw_bps: Optional[float] = None
     total_net_bps: Optional[float] = None
+    result: Optional[str] = None
+    pnl_usdt: Optional[float] = None
     condition: Optional[str] = None
     reason: Optional[str] = None
     last_error: Optional[str] = None
+
+
+@dataclass
+class CycleViewModel:
+    state: str
+    cycle_id: int
+    active_cycle: bool
+    start_ts: Optional[datetime]
+    duration_s: Optional[float]
+    entry_mid: Optional[float]
+    last_mid: Optional[float]
+    exit_mid: Optional[float]
+    impulse_bps: Optional[float]
+    tick_rate: Optional[float]
+    spread_bps: Optional[float]
+    ws_age_ms: Optional[float]
+    effective_source: Optional[str]
+    effective_age_ms: Optional[float]
+    long_raw_bps: Optional[float]
+    short_raw_bps: Optional[float]
+    winner: Optional[str]
+    loser: Optional[str]
+    reason: Optional[str]
+    target_net_bps: float
+    fee_bps: float
+    max_loss_bps: float
+    detect_window_ticks: int
+    detect_timeout_ms: int
+    cooldown_s: float
+    result: Optional[str]
+    pnl_usdt: Optional[float]
+    net_bps_total: Optional[float]
+    data_stale: bool
+    waiting_for_data: bool
 
 
 @dataclass

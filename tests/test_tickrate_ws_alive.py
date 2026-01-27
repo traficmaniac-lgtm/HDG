@@ -11,6 +11,8 @@ from src.services.market_data import MarketDataService
 
 
 class DummyExecution:
+    symbol = "BTCUSDT"
+
     def get_margin_account(self) -> dict[str, Any]:
         return {"userAssets": [{"asset": "USDT", "free": "10000", "borrowed": "0"}]}
 
@@ -31,6 +33,7 @@ def _make_cycle(strategy: StrategyParams, market_data: MarketDataService) -> Dir
         emit_log=lambda *args, **kwargs: None,
         emit_trade_row=lambda payload: None,
         emit_exposure=lambda exposure: None,
+        on_not_authorized=lambda context: None,
     )
 
 
