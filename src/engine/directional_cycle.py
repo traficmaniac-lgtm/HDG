@@ -271,7 +271,7 @@ class DirectionalCycle:
                 qty,
                 sell_mode,
                 price=sell_price,
-                side_effect_type="AUTO_BORROW",
+                side_effect_type="AUTO_BORROW_REPAY",
             )
             if not sell_order:
                 self._log_partial("partial_hedge_entry", qty)
@@ -307,7 +307,7 @@ class DirectionalCycle:
             qty,
             sell_mode,
             sell_price,
-            side_effect_type="AUTO_BORROW",
+            side_effect_type="AUTO_BORROW_REPAY",
         )
         if not buy_fill or not sell_fill:
             self._log_partial("partial_hedge_entry", qty)
