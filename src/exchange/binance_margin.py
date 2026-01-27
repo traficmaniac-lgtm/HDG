@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import time
 from typing import Any, Optional
 
@@ -7,9 +8,18 @@ from src.services.binance_rest import BinanceRestClient
 
 
 class BinanceMarginExecution:
+    _VALID_SIDE_EFFECT_TYPES = {
+        "NO_SIDE_EFFECT",
+        "MARGIN_BUY",
+        "AUTO_REPAY",
+        "AUTO_BORROW_REPAY",
+    }
+
     def __init__(self, client: BinanceRestClient, symbol: str = "BTCUSDT") -> None:
         self._client = client
         self.symbol = symbol
+        self._logger = logging.getLogger("dhs")
+        self._side_effect_warned = False
 
     @property
     def last_error(self) -> Optional[str]:
@@ -50,14 +60,25 @@ class BinanceMarginExecution:
         time_in_force: Optional[str] = None,
         is_isolated: bool = False,
     ) -> Optional[dict[str, Any]]:
+        resolved_side_effect = side_effect_type
+        if resolved_side_effect not in self._VALID_SIDE_EFFECT_TYPES:
+            if not self._side_effect_warned:
+                self._logger.warning(
+                    "MARGIN_ORDER sideEffectType invalid or missing; defaulting",
+                    extra={
+                        "sideEffectType": resolved_side_effect,
+                        "default": "AUTO_BORROW_REPAY",
+                    },
+                )
+                self._side_effect_warned = True
+            resolved_side_effect = "AUTO_BORROW_REPAY"
         payload: dict[str, Any] = {
             "symbol": self.symbol,
             "side": side,
             "quantity": f"{quantity:.6f}",
             "isIsolated": "TRUE" if is_isolated else "FALSE",
+            "sideEffectType": resolved_side_effect,
         }
-        if side_effect_type:
-            payload["sideEffectType"] = side_effect_type
         if order_mode == "aggressive_limit":
             if price is None:
                 raise ValueError("price required for aggressive_limit")
@@ -66,6 +87,18 @@ class BinanceMarginExecution:
             payload["timeInForce"] = time_in_force or "IOC"
         else:
             payload["type"] = "MARKET"
+        self._logger.info(
+            "MARGIN_ORDER_REQUEST symbol=%s side=%s type=%s qty=%s price=%s sideEffectType=%s isIsolated=%s leverage=%s clientOrderId=%s",
+            payload.get("symbol"),
+            payload.get("side"),
+            payload.get("type"),
+            payload.get("quantity"),
+            payload.get("price"),
+            payload.get("sideEffectType"),
+            payload.get("isIsolated"),
+            payload.get("leverage"),
+            payload.get("newClientOrderId"),
+        )
         return self._client.place_order_margin(payload)
 
     def wait_for_fill(
