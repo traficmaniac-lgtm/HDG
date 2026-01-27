@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 
 from PySide6.QtCore import QObject, Signal, Slot
 
-from src.core.models import StrategyParams, SymbolFilters
+from src.core.models import MarketDataMode, StrategyParams, SymbolFilters
 from src.core.state_machine import BotStateMachine
 from src.engine.directional_cycle import DirectionalCycle
 from src.exchange.binance_margin import BinanceMarginExecution
@@ -34,6 +34,8 @@ class TradeEngine(QObject):
         self._state_machine = BotStateMachine()
         self._strategy = StrategyParams()
         self._symbol_filters = SymbolFilters()
+        self._data_mode = MarketDataMode.HYBRID
+        self._ws_status = "DISCONNECTED"
         self._connected = False
         self._margin_permission_ok = False
         self._margin_btc_free = 0.0
@@ -48,6 +50,8 @@ class TradeEngine(QObject):
             emit_trade_row=self.trade_row.emit,
             emit_exposure=self._emit_exposure_status,
         )
+        self._cycle.update_data_mode(self._data_mode)
+        self._cycle.update_ws_status(self._ws_status)
         self._watchdog_stop = threading.Event()
         self._auto_loop = False
         self._stop_requested = False
@@ -96,6 +100,8 @@ class TradeEngine(QObject):
             emit_trade_row=self.trade_row.emit,
             emit_exposure=self._emit_exposure_status,
         )
+        self._cycle.update_data_mode(self._data_mode)
+        self._cycle.update_ws_status(self._ws_status)
         self._connected = bool(api_key and api_secret)
         if self._connected:
             self._state_machine.connect_ok()
@@ -193,7 +199,21 @@ class TradeEngine(QObject):
     def fetch_http_fallback(self) -> None:
         data = self._http_fallback.get_book_ticker("BTCUSDT")
         if data:
-            self.tick_update.emit(data)
+            self.on_tick(data)
+
+    @Slot(str)
+    def set_data_mode(self, mode: str) -> None:
+        try:
+            self._data_mode = MarketDataMode(mode)
+        except ValueError:
+            self._data_mode = MarketDataMode.HYBRID
+        self._cycle.update_data_mode(self._data_mode)
+        self._emit_cycle_state()
+
+    @Slot(str)
+    def set_ws_status(self, status: str) -> None:
+        self._ws_status = status
+        self._cycle.update_ws_status(status)
 
     @Slot()
     def attempt_entry(self) -> None:
@@ -249,6 +269,11 @@ class TradeEngine(QObject):
                 "loser_net_bps": snapshot.loser_net_bps,
                 "reason": snapshot.reason,
                 "ws_age_ms": snapshot.ws_age_ms,
+                "http_age_ms": snapshot.http_age_ms,
+                "effective_source": snapshot.effective_source,
+                "effective_age_ms": snapshot.effective_age_ms,
+                "data_stale": snapshot.data_stale,
+                "waiting_for_data": snapshot.waiting_for_data,
             }
         )
 

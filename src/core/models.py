@@ -11,6 +11,12 @@ class ConnectionMode(str, Enum):
     FUTURES = "FUTURES"
 
 
+class MarketDataMode(str, Enum):
+    WS_ONLY = "WS_ONLY"
+    HTTP_ONLY = "HTTP_ONLY"
+    HYBRID = "HYBRID"
+
+
 @dataclass
 class ConnectionSettings:
     api_key: str = ""
@@ -29,6 +35,20 @@ class MarketTick:
     spread_bps: float = 0.0
     event_time: datetime = field(default_factory=datetime.utcnow)
     rx_time: datetime = field(default_factory=datetime.utcnow)
+
+
+@dataclass
+class MarketSnapshot:
+    last_ws_tick_ms: Optional[float] = None
+    last_http_tick_ms: Optional[float] = None
+    bid: float = 0.0
+    ask: float = 0.0
+    mid: float = 0.0
+    effective_source: str = "NONE"
+    ws_age_ms: float = 9999.0
+    http_age_ms: float = 9999.0
+    effective_age_ms: float = 9999.0
+    data_stale: bool = True
 
 
 @dataclass
