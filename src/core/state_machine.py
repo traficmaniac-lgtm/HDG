@@ -6,12 +6,12 @@ from typing import Optional
 
 class BotState(str, Enum):
     IDLE = "IDLE"
-    READY = "READY"
+    ARMED = "ARMED"
     ENTERING = "ENTERING"
     DETECTING = "DETECTING"
-    CUT_LOSER = "CUT_LOSER"
-    HOLD_WINNER = "HOLD_WINNER"
-    EXIT_WINNER = "EXIT_WINNER"
+    CUTTING = "CUTTING"
+    RIDING = "RIDING"
+    EXITING = "EXITING"
     COOLDOWN = "COOLDOWN"
     ERROR = "ERROR"
 
@@ -25,14 +25,18 @@ class BotStateMachine:
 
     def connect_ok(self) -> None:
         if self.state == BotState.IDLE:
-            self.state = BotState.READY
+            self.state = BotState.IDLE
 
     def disconnect(self) -> None:
         self.state = BotState.IDLE
         self.active_cycle = False
 
+    def arm(self) -> None:
+        if self.state in {BotState.IDLE, BotState.ERROR, BotState.COOLDOWN}:
+            self.state = BotState.ARMED
+
     def start_cycle(self) -> bool:
-        if self.state == BotState.READY:
+        if self.state == BotState.ARMED:
             self.state = BotState.ENTERING
             self.active_cycle = True
             self.cycle_id += 1
@@ -43,28 +47,28 @@ class BotStateMachine:
         if self.state in {
             BotState.ENTERING,
             BotState.DETECTING,
-            BotState.CUT_LOSER,
-            BotState.HOLD_WINNER,
-            BotState.EXIT_WINNER,
+            BotState.CUTTING,
+            BotState.RIDING,
+            BotState.EXITING,
             BotState.COOLDOWN,
         }:
-            self.state = BotState.READY
+            self.state = BotState.IDLE
             self.active_cycle = False
 
     def finish_cycle(self) -> None:
         if self.state in {
             BotState.ENTERING,
             BotState.DETECTING,
-            BotState.CUT_LOSER,
-            BotState.HOLD_WINNER,
-            BotState.EXIT_WINNER,
+            BotState.CUTTING,
+            BotState.RIDING,
+            BotState.EXITING,
         }:
             self.state = BotState.COOLDOWN
             self.active_cycle = False
 
     def end_cooldown(self) -> None:
         if self.state == BotState.COOLDOWN:
-            self.state = BotState.READY
+            self.state = BotState.ARMED
 
     def set_error(self, message: str) -> None:
         self.state = BotState.ERROR

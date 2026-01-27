@@ -79,6 +79,7 @@ class MarketDataThread(QThread):
                 "spread_bps": spread_bps,
                 "event_time": event_time,
                 "rx_time": now,
+                "source": "WS",
             }
         )
 
