@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import time
+from urllib.parse import urlencode
 from typing import Any, Optional
 
 import httpx
@@ -146,17 +147,21 @@ class BinanceRestClient:
                 "timestamp": self._time_sync.timestamp_ms(),
                 "recvWindow": 5000,
             }
-            query_string = self._build_query_string(signed_params)
+            ordered_params = self._build_query_params(signed_params)
+            query_string = urlencode(ordered_params, doseq=True)
             signature = hmac.new(
                 self.api_secret.encode("utf-8"),
                 query_string.encode("utf-8"),
                 hashlib.sha256,
             ).hexdigest()
-            signed_params["signature"] = signature
+            ordered_params.append(("signature", signature))
             headers = {"X-MBX-APIKEY": self.api_key}
             try:
                 resp = self._client.request(
-                    method, f"{base_url}{path}", params=signed_params, headers=headers
+                    method,
+                    f"{base_url}{path}",
+                    params=ordered_params,
+                    headers=headers,
                 )
                 resp.raise_for_status()
                 return resp.json()
@@ -213,9 +218,8 @@ class BinanceRestClient:
                 return None
         return None
 
-    def _build_query_string(self, params: dict[str, Any]) -> str:
-        items = sorted(params.items(), key=lambda item: item[0])
-        return "&".join(f"{key}={value}" for key, value in items)
+    def _build_query_params(self, params: dict[str, Any]) -> list[tuple[str, Any]]:
+        return sorted(params.items(), key=lambda item: item[0])
 
     def _log_signed_failure(
         self,
