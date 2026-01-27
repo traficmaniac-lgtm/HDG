@@ -10,12 +10,14 @@ from PySide6.QtCore import QThread, QTimer, Qt, Signal
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
+    QFileDialog,
     QFrame,
     QFormLayout,
     QGridLayout,
     QHBoxLayout,
     QLabel,
     QLCDNumber,
+    QLineEdit,
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
@@ -30,7 +32,7 @@ from PySide6.QtWidgets import (
 
 from src.core.version import VERSION
 from src.core.config_store import SettingsStore
-from src.core.logger import QtLogEmitter, setup_logger
+from src.core.logger import LogBus, setup_logger
 from src.core.models import ConnectionMode, ConnectionSettings, MarketTick, StrategyParams
 from src.core.state_machine import BotState, BotStateMachine
 from src.core.trade_engine import TradeEngine
@@ -49,7 +51,7 @@ class MainWindow(QMainWindow):
     request_exchange_info = Signal()
     request_orderbook_snapshot = Signal()
     request_http_fallback = Signal()
-    request_start_cycle = Signal()
+    request_attempt_entry = Signal()
     request_stop_cycle = Signal()
     request_emergency_flatten = Signal()
     request_set_strategy = Signal(dict)
@@ -73,6 +75,7 @@ class MainWindow(QMainWindow):
         self.data_source = "WS"
         self.ws_status = "DISCONNECTED"
         self.cycle_start_time: Optional[datetime] = None
+        self.run_mode = False
 
         self.sim_entry_price: Optional[float] = None
         self.sim_entry_qty: Optional[float] = None
@@ -81,9 +84,11 @@ class MainWindow(QMainWindow):
         self.sim_net_bps: Optional[float] = None
         self.sim_condition: str = "—"
 
-        self.log_emitter = QtLogEmitter()
-        self.logger = setup_logger(Path("logs"), self.log_emitter)
-        self.logger.info(f"[APP] version={self.version}")
+        self.logger = setup_logger(Path("logs"))
+        self.log_bus = LogBus(self.logger)
+        self.log_entries: list[dict] = []
+        self.log_bus.entry.connect(self.on_log_entry)
+        self.log_bus.log("INFO", "INFO", "APP start", version=self.version)
 
         self.ws_thread = MarketDataThread("btcusdt")
         self.ws_thread.price_update.connect(self.on_price_update)
@@ -127,7 +132,6 @@ class MainWindow(QMainWindow):
         self._load_settings_into_form()
         self._update_ui_state()
 
-        self.log_emitter.message.connect(self.append_log)
 
         self.request_set_strategy.emit(self.strategy_params.__dict__)
 
@@ -136,8 +140,15 @@ class MainWindow(QMainWindow):
         self.heartbeat_timer.timeout.connect(self._emit_heartbeat)
         self.heartbeat_timer.start()
 
+        self.run_timer = QTimer(self)
+        self.run_timer.setInterval(150)
+        self.run_timer.timeout.connect(self._run_loop_check)
+        self.run_timer.start()
+
+        self._auto_connect()
+
     def closeEvent(self, event) -> None:
-        self.logger.info("Shutting down GUI")
+        self.log_bus.log("INFO", "INFO", "GUI shutdown requested")
         self.stop_ws_thread()
         self.trade_engine.close()
         self.engine_thread.quit()
@@ -262,15 +273,8 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(widget)
         layout.setSpacing(6)
 
-        arm_layout = QHBoxLayout()
-        self.arm_button = QPushButton("АРМ")
-        self.disarm_button = QPushButton("ДИЗАРМ")
-        arm_layout.addWidget(self.arm_button)
-        arm_layout.addWidget(self.disarm_button)
-        layout.addLayout(arm_layout)
-
         cycle_layout = QHBoxLayout()
-        self.start_cycle_button = QPushButton("СТАРТ ЦИКЛА")
+        self.start_cycle_button = QPushButton("СТАРТ")
         self.stop_button = QPushButton("СТОП")
         cycle_layout.addWidget(self.start_cycle_button)
         cycle_layout.addWidget(self.stop_button)
@@ -406,6 +410,11 @@ class MainWindow(QMainWindow):
         )
         self.trades_table.horizontalHeader().setStretchLastSection(True)
         layout.addWidget(self.trades_table)
+        layout.addWidget(QLabel("Сделки (лог)"))
+        self.deals_log_output = QPlainTextEdit()
+        self.deals_log_output.setReadOnly(True)
+        self.deals_log_output.setMaximumHeight(160)
+        layout.addWidget(self.deals_log_output)
         if DEBUG:
             self.add_test_trade_button = QPushButton("Добавить тестовую строку")
             layout.addWidget(self.add_test_trade_button)
@@ -416,12 +425,21 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(widget)
         filter_layout = QHBoxLayout()
         self.log_filter_combo = QComboBox()
-        self.log_filter_combo.addItems(["INFO", "WARN", "ERROR"])
-        filter_layout.addWidget(QLabel("Фильтр:"))
+        self.log_filter_combo.addItems(["ВСЕ", "Инфо", "Ошибки", "Торговля", "Сделки"])
+        self.log_level_combo = QComboBox()
+        self.log_level_combo.addItems(["ВСЕ", "DEBUG", "INFO", "WARN", "ERROR"])
+        self.log_search_input = QLineEdit()
+        self.log_search_input.setPlaceholderText("Поиск по тексту")
+        filter_layout.addWidget(QLabel("Категория:"))
         filter_layout.addWidget(self.log_filter_combo)
+        filter_layout.addWidget(QLabel("Уровень:"))
+        filter_layout.addWidget(self.log_level_combo)
+        filter_layout.addWidget(self.log_search_input)
         filter_layout.addStretch(1)
 
+        self.save_logs_button = QPushButton("Сохранить лог")
         self.open_logs_button = QPushButton("Открыть папку логов")
+        filter_layout.addWidget(self.save_logs_button)
         filter_layout.addWidget(self.open_logs_button)
 
         self.log_output = QPlainTextEdit()
@@ -438,14 +456,10 @@ class MainWindow(QMainWindow):
         return widget
 
     def _wire_signals(self) -> None:
-        self.settings_tab.connect_button.clicked.connect(self.connect_to_binance)
-        self.settings_tab.disconnect_button.clicked.connect(self.disconnect_from_binance)
         self.settings_tab.save_button.clicked.connect(self.save_settings)
         self.settings_tab.test_button.clicked.connect(self.test_connection)
         self.settings_tab.clear_button.clicked.connect(self.clear_settings_fields)
 
-        self.arm_button.clicked.connect(self.on_arm)
-        self.disarm_button.clicked.connect(self.on_disarm)
         self.start_cycle_button.clicked.connect(self.on_start_cycle)
         self.stop_button.clicked.connect(self.on_stop)
         self.emergency_button.clicked.connect(self.on_emergency_flatten)
@@ -454,14 +468,18 @@ class MainWindow(QMainWindow):
         self.parameters_tab.reset_params_button.clicked.connect(self.reset_params)
         if DEBUG:
             self.add_test_trade_button.clicked.connect(self.add_test_trade)
+        self.save_logs_button.clicked.connect(self.save_logs_to_file)
         self.open_logs_button.clicked.connect(self.open_logs_folder)
+        self.log_filter_combo.currentTextChanged.connect(self._refresh_log_view)
+        self.log_level_combo.currentTextChanged.connect(self._refresh_log_view)
+        self.log_search_input.textChanged.connect(self._refresh_log_view)
 
         self.request_validate.connect(self.trade_engine.validate_access)
         self.request_refresh_balance.connect(self.trade_engine.refresh_balance)
         self.request_exchange_info.connect(self.trade_engine.load_exchange_info)
         self.request_orderbook_snapshot.connect(self.trade_engine.load_orderbook_snapshot)
         self.request_http_fallback.connect(self.trade_engine.fetch_http_fallback)
-        self.request_start_cycle.connect(self.trade_engine.start_cycle)
+        self.request_attempt_entry.connect(self.trade_engine.attempt_entry)
         self.request_stop_cycle.connect(self.trade_engine.stop)
         self.request_emergency_flatten.connect(self.trade_engine.emergency_flatten)
         self.request_set_strategy.connect(self.trade_engine.set_strategy)
@@ -478,35 +496,6 @@ class MainWindow(QMainWindow):
         self.trade_engine.trade_row.connect(self.on_trade_row)
         self.trade_engine.exposure_update.connect(self.on_exposure_update)
         self.trade_engine.log.connect(self.on_engine_log)
-
-    def connect_to_binance(self) -> None:
-        self._sync_settings_from_form()
-        if not self.connection_settings.api_key or not self.connection_settings.api_secret:
-            QMessageBox.warning(self, "Ключи", "Введите API ключ и секрет.")
-            return
-
-        if self.connection_settings.save_local:
-            self.settings_store.save(self.connection_settings)
-            self.logger.info("Settings saved to config/settings.json")
-
-        self.request_set_connection.emit(
-            {
-                "api_key": self.connection_settings.api_key,
-                "api_secret": self.connection_settings.api_secret,
-            }
-        )
-        self.request_validate.emit(False)
-
-    def disconnect_from_binance(self) -> None:
-        self.connected = False
-        self.state_machine.disconnect()
-        self.stop_ws_thread()
-        self.balance_timer.stop()
-        self.orderbook = OrderBook()
-        self.orderbook_ready = False
-        self.request_set_connection.emit({"api_key": "", "api_secret": ""})
-        self.logger.info("Disconnected from Binance")
-        self._update_ui_state()
 
     def test_connection(self) -> None:
         self._sync_settings_from_form()
@@ -528,43 +517,29 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self, "Настройки", "Сохранено локально в config/settings.json"
             )
-            self.logger.info("Settings saved to config/settings.json")
+            self.log_bus.log("INFO", "INFO", "Settings saved", path="config/settings.json")
         else:
             QMessageBox.information(self, "Настройки", "Локальное сохранение отключено.")
+        self._auto_connect()
 
     def clear_settings_fields(self) -> None:
         self.settings_tab.api_key_input.clear()
         self.settings_tab.api_secret_input.clear()
-        self.logger.info("Settings cleared")
-
-    def on_arm(self) -> None:
-        self.state_machine.arm(self.connected)
-        self.logger.info("ARM requested")
-        self._update_ui_state()
-
-    def on_disarm(self) -> None:
-        self.state_machine.disconnect()
-        self.logger.info("DISARM requested")
-        self._update_ui_state()
+        self.log_bus.log("INFO", "INFO", "Settings cleared")
+        self._auto_connect()
 
     def on_start_cycle(self) -> None:
-        if not self._entry_allowed():
-            QMessageBox.warning(self, "Защита", "Условия входа не выполнены.")
+        if not self._can_run():
+            QMessageBox.warning(self, "Защита", "Нет доступа для старта авто-торговли.")
             return
-        started = self.state_machine.start_cycle()
-        if not started:
-            return
-        if not self.settings_tab.live_enabled_checkbox.isChecked():
-            QMessageBox.warning(self, "LIVE", "Цикл доступен только в LIVE режиме.")
-            self.state_machine.stop()
-            return
-        self.request_start_cycle.emit()
+        self.run_mode = True
+        self.log_bus.log("INFO", "INFO", "AUTO trading started")
+        self._update_ui_state()
+        self._run_loop_check()
 
     def on_stop(self) -> None:
-        self.state_machine.stop()
-        if self.settings_tab.live_enabled_checkbox.isChecked():
-            self.request_stop_cycle.emit()
-        self.logger.info("Cycle stopped")
+        self.run_mode = False
+        self.log_bus.log("INFO", "INFO", "AUTO trading stopped by user")
         self._update_ui_state()
 
     def on_emergency_flatten(self) -> None:
@@ -578,8 +553,8 @@ class MainWindow(QMainWindow):
     def on_cooldown_complete(self) -> None:
         self.request_end_cooldown.emit()
         self._update_ui_state()
-        if self.strategy_params.auto_loop and self._entry_allowed():
-            self.request_start_cycle.emit()
+        if self.run_mode:
+            self._run_loop_check()
 
     def apply_params(self) -> None:
         self.strategy_params.order_mode = (
@@ -608,7 +583,7 @@ class MainWindow(QMainWindow):
             self.parameters_tab.burst_volume_spin.value()
         )
         self.strategy_params.auto_loop = self.parameters_tab.auto_loop_checkbox.isChecked()
-        self.logger.info("PARAMS applied")
+        self.log_bus.log("INFO", "INFO", "PARAMS applied")
         self.request_set_strategy.emit(self.strategy_params.__dict__)
         self._update_ui_state()
 
@@ -700,6 +675,8 @@ class MainWindow(QMainWindow):
     def on_connection_checked(self, payload: dict) -> None:
         ok = payload.get("ok")
         test_only = payload.get("test_only")
+        if "margin_permission_ok" in payload:
+            self.margin_permission_ok = bool(payload.get("margin_permission_ok"))
         if test_only:
             if ok:
                 QMessageBox.information(self, "Связь", "Доступ подтверждён.")
@@ -719,7 +696,7 @@ class MainWindow(QMainWindow):
         self.request_exchange_info.emit()
         self.request_orderbook_snapshot.emit()
         self.request_refresh_balance.emit()
-        self.logger.info("Подключение установлено")
+        self.log_bus.log("INFO", "INFO", "Подключение установлено")
         self._update_ui_state()
 
     def on_cycle_update(self, payload: dict) -> None:
@@ -762,11 +739,24 @@ class MainWindow(QMainWindow):
             self.exposure_label.setText("позиция: нет")
             self.exposure_label.setStyleSheet("color: #8c8c8c;")
 
-    def on_engine_log(self, message: str) -> None:
-        self.logger.info(message)
+    def on_engine_log(self, message: dict) -> None:
+        self.log_bus.log(
+            message.get("category", "INFO"),
+            message.get("level", "INFO"),
+            message.get("message", ""),
+            **message.get("fields", {}),
+        )
 
     def _emit_heartbeat(self) -> None:
         self.request_ui_heartbeat.emit(time.monotonic())
+
+    def _run_loop_check(self) -> None:
+        if not self.run_mode:
+            return
+        if not self.settings_tab.live_enabled_checkbox.isChecked():
+            return
+        if self.connected and self.margin_permission_ok:
+            self.request_attempt_entry.emit()
 
     def start_ws_thread(self) -> None:
         if self.ws_thread.isRunning():
@@ -836,7 +826,10 @@ class MainWindow(QMainWindow):
         self.sim_condition_label.setText(f"условие: {winner}")
 
     def _update_state_labels(self) -> None:
-        self.state_label.setText(f"Состояние: {self.state_machine.state.value}")
+        mode = "RUNNING" if self.run_mode else "IDLE"
+        self.state_label.setText(
+            f"Режим: {mode} | Состояние: {self.state_machine.state.value}"
+        )
         self.active_cycle_label.setText(
             f"активный цикл: {str(self.state_machine.active_cycle).lower()}"
         )
@@ -874,13 +867,10 @@ class MainWindow(QMainWindow):
         self.account_data_label.setText(f"Данные: {data_status}")
         self.account_data_label.setStyleSheet(color)
 
-        self.settings_tab.connect_button.setEnabled(not self.connected)
-        self.settings_tab.disconnect_button.setEnabled(self.connected)
-        self.arm_button.setEnabled(self.connected)
-        self.disarm_button.setEnabled(self.connected)
-        self.start_cycle_button.setEnabled(self._entry_allowed())
+        self.start_cycle_button.setEnabled(self._can_run() and not self.run_mode)
         self.stop_button.setEnabled(
-            self.state_machine.state
+            self.run_mode
+            or self.state_machine.state
             in {
                 BotState.ENTERING,
                 BotState.DETECTING,
@@ -914,24 +904,78 @@ class MainWindow(QMainWindow):
             self.settings_tab.live_enabled_checkbox.setEnabled(True)
             self.settings_tab.live_warning.setText("Отправляет реальные ордера")
 
-        entry_allowed = self._entry_allowed()
-        self.entry_allowed_label.setText(f"вход разрешён: {str(entry_allowed).lower()}")
+        entry_allowed = self._can_run()
+        self.entry_allowed_label.setText(
+            f"готовность торговли: {str(entry_allowed).lower()}"
+        )
         self.entry_allowed_label.setStyleSheet(
             "color: #27ae60;" if entry_allowed else "color: #e74c3c;"
         )
         self._update_state_labels()
         self._update_sim_labels()
 
-    def append_log(self, message: str) -> None:
-        filter_level = self.log_filter_combo.currentText()
-        expected = "WARNING" if filter_level == "WARN" else filter_level
-        if f"| {expected} |" not in message:
-            return
-        self.log_output.appendPlainText(message)
+    def on_log_entry(self, entry: dict) -> None:
+        self.log_entries.append(entry)
+        if self._log_entry_visible(entry):
+            self.log_output.appendPlainText(self._format_log_line(entry))
+        if entry.get("category") == "DEALS":
+            self.deals_log_output.appendPlainText(self._format_log_line(entry))
+
+    def _format_log_line(self, entry: dict) -> str:
+        ts = entry.get("timestamp")
+        if isinstance(ts, datetime):
+            ts_str = ts.strftime("%H:%M:%S.%f")[:-3]
+        else:
+            ts_str = datetime.now(timezone.utc).strftime("%H:%M:%S.%f")[:-3]
+        category = entry.get("category", "INFO")
+        level = entry.get("level", "INFO")
+        message = entry.get("message", "")
+        fields = entry.get("fields", {})
+        lines = [f"{ts_str} | {category} | {level} | {message}"]
+        for key, value in fields.items():
+            lines.append(f"  {key}={value}")
+        return "\n".join(lines)
+
+    def _log_entry_visible(self, entry: dict) -> bool:
+        category_filter = self.log_filter_combo.currentText()
+        category_map = {
+            "ВСЕ": None,
+            "Инфо": "INFO",
+            "Ошибки": "ERROR",
+            "Торговля": "TRADE",
+            "Сделки": "DEALS",
+        }
+        selected_category = category_map.get(category_filter)
+        if selected_category and entry.get("category") != selected_category:
+            return False
+        level_filter = self.log_level_combo.currentText()
+        if level_filter != "ВСЕ" and entry.get("level") != level_filter:
+            return False
+        query = self.log_search_input.text().strip().lower()
+        if not query:
+            return True
+        text = self._format_log_line(entry).lower()
+        return query in text
+
+    def _refresh_log_view(self) -> None:
+        lines = []
+        for entry in self.log_entries:
+            if self._log_entry_visible(entry):
+                lines.append(self._format_log_line(entry))
+        self.log_output.setPlainText("\n".join(lines))
 
     def open_logs_folder(self) -> None:
         logs_path = Path("logs").resolve()
         QMessageBox.information(self, "Логи", f"Папка логов: {logs_path}")
+
+    def save_logs_to_file(self) -> None:
+        filename, _ = QFileDialog.getSaveFileName(
+            self, "Сохранить лог", str(Path("logs").resolve()), "Text Files (*.txt)"
+        )
+        if not filename:
+            return
+        Path(filename).write_text(self.log_output.toPlainText(), encoding="utf-8")
+        QMessageBox.information(self, "Логи", f"Сохранено: {filename}")
 
     def add_trade_row(self, payload: dict) -> None:
         row = self.trades_table.rowCount()
@@ -1006,23 +1050,42 @@ class MainWindow(QMainWindow):
         self.settings_tab.save_checkbox.setChecked(self.connection_settings.save_local)
         self.settings_tab.live_enabled_checkbox.setChecked(self.connection_settings.live_enabled)
 
-    def _entry_allowed(self) -> bool:
+    def _can_run(self) -> bool:
         if not self.settings_tab.live_enabled_checkbox.isChecked():
             return False
-        if self.settings_tab.live_enabled_checkbox.isChecked() and not self.margin_permission_ok:
+        if not self.margin_permission_ok:
             return False
-        return (
-            self.connected
-            and self.state_machine.state == BotState.READY
-            and self.orderbook_ready
-            and self.market_tick.spread_bps <= self.strategy_params.max_spread_bps
-        )
+        if not self.connection_settings.api_key or not self.connection_settings.api_secret:
+            return False
+        return self.connected
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
         if not hasattr(self, "_initialized"):
             self._initialize_defaults()
             self._initialized = True
+
+    def _auto_connect(self) -> None:
+        self._sync_settings_from_form()
+        if not self.connection_settings.api_key or not self.connection_settings.api_secret:
+            self.connected = False
+            self.state_machine.disconnect()
+            self.account_permissions = "НЕТ КЛЮЧЕЙ"
+            self.log_bus.log("INFO", "INFO", "Нет ключей API для REST")
+            self.request_set_connection.emit({"api_key": "", "api_secret": ""})
+            self.start_ws_thread()
+            self._update_ui_state()
+            return
+        if self.connection_settings.save_local:
+            self.settings_store.save(self.connection_settings)
+        self.request_set_connection.emit(
+            {
+                "api_key": self.connection_settings.api_key,
+                "api_secret": self.connection_settings.api_secret,
+            }
+        )
+        self.request_validate.emit(False)
+        self.start_ws_thread()
 
 
 if __name__ == "__main__":
