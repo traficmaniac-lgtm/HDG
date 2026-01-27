@@ -26,7 +26,7 @@ class SymbolFilters:
 
 
 class TradeEngine(QObject):
-    log = Signal(str)
+    log = Signal(dict)
     status_update = Signal(dict)
     balance_update = Signal(dict)
     depth_snapshot = Signal(dict)
@@ -59,6 +59,8 @@ class TradeEngine(QObject):
         self._winner_exit_price: Optional[float] = None
         self._exposure_open = False
         self._entry_tick_count = 0
+        self._last_skip_log_ts = 0.0
+        self._last_skip_reason: Optional[str] = None
         self._watchdog_stop = threading.Event()
         self._ui_heartbeat = time.monotonic()
         self._watchdog_thread = threading.Thread(
@@ -145,7 +147,7 @@ class TradeEngine(QObject):
     def load_exchange_info(self) -> None:
         info = self._rest_client.get_exchange_info("BTCUSDT")
         if not info:
-            self.log.emit("Не удалось загрузить информацию биржи")
+            self._emit_log("ERROR", "ERROR", "Не удалось загрузить информацию биржи")
             return
         symbols = info.get("symbols", [])
         if not symbols:
@@ -177,7 +179,7 @@ class TradeEngine(QObject):
     def load_orderbook_snapshot(self) -> None:
         depth = self._rest_client.get_depth("BTCUSDT", limit=20)
         if not depth:
-            self.log.emit("Не удалось загрузить стакан")
+            self._emit_log("ERROR", "ERROR", "Не удалось загрузить стакан")
             return
         self.depth_snapshot.emit(depth)
 
@@ -188,32 +190,34 @@ class TradeEngine(QObject):
             self.tick_update.emit(data)
 
     @Slot()
-    def start_cycle(self) -> None:
+    def attempt_entry(self) -> None:
+        if self._state_machine.state == BotState.COOLDOWN:
+            self._log_skip("cooldown")
+            return
+        if self._state_machine.state != BotState.READY:
+            return
+        if (
+            not self._connected
+            or not self._margin_permission_ok
+            or not self._last_tick
+            or self._symbol_filters.step_size <= 0
+            or self._symbol_filters.min_qty <= 0
+        ):
+            self._log_skip("not_ready")
+            return
+        if self._exposure_open or self._margin_btc_free > 0 or self._margin_btc_borrowed > 0:
+            self._log_skip("exposure")
+            return
+        reason = self._entry_filter_reason()
+        if reason:
+            self._log_skip(reason)
+            return
+        self._start_cycle()
+
+    def _start_cycle(self) -> None:
         if not self._state_machine.start_cycle():
             return
-        if not self._connected:
-            self._state_machine.set_error("not_connected")
-            self._emit_cycle_state()
-            return
-        if not self._last_tick:
-            self._state_machine.set_error("no_tick")
-            self._emit_cycle_state()
-            return
         self._rest_client.cancel_open_orders("BTCUSDT")
-        if not self._impulse_ok():
-            self.log.emit("Пропуск входа: причина=flat/spread/tick_rate")
-            self._state_machine.stop()
-            self._emit_cycle_state()
-            return
-        if not self._margin_permission_ok:
-            self._state_machine.set_error("margin_permission_missing")
-            self._emit_cycle_state()
-            return
-        if self._has_open_exposure():
-            self.log.emit("ЕСТЬ ОТКРЫТАЯ ПОЗИЦИЯ")
-            self._state_machine.set_error("open_exposure")
-            self._emit_cycle_state()
-            return
         self._cycle_start = datetime.now(timezone.utc)
         self._entry_price_long = None
         self._entry_price_short = None
@@ -224,6 +228,7 @@ class TradeEngine(QObject):
         self._winner_exit_price = None
         self._entry_tick_count = len(self._tick_history)
         self._emit_cycle_state()
+        self._emit_log("TRADE", "INFO", "ENTER cycle", cycle_id=self._state_machine.cycle_id)
         if not self._enter_hedge():
             return
         self._state_machine.state = BotState.DETECTING
@@ -275,14 +280,65 @@ class TradeEngine(QObject):
             except Exception:
                 buy_order = None
                 sell_order = None
+        buy_id = buy_order.get("orderId") if buy_order else None
+        sell_id = sell_order.get("orderId") if sell_order else None
+        self._emit_log(
+            "TRADE",
+            "INFO",
+            "ENTER sent both orders",
+            buy_id=buy_id,
+            sell_id=sell_id,
+            qty=qty,
+            type="MARKET",
+        )
         if not buy_order or not sell_order:
+            self._emit_log(
+                "TRADE",
+                "INFO",
+                "ENTER result",
+                long="FILLED" if buy_order else "REJECTED",
+                short="FILLED" if sell_order else "REJECTED",
+                reason="partial_hedge",
+            )
+            self._emit_log(
+                "ERROR",
+                "ERROR",
+                "Partial hedge on entry (order rejected)",
+                buy_order=bool(buy_order),
+                sell_order=bool(sell_order),
+                buy_id=buy_id,
+                sell_id=sell_id,
+                qty=qty,
+                error=self._rest_client.last_error,
+                error_code=self._rest_client.last_error_code,
+            )
             self._emergency_flatten(reason="partial_hedge")
             self._state_machine.set_error("partial_hedge")
             self._emit_cycle_state()
             return False
-        buy_fill = self._wait_for_fill(buy_order.get("orderId"))
-        sell_fill = self._wait_for_fill(sell_order.get("orderId"))
+        buy_fill = self._wait_for_fill(buy_id)
+        sell_fill = self._wait_for_fill(sell_id)
         if not buy_fill or not sell_fill:
+            self._emit_log(
+                "TRADE",
+                "INFO",
+                "ENTER result",
+                long="FILLED" if buy_fill else "REJECTED",
+                short="FILLED" if sell_fill else "REJECTED",
+                reason="partial_hedge",
+            )
+            self._emit_log(
+                "ERROR",
+                "ERROR",
+                "Partial hedge on entry (fill missing)",
+                buy_filled=bool(buy_fill),
+                sell_filled=bool(sell_fill),
+                buy_id=buy_id,
+                sell_id=sell_id,
+                qty=qty,
+                error=self._rest_client.last_error,
+                error_code=self._rest_client.last_error_code,
+            )
             self._emergency_flatten(reason="partial_hedge")
             self._state_machine.set_error("partial_hedge")
             self._emit_cycle_state()
@@ -291,6 +347,14 @@ class TradeEngine(QObject):
         self._entry_price_short = sell_fill[0]
         self._exposure_open = True
         self._emit_exposure_status()
+        self._emit_log(
+            "TRADE",
+            "INFO",
+            "ENTER filled",
+            buy_price=self._entry_price_long,
+            sell_price=self._entry_price_short,
+            qty=qty,
+        )
         self._emit_cycle_state()
         return True
 
@@ -329,6 +393,13 @@ class TradeEngine(QObject):
             return
         self._state_machine.state = BotState.CUT_LOSER
         self._emit_cycle_state()
+        self._emit_log(
+            "TRADE",
+            "INFO",
+            "DETECT winner",
+            winner=self._winner_side,
+            loser=self._loser_side,
+        )
         self._cut_loser()
 
     def _cut_loser(self) -> None:
@@ -350,6 +421,13 @@ class TradeEngine(QObject):
             self._emit_cycle_state()
             return
         self._loser_exit_price = fill[0]
+        self._emit_log(
+            "TRADE",
+            "INFO",
+            "CUT loser filled",
+            loser_side=self._loser_side,
+            exit_price=self._loser_exit_price,
+        )
         self._state_machine.state = BotState.HOLD_WINNER
         self._emit_cycle_state()
         self._evaluate_winner_hold()
@@ -395,6 +473,14 @@ class TradeEngine(QObject):
             self._emit_cycle_state()
             return
         self._winner_exit_price = fill[0]
+        self._emit_log(
+            "TRADE",
+            "INFO",
+            "EXIT winner filled",
+            winner_side=self._winner_side,
+            exit_price=self._winner_exit_price,
+            note=note,
+        )
         self._emit_trade_summary(note=note)
         self._exposure_open = False
         self._emit_exposure_status()
@@ -439,6 +525,18 @@ class TradeEngine(QObject):
                 "duration_ms": duration_ms,
                 "note": note,
             }
+        )
+        self._emit_log(
+            "DEALS",
+            "INFO",
+            "Cycle summary",
+            cycle_id=self._state_machine.cycle_id,
+            winner=winner_side,
+            loser=loser_side,
+            raw_bps=winner_raw + loser_raw,
+            net_bps=net_total,
+            net_usd=net_usd,
+            note=note,
         )
 
     def _place_order_margin(self, side: str, qty: float) -> Optional[dict[str, Any]]:
@@ -486,28 +584,15 @@ class TradeEngine(QObject):
             time.sleep(0.1)
         return None
 
-    def _impulse_ok(self) -> bool:
-        if not self._last_tick:
-            return False
-        spread = float(self._last_tick.get("spread_bps", 0.0))
-        if spread > self._strategy.max_spread_bps:
-            return False
-        now = time.monotonic()
-        cutoff = now - 0.5
-        ticks = [tick for tick in self._tick_history if tick[0] >= cutoff]
-        tick_rate = len(ticks) / 0.5 if ticks else 0.0
-        if tick_rate < self._strategy.min_tick_rate:
-            return False
-        impulse_cutoff = now - 0.4
-        first_tick = next((t for t in ticks if t[0] >= impulse_cutoff), None)
-        if not first_tick:
-            return False
-        start_mid = first_tick[1]
-        end_mid = ticks[-1][1]
-        if start_mid <= 0:
-            return False
-        impulse_bps = abs(end_mid / start_mid - 1) * 10_000
-        return impulse_bps >= self._strategy.impulse_min_bps
+    def _entry_filter_reason(self) -> Optional[str]:
+        metrics = self._compute_entry_metrics()
+        if metrics["spread_bps"] > self._strategy.max_spread_bps:
+            return "spread"
+        if metrics["tick_rate"] < self._strategy.min_tick_rate:
+            return "tick_rate"
+        if metrics["impulse_bps"] < self._strategy.impulse_min_bps:
+            return "impulse"
+        return None
 
     def _has_open_exposure(self) -> bool:
         open_orders = self._rest_client.get_open_margin_orders("BTCUSDT") or []
@@ -547,7 +632,18 @@ class TradeEngine(QObject):
             usdt_borrowed = float(usdt.get("borrowed", 0.0))
             if usdt_borrowed > 0:
                 self._rest_client.repay_margin_asset("USDT", usdt_borrowed)
-        self.log.emit(f"АВАРИЙНОЕ ЗАКРЫТИЕ: {reason}")
+        self._emit_log("TRADE", "INFO", "ACTION: EMERGENCY FLATTEN", reason=reason)
+        self._emit_log(
+            "ERROR",
+            "ERROR",
+            "EMERGENCY FLATTEN",
+            reason=reason,
+            btc_free=float(btc.get("free", 0.0)) if btc else 0.0,
+            btc_borrowed=float(btc.get("borrowed", 0.0)) if btc else 0.0,
+            usdt_borrowed=float(usdt.get("borrowed", 0.0)) if usdt else 0.0,
+            error=self._rest_client.last_error,
+            error_code=self._rest_client.last_error_code,
+        )
         self._exposure_open = False
         self._emit_exposure_status()
 
@@ -588,7 +684,7 @@ class TradeEngine(QObject):
             lag = time.monotonic() - self._ui_heartbeat
             if lag > 2.0:
                 dump = self._dump_threads()
-                self.log.emit(f"Фриз GUI ({lag:.2f}s)\n{dump}")
+                self._emit_log("ERROR", "ERROR", "Фриз GUI", lag_s=f"{lag:.2f}", dump=dump)
 
     def _dump_threads(self) -> str:
         buffer = io.StringIO()
@@ -598,3 +694,69 @@ class TradeEngine(QObject):
         buffer.write("\nStack:\n")
         faulthandler.dump_traceback(file=buffer)
         return buffer.getvalue()
+
+    def _emit_log(self, category: str, level: str, message: str, **fields: object) -> None:
+        self.log.emit(
+            {
+                "category": category,
+                "level": level,
+                "message": message,
+                "fields": fields,
+            }
+        )
+
+    def _log_skip(self, reason: str) -> None:
+        now = time.monotonic()
+        if reason == self._last_skip_reason and now - self._last_skip_log_ts < 0.5:
+            return
+        self._last_skip_log_ts = now
+        self._last_skip_reason = reason
+        metrics = self._compute_entry_metrics()
+        self._emit_log(
+            "TRADE",
+            "INFO",
+            "SKIP entry",
+            reason=reason,
+            spread_bps=f"{metrics['spread_bps']:.2f}",
+            spread_limit=self._strategy.max_spread_bps,
+            tick_rate=f"{metrics['tick_rate']:.2f}",
+            tick_rate_limit=self._strategy.min_tick_rate,
+            impulse_bps=f"{metrics['impulse_bps']:.2f}",
+            impulse_limit=self._strategy.impulse_min_bps,
+            mid=f"{metrics['mid']:.2f}",
+            bid=f"{metrics['bid']:.2f}",
+            ask=f"{metrics['ask']:.2f}",
+            ws_age_ms=metrics["ws_age_ms"],
+        )
+
+    def _compute_entry_metrics(self) -> dict[str, float]:
+        tick = self._last_tick or {}
+        spread = float(tick.get("spread_bps", 0.0))
+        bid = float(tick.get("bid", 0.0))
+        ask = float(tick.get("ask", 0.0))
+        mid = float(tick.get("mid", 0.0))
+        now = time.monotonic()
+        cutoff = now - 0.5
+        ticks = [tick_data for tick_data in self._tick_history if tick_data[0] >= cutoff]
+        tick_rate = len(ticks) / 0.5 if ticks else 0.0
+        impulse_cutoff = now - 0.4
+        first_tick = next((t for t in ticks if t[0] >= impulse_cutoff), None)
+        impulse_bps = 0.0
+        if first_tick and ticks:
+            start_mid = first_tick[1]
+            end_mid = ticks[-1][1]
+            if start_mid > 0:
+                impulse_bps = abs(end_mid / start_mid - 1) * 10_000
+        rx_time = tick.get("rx_time")
+        ws_age_ms = 0.0
+        if isinstance(rx_time, datetime):
+            ws_age_ms = (datetime.now(timezone.utc) - rx_time).total_seconds() * 1000
+        return {
+            "spread_bps": spread,
+            "tick_rate": tick_rate,
+            "impulse_bps": impulse_bps,
+            "mid": mid,
+            "bid": bid,
+            "ask": ask,
+            "ws_age_ms": ws_age_ms,
+        }

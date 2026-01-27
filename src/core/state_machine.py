@@ -31,10 +31,6 @@ class BotStateMachine:
         self.state = BotState.IDLE
         self.active_cycle = False
 
-    def arm(self, connected: bool) -> None:
-        if connected:
-            self.state = BotState.READY
-
     def start_cycle(self) -> bool:
         if self.state == BotState.READY:
             self.state = BotState.ENTERING

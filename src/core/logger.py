@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Optional
@@ -12,8 +14,62 @@ LOG_FORMAT = "%(asctime)s.%(msecs)03d | %(levelname)s | %(module)s | %(message)s
 DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 
+@dataclass
+class LogEntry:
+    timestamp: datetime
+    category: str
+    level: str
+    message: str
+    fields: dict[str, object]
+
+
 class QtLogEmitter(QObject):
     message = Signal(str)
+
+
+class LogBus(QObject):
+    entry = Signal(dict)
+
+    def __init__(self, logger: logging.Logger) -> None:
+        super().__init__()
+        self._logger = logger
+
+    def log(self, category: str, level: str, message: str, **fields: object) -> None:
+        normalized_level = level.upper()
+        entry = LogEntry(
+            timestamp=datetime.now(timezone.utc),
+            category=category.upper(),
+            level=normalized_level,
+            message=message,
+            fields=fields,
+        )
+        self._logger.log(self._level_to_number(normalized_level), self._format_entry(entry))
+        self.entry.emit(
+            {
+                "timestamp": entry.timestamp,
+                "category": entry.category,
+                "level": entry.level,
+                "message": entry.message,
+                "fields": entry.fields,
+            }
+        )
+
+    @staticmethod
+    def _level_to_number(level: str) -> int:
+        return {
+            "DEBUG": logging.DEBUG,
+            "INFO": logging.INFO,
+            "WARN": logging.WARNING,
+            "WARNING": logging.WARNING,
+            "ERROR": logging.ERROR,
+        }.get(level.upper(), logging.INFO)
+
+    @staticmethod
+    def _format_entry(entry: LogEntry) -> str:
+        fields = " ".join(f"{key}={value}" for key, value in entry.fields.items())
+        if fields:
+            return f"{entry.category} | {entry.message} | {fields}"
+        return f"{entry.category} | {entry.message}"
 
 
 class QtLogHandler(logging.Handler):
