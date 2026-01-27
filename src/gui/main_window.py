@@ -6,29 +6,31 @@ from pathlib import Path
 from typing import Optional
 
 from PySide6.QtCore import QTimer, Qt
-from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
+    QDoubleSpinBox,
     QFormLayout,
     QFrame,
     QGridLayout,
     QHBoxLayout,
     QLabel,
+    QLCDNumber,
     QMainWindow,
     QMessageBox,
-    QPushButton,
     QPlainTextEdit,
+    QPushButton,
+    QSizePolicy,
     QSpinBox,
-    QDoubleSpinBox,
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
-    QCheckBox,
 )
 
+from src.core.version import VERSION
 from src.core.config_store import SettingsStore
 from src.core.logger import QtLogEmitter, setup_logger
 from src.core.models import ConnectionMode, ConnectionSettings, MarketTick, StrategyParams
@@ -46,7 +48,7 @@ DEBUG = os.getenv("DEBUG", "false").lower() == "true"
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.version = "0.2.0"
+        self.version = VERSION
         self.setWindowTitle(f"Directional Hedge Scalper v{self.version} — BTCUSDT")
         self.setMinimumSize(1200, 720)
 
@@ -69,7 +71,7 @@ class MainWindow(QMainWindow):
 
         self.log_emitter = QtLogEmitter()
         self.logger = setup_logger(Path("logs"), self.log_emitter)
-        self.logger.info("[APP] version=0.2.0")
+        self.logger.info(f"[APP] version={self.version}")
 
         self.ws_thread = MarketDataThread("btcusdt")
         self.ws_thread.price_update.connect(self.on_price_update)
@@ -84,7 +86,7 @@ class MainWindow(QMainWindow):
         self.http_timer.timeout.connect(self.fetch_http_fallback)
 
         self.balance_timer = QTimer(self)
-        self.balance_timer.setInterval(7000)
+        self.balance_timer.setInterval(10_000)
         self.balance_timer.timeout.connect(self.refresh_balance)
 
         self.cooldown_timer = QTimer(self)
@@ -95,6 +97,21 @@ class MainWindow(QMainWindow):
         self.orderbook_ready = False
         self.last_balance_update: Optional[datetime] = None
         self.account_permissions = "—"
+        self.margin_permission_ok = False
+        self.margin_usdt_free = 0.0
+        self.margin_usdt_borrowed = 0.0
+        self.margin_usdt_interest = 0.0
+        self.margin_usdt_net = 0.0
+        self.margin_btc_free = 0.0
+        self.margin_btc_borrowed = 0.0
+        self.spot_usdt_free = 0.0
+        self.tick_size = 0.1
+        self.live_entry_price: Optional[float] = None
+        self.live_entry_qty: Optional[float] = None
+        self.live_order_id: Optional[int] = None
+        self.live_borrowed_amount: float = 0.0
+        self.live_borrowed_asset: Optional[str] = None
+        self.live_exposure = False
 
         self._build_ui()
         self._wire_signals()
@@ -156,9 +173,14 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(wrapper)
         layout.setSpacing(12)
 
-        layout.addWidget(make_card("Market", self._build_market_card()))
-        layout.addWidget(make_card("Account", self._build_account_card()))
-        layout.addWidget(make_card("Controls", self._build_controls_card()))
+        market_card = make_card("Market", self._build_market_card())
+        account_card = make_card("Account", self._build_account_card())
+        controls_card = make_card("Controls", self._build_controls_card())
+        for card in (market_card, account_card, controls_card):
+            card.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Minimum)
+        layout.addWidget(market_card)
+        layout.addWidget(account_card)
+        layout.addWidget(controls_card)
         layout.addStretch(1)
         return wrapper
 
@@ -175,19 +197,27 @@ class MainWindow(QMainWindow):
         self.price_source_label = QLabel("Source: Auto (WS→HTTP)")
         layout.addWidget(self.price_source_label)
 
-        self.mid_label = QLabel("—")
-        self.mid_label.setFont(QFont("Arial", 24, QFont.Bold))
-        self.mid_label.setAlignment(Qt.AlignCenter)
-        layout.addWidget(self.mid_label)
+        self.mid_display = QLCDNumber()
+        self.mid_display.setDigitCount(10)
+        self.mid_display.setSegmentStyle(QLCDNumber.Flat)
+        self.mid_display.setFixedHeight(48)
+        self.mid_display.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        layout.addWidget(self.mid_display)
 
-        self.bid_label = QLabel("Bid: —")
-        self.ask_label = QLabel("Ask: —")
-        self.spread_label = QLabel("Spread: — bps")
-        self.card_tick_age_label = QLabel("Tick age: — ms")
-        layout.addWidget(self.bid_label)
-        layout.addWidget(self.ask_label)
-        layout.addWidget(self.spread_label)
-        layout.addWidget(self.card_tick_age_label)
+        grid = QFormLayout()
+        grid.setLabelAlignment(Qt.AlignLeft)
+        grid.setFormAlignment(Qt.AlignLeft | Qt.AlignTop)
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(4)
+        self.bid_value = QLabel("—")
+        self.ask_value = QLabel("—")
+        self.spread_value = QLabel("—")
+        self.card_tick_age_value = QLabel("—")
+        grid.addRow("Bid", self.bid_value)
+        grid.addRow("Ask", self.ask_value)
+        grid.addRow("Spread (bps)", self.spread_value)
+        grid.addRow("Tick age (ms)", self.card_tick_age_value)
+        layout.addLayout(grid)
         return widget
 
     def _build_account_card(self) -> QWidget:
@@ -197,14 +227,16 @@ class MainWindow(QMainWindow):
 
         self.account_connection_label = QLabel("Connection: DISCONNECTED")
         self.account_data_label = QLabel("Data: —")
-        self.balance_label = QLabel("USDT Balance: —")
+        self.margin_balance_label = QLabel("USDT (MARGIN): —")
+        self.spot_balance_label = QLabel("USDT (SPOT): —")
         self.permissions_label = QLabel("Permissions: —")
         self.balance_updated_label = QLabel("Updated: —")
         self.balance_updated_label.setStyleSheet("color: #8c8c8c;")
 
         layout.addWidget(self.account_connection_label)
         layout.addWidget(self.account_data_label)
-        layout.addWidget(self.balance_label)
+        layout.addWidget(self.margin_balance_label)
+        layout.addWidget(self.spot_balance_label)
         layout.addWidget(self.permissions_label)
         layout.addWidget(self.balance_updated_label)
         return widget
@@ -228,8 +260,12 @@ class MainWindow(QMainWindow):
         cycle_layout.addWidget(self.stop_button)
         layout.addLayout(cycle_layout)
 
-        self.emergency_button = QPushButton("EMERGENCY FLATTEN")
+        self.emergency_button = QPushButton("FLATTEN NOW")
         layout.addWidget(self.emergency_button)
+
+        self.exposure_label = QLabel("exposure: none")
+        self.exposure_label.setStyleSheet("color: #8c8c8c;")
+        layout.addWidget(self.exposure_label)
 
         self.entry_allowed_label = QLabel("entry allowed: —")
         layout.addWidget(self.entry_allowed_label)
@@ -450,7 +486,6 @@ class MainWindow(QMainWindow):
         return widget
 
     def _wire_signals(self) -> None:
-        self.settings_tab.mode_futures.toggled.connect(self.on_mode_changed)
         self.settings_tab.connect_button.clicked.connect(self.connect_to_binance)
         self.settings_tab.disconnect_button.clicked.connect(self.disconnect_from_binance)
         self.settings_tab.save_button.clicked.connect(self.save_settings)
@@ -468,9 +503,6 @@ class MainWindow(QMainWindow):
         if DEBUG:
             self.add_test_trade_button.clicked.connect(self.add_test_trade)
         self.open_logs_button.clicked.connect(self.open_logs_folder)
-
-    def on_mode_changed(self) -> None:
-        self.settings_tab.leverage_combo.setEnabled(self.settings_tab.mode_futures.isChecked())
 
     def connect_to_binance(self) -> None:
         self._sync_settings_from_form()
@@ -495,9 +527,11 @@ class MainWindow(QMainWindow):
 
         self.connected = True
         self.state_machine.connect_ok()
+        self._load_exchange_info()
         self.load_orderbook_snapshot()
         self.start_ws_thread()
         self.balance_timer.start()
+        self.refresh_balance()
         self.logger.info("Connected (read-only) to Binance")
         self._update_ui_state()
 
@@ -558,6 +592,20 @@ class MainWindow(QMainWindow):
         started = self.state_machine.start_cycle()
         if not started:
             return
+        if self.settings_tab.live_enabled_checkbox.isChecked():
+            if not self.margin_permission_ok:
+                QMessageBox.warning(
+                    self,
+                    "Permissions",
+                    "Margin trading permission missing. Enable 'Spot & Margin trading' in API key.",
+                )
+                self.state_machine.stop()
+                return
+            if not self._start_live_cycle():
+                self.state_machine.stop()
+                return
+            return
+
         entry = self.orderbook.vwap_for_notional(
             self.strategy_params.sim_side, self.strategy_params.usd_notional
         )
@@ -575,11 +623,14 @@ class MainWindow(QMainWindow):
 
     def on_stop(self) -> None:
         self.state_machine.stop()
+        if self.settings_tab.live_enabled_checkbox.isChecked():
+            self._cancel_open_orders()
+            self._update_exposure_status()
         self.logger.info("Cycle stopped")
         self._update_ui_state()
 
     def on_emergency_flatten(self) -> None:
-        self.logger.warning("EMERGENCY FLATTEN requested (stub)")
+        self._flatten_now()
 
     def on_end_cycle(self) -> None:
         if self.state_machine.state != BotState.RUNNING:
@@ -606,7 +657,7 @@ class MainWindow(QMainWindow):
         )
         self.strategy_params.burst_volume_threshold = self.burst_volume_spin.value()
         self.strategy_params.auto_loop = self.auto_loop_checkbox.isChecked()
-        self.logger.info("Parameters applied")
+        self.logger.info("PARAMS applied")
         self._update_ui_state()
 
     def reset_params(self) -> None:
@@ -643,7 +694,10 @@ class MainWindow(QMainWindow):
         self.orderbook.apply_snapshot(payload["bids"], payload["asks"])
         self.orderbook_ready = self.orderbook.is_ready()
         if self.state_machine.state == BotState.RUNNING:
-            self._update_simulation_metrics()
+            if self.settings_tab.live_enabled_checkbox.isChecked():
+                self._update_live_metrics()
+            else:
+                self._update_simulation_metrics()
         self._update_ui_state()
 
     def on_ws_status(self, status: str) -> None:
@@ -689,24 +743,28 @@ class MainWindow(QMainWindow):
     def refresh_balance(self) -> None:
         if not self.connected:
             return
-        if self.connection_settings.mode == ConnectionMode.FUTURES:
-            balance = self.rest_client.get_futures_balance()
-            if not balance:
-                self.logger.warning("Failed to refresh futures balance")
-                return
-            usdt = next((item for item in balance if item.get("asset") == "USDT"), None)
-            if usdt:
-                available = float(usdt.get("availableBalance", 0.0))
-                total = float(usdt.get("balance", 0.0))
-                self.balance_label.setText(
-                    f"USDT Balance: {available:,.2f} free / {total:,.2f} total"
-                )
+        account = self.rest_client.get_spot_account()
+        if not account:
+            self.logger.warning("Failed to refresh spot account")
         else:
-            account = self.rest_client.get_spot_account()
-            if not account:
-                self.logger.warning("Failed to refresh spot account")
-                return
             self._update_balance_from_spot_account(account)
+            if account.get("canTrade") is False:
+                self.account_permissions = "READ-ONLY SPOT"
+
+        margin_account = self.rest_client.get_margin_account()
+        if not margin_account:
+            if self.rest_client.last_error_code in {-2015, -2014}:
+                self.logger.error("invalid api-key/permissions")
+            self.margin_permission_ok = False
+            self.account_permissions = "MARGIN NO PERMISSION"
+        else:
+            self.margin_permission_ok = True
+            self.account_permissions = (
+                "MARGIN OK (READ-ONLY SPOT)"
+                if account and account.get("canTrade") is False
+                else "MARGIN OK"
+            )
+            self._update_balance_from_margin_account(margin_account)
         self.last_balance_update = datetime.now(timezone.utc)
         self._update_ui_state()
 
@@ -716,18 +774,37 @@ class MainWindow(QMainWindow):
         if usdt:
             free = float(usdt.get("free", 0.0))
             locked = float(usdt.get("locked", 0.0))
-            total = free + locked
-            self.balance_label.setText(f"USDT Balance: {free:,.2f} free / {total:,.2f} total")
+            self.spot_usdt_free = free
+            self.spot_balance_label.setText(f"USDT (SPOT): free={free:,.2f}")
+
+    def _update_balance_from_margin_account(self, account: dict) -> None:
+        assets = account.get("userAssets", [])
+        usdt = next((item for item in assets if item.get("asset") == "USDT"), None)
+        btc = next((item for item in assets if item.get("asset") == "BTC"), None)
+        if usdt:
+            self.margin_usdt_free = float(usdt.get("free", 0.0))
+            self.margin_usdt_borrowed = float(usdt.get("borrowed", 0.0))
+            self.margin_usdt_interest = float(usdt.get("interest", 0.0))
+            self.margin_usdt_net = float(usdt.get("netAsset", 0.0))
+            self.margin_balance_label.setText(
+                "USDT (MARGIN): "
+                f"free={self.margin_usdt_free:,.2f} "
+                f"borrowed={self.margin_usdt_borrowed:,.2f} "
+                f"net={self.margin_usdt_net:,.2f}"
+            )
+        if btc:
+            self.margin_btc_free = float(btc.get("free", 0.0))
+            self.margin_btc_borrowed = float(btc.get("borrowed", 0.0))
 
     def _update_market_labels(self) -> None:
-        self.mid_label.setText(f"{self.market_tick.mid:,.2f}")
-        self.bid_label.setText(f"Bid: {self.market_tick.bid:,.2f}")
-        self.ask_label.setText(f"Ask: {self.market_tick.ask:,.2f}")
-        self.spread_label.setText(f"Spread: {self.market_tick.spread_bps:.2f} bps")
+        self.mid_display.display(f"{self.market_tick.mid:,.2f}")
+        self.bid_value.setText(f"{self.market_tick.bid:,.2f}")
+        self.ask_value.setText(f"{self.market_tick.ask:,.2f}")
+        self.spread_value.setText(f"{self.market_tick.spread_bps:.2f}")
         now = datetime.now(timezone.utc)
         age_ms = (now - self.market_tick.rx_time).total_seconds() * 1000
         self.tick_age_label.setText(f"Tick age: {age_ms:.0f} ms")
-        self.card_tick_age_label.setText(f"Tick age: {age_ms:.0f} ms")
+        self.card_tick_age_value.setText(f"{age_ms:.0f}")
         self.last_update_label.setText(
             f"Last update: {self.market_tick.rx_time.strftime('%H:%M:%S.%f')[:-3]}"
         )
@@ -755,6 +832,223 @@ class MainWindow(QMainWindow):
             return
         self.sim_condition = "SIM RUNNING"
         self._update_sim_labels()
+
+    def _start_live_cycle(self) -> bool:
+        side = self.strategy_params.sim_side
+        notional = self.strategy_params.usd_notional
+        if side == "SELL" and self.margin_btc_free <= 0:
+            QMessageBox.warning(self, "Balance", "SELL blocked: no BTC available in margin.")
+            return False
+
+        borrow_needed = 0.0
+        if side == "BUY" and self.margin_usdt_free < notional:
+            borrow_needed = notional - self.margin_usdt_free
+            max_allowed = max(self.margin_usdt_net * self.connection_settings.leverage, 0.0)
+            if max_allowed <= 0 or self.margin_usdt_free + borrow_needed > max_allowed:
+                QMessageBox.warning(
+                    self,
+                    "Leverage",
+                    "Borrow limit reached for target leverage.",
+                )
+                return False
+            borrow_resp = self.rest_client.borrow_margin_asset("USDT", borrow_needed)
+            if not borrow_resp:
+                self.logger.error("Borrow failed")
+                return False
+            self.live_borrowed_amount = borrow_needed
+            self.live_borrowed_asset = "USDT"
+
+        order = self._place_live_order(side=side, notional=notional, entry=True)
+        if not order:
+            return False
+        self.live_entry_price, self.live_entry_qty = self._extract_fill(order)
+        self.live_order_id = int(order.get("orderId", 0)) if order.get("orderId") else None
+        self.live_exposure = True
+        self.sim_entry_price = self.live_entry_price
+        self.sim_entry_qty = self.live_entry_qty
+        self.sim_exit_price = None
+        self.cycle_start_time = datetime.now(timezone.utc)
+        self.sim_condition = "LIVE ENTRY"
+        self.logger.info("Cycle started (LIVE micro-trade)")
+        self._update_exposure_status()
+        self._update_ui_state()
+        return True
+
+    def _update_live_metrics(self) -> None:
+        if not self.live_entry_price or not self.live_entry_qty:
+            return
+        exit_side = "SELL" if self.strategy_params.sim_side == "BUY" else "BUY"
+        exit_price = self.market_tick.mid
+        if exit_side == "SELL":
+            raw_bps = (exit_price / self.live_entry_price - 1) * 10_000
+        else:
+            raw_bps = (self.live_entry_price / exit_price - 1) * 10_000
+        net_bps = raw_bps - self.strategy_params.fee_total_bps
+        self.sim_raw_bps = raw_bps
+        self.sim_net_bps = net_bps
+        if net_bps >= self.strategy_params.target_net_bps:
+            self._close_live_position(note="LIVE TARGET")
+            return
+        if raw_bps <= -self.strategy_params.max_loss_bps:
+            self._close_live_position(note="LIVE STOP")
+            return
+        self.sim_condition = "LIVE RUNNING"
+        self._update_sim_labels()
+
+    def _close_live_position(self, note: str) -> None:
+        if self.state_machine.state != BotState.RUNNING:
+            return
+        close_side = "SELL" if self.strategy_params.sim_side == "BUY" else "BUY"
+        order = self._place_live_order(
+            side=close_side,
+            notional=self.strategy_params.usd_notional,
+            entry=False,
+        )
+        if not order:
+            self.logger.error("Close order failed")
+            return
+        exit_price, _ = self._extract_fill(order)
+        self.sim_exit_price = exit_price
+        entry_price = self.live_entry_price or self.market_tick.mid
+        if self.strategy_params.sim_side == "BUY":
+            raw_bps = (exit_price / entry_price - 1) * 10_000
+        else:
+            raw_bps = (entry_price / exit_price - 1) * 10_000
+        net_bps = raw_bps - self.strategy_params.fee_total_bps
+        net_usd = (net_bps / 10_000) * self.strategy_params.usd_notional
+        self.add_trade_row(
+            side=self.strategy_params.sim_side,
+            entry_price=entry_price,
+            exit_price=exit_price,
+            raw_bps=raw_bps,
+            fees_bps=self.strategy_params.fee_total_bps,
+            net_bps=net_bps,
+            net_usd=net_usd,
+            duration_s=self._elapsed_seconds(),
+            note=note,
+        )
+        if self.live_borrowed_asset and self.live_borrowed_amount > 0:
+            self.rest_client.repay_margin_asset(self.live_borrowed_asset, self.live_borrowed_amount)
+        self.live_borrowed_asset = None
+        self.live_borrowed_amount = 0.0
+        self.live_exposure = False
+        self.state_machine.finish_cycle()
+        self.cooldown_timer.start(self.strategy_params.cooldown_s * 1000)
+        self.sim_condition = note
+        self.logger.info(f"Cycle finished ({note})")
+        self.refresh_balance()
+        self._update_exposure_status()
+        self._update_ui_state()
+
+    def _place_live_order(self, side: str, notional: float, entry: bool) -> Optional[dict]:
+        order_mode = self.strategy_params.order_mode
+        payload: dict[str, str] = {"symbol": "BTCUSDT", "side": side}
+        if order_mode == "market":
+            payload["type"] = "MARKET"
+            if side == "BUY":
+                payload["quoteOrderQty"] = f"{notional:.2f}"
+            else:
+                qty = self.margin_btc_free if entry else self.live_entry_qty or self.margin_btc_free
+                if qty <= 0:
+                    self.logger.error("SELL blocked: no BTC available")
+                    return None
+                payload["quantity"] = f"{qty:.6f}"
+            return self.rest_client.place_margin_order(payload)
+
+        best_ask = self.orderbook.best_ask() or self.market_tick.ask
+        best_bid = self.orderbook.best_bid() or self.market_tick.bid
+        if side == "BUY":
+            price = self._round_to_tick(best_ask + self.tick_size)
+        else:
+            price = self._round_to_tick(best_bid - self.tick_size)
+        payload.update({"type": "LIMIT", "price": f"{price:.2f}", "timeInForce": "IOC"})
+        if side == "BUY":
+            qty = notional / price if price > 0 else 0.0
+            payload["quantity"] = f"{qty:.6f}"
+        else:
+            qty = self.margin_btc_free if entry else self.live_entry_qty or self.margin_btc_free
+            if qty <= 0:
+                self.logger.error("SELL blocked: no BTC available")
+                return None
+            payload["quantity"] = f"{qty:.6f}"
+
+        order = self.rest_client.place_margin_order(payload)
+        if order:
+            return order
+        self.logger.warning("IOC limit failed, fallback to MARKET")
+        payload = {"symbol": "BTCUSDT", "side": side, "type": "MARKET"}
+        if side == "BUY":
+            payload["quoteOrderQty"] = f"{notional:.2f}"
+        else:
+            qty = self.margin_btc_free if entry else self.live_entry_qty or self.margin_btc_free
+            if qty <= 0:
+                self.logger.error("SELL blocked: no BTC available")
+                return None
+            payload["quantity"] = f"{qty:.6f}"
+        return self.rest_client.place_margin_order(payload)
+
+    def _extract_fill(self, order: dict) -> tuple[float, float]:
+        executed_qty = float(order.get("executedQty", 0.0) or 0.0)
+        cumm_quote = float(order.get("cummulativeQuoteQty", 0.0) or 0.0)
+        if executed_qty > 0 and cumm_quote > 0:
+            return cumm_quote / executed_qty, executed_qty
+        return self.market_tick.mid, executed_qty
+
+    def _cancel_open_orders(self) -> None:
+        open_orders = self.rest_client.get_open_margin_orders("BTCUSDT") or []
+        for order in open_orders:
+            order_id = order.get("orderId")
+            if order_id:
+                self.rest_client.cancel_margin_order("BTCUSDT", int(order_id))
+
+    def _flatten_now(self) -> None:
+        self._cancel_open_orders()
+        if self.margin_btc_free > 0:
+            payload = {
+                "symbol": "BTCUSDT",
+                "side": "SELL",
+                "type": "MARKET",
+                "quantity": f"{self.margin_btc_free:.6f}",
+            }
+            self.rest_client.place_margin_order(payload)
+        if self.live_borrowed_asset and self.live_borrowed_amount > 0:
+            self.rest_client.repay_margin_asset(self.live_borrowed_asset, self.live_borrowed_amount)
+        self.live_borrowed_asset = None
+        self.live_borrowed_amount = 0.0
+        self.refresh_balance()
+        self._update_exposure_status()
+        self.logger.warning("EMERGENCY FLATTEN executed")
+
+    def _update_exposure_status(self) -> None:
+        if self.margin_btc_free > 0:
+            self.exposure_label.setText("exposure: OPEN EXPOSURE")
+            self.exposure_label.setStyleSheet("color: #e74c3c; font-weight: 600;")
+        else:
+            self.exposure_label.setText("exposure: none")
+            self.exposure_label.setStyleSheet("color: #8c8c8c;")
+
+    def _round_to_tick(self, price: float) -> float:
+        if self.tick_size <= 0:
+            return price
+        return round(price / self.tick_size) * self.tick_size
+
+    def _load_exchange_info(self) -> None:
+        info = self.rest_client.get_exchange_info("BTCUSDT")
+        if not info:
+            return
+        symbols = info.get("symbols", [])
+        if not symbols:
+            return
+        filters = symbols[0].get("filters", [])
+        price_filter = next(
+            (item for item in filters if item.get("filterType") == "PRICE_FILTER"),
+            None,
+        )
+        if price_filter and price_filter.get("tickSize"):
+            try:
+                self.tick_size = float(price_filter["tickSize"])
+            except ValueError:
+                self.tick_size = 0.1
 
     def _finish_sim_cycle(self, note: str) -> None:
         if self.state_machine.state != BotState.RUNNING:
@@ -856,11 +1150,22 @@ class MainWindow(QMainWindow):
                 f"Updated: {self.last_balance_update.strftime('%H:%M:%S')}"
             )
 
+        if not self.margin_permission_ok:
+            self.settings_tab.live_enabled_checkbox.setChecked(False)
+            self.settings_tab.live_enabled_checkbox.setEnabled(False)
+            self.settings_tab.live_warning.setText(
+                "Margin permission missing: enable Spot & Margin trading."
+            )
+        else:
+            self.settings_tab.live_enabled_checkbox.setEnabled(True)
+            self.settings_tab.live_warning.setText("Отправляет реальные ордера")
+
         entry_allowed = self._entry_allowed()
         self.entry_allowed_label.setText(f"entry allowed: {str(entry_allowed).lower()}")
         self.entry_allowed_label.setStyleSheet(
             "color: #27ae60;" if entry_allowed else "color: #e74c3c;"
         )
+        self._update_exposure_status()
         self._update_state_labels()
         self._update_sim_labels()
 
@@ -931,55 +1236,54 @@ class MainWindow(QMainWindow):
         self.sim_exit_price = None
         self.sim_raw_bps = None
         self.sim_net_bps = None
+        self.live_entry_price = None
+        self.live_entry_qty = None
+        self.live_order_id = None
+        self.live_borrowed_amount = 0.0
+        self.live_borrowed_asset = None
+        self.live_exposure = False
 
     def _sync_settings_from_form(self) -> None:
         self.connection_settings.api_key = self.settings_tab.api_key_input.text().strip()
         self.connection_settings.api_secret = self.settings_tab.api_secret_input.text().strip()
-        self.connection_settings.mode = (
-            ConnectionMode.FUTURES
-            if self.settings_tab.mode_futures.isChecked()
-            else ConnectionMode.MARGIN
-        )
+        self.connection_settings.mode = ConnectionMode.MARGIN
         self.connection_settings.leverage = int(self.settings_tab.leverage_combo.currentText()[0])
         self.connection_settings.save_local = self.settings_tab.save_checkbox.isChecked()
+        self.connection_settings.live_enabled = (
+            self.settings_tab.live_enabled_checkbox.isChecked()
+        )
 
     def _load_settings_into_form(self) -> None:
         self.settings_tab.api_key_input.setText(self.connection_settings.api_key)
         self.settings_tab.api_secret_input.setText(self.connection_settings.api_secret)
-        if self.connection_settings.mode == ConnectionMode.FUTURES:
-            self.settings_tab.mode_futures.setChecked(True)
-        else:
-            self.settings_tab.mode_margin.setChecked(True)
         self.settings_tab.leverage_combo.setCurrentText(f"{self.connection_settings.leverage}x")
         self.settings_tab.save_checkbox.setChecked(self.connection_settings.save_local)
-        self.on_mode_changed()
+        self.settings_tab.live_enabled_checkbox.setChecked(self.connection_settings.live_enabled)
 
     def _validate_account_access(self, test_only: bool = False) -> bool:
-        if self.connection_settings.mode == ConnectionMode.FUTURES:
-            account = self.rest_client.get_futures_account()
-            if not account:
-                self._handle_connection_error("Futures account access denied")
-                return False
-            balance = self.rest_client.get_futures_balance()
-            if not balance:
-                self._handle_connection_error("Futures balance unavailable")
-                return False
-            self.account_permissions = "FUTURES OK"
-            if not test_only:
-                self.refresh_balance()
-            return True
-
         account = self.rest_client.get_spot_account()
         if not account:
             self._handle_connection_error("Spot account access denied")
             return False
         can_trade = account.get("canTrade")
-        if can_trade is False:
-            self.account_permissions = "READ-ONLY"
+        spot_permissions = "READ-ONLY" if can_trade is False else "SPOT OK"
+
+        margin_account = self.rest_client.get_margin_account()
+        if not margin_account:
+            self.margin_permission_ok = False
+            self.account_permissions = "MARGIN NO PERMISSION"
+            if self.rest_client.last_error_code in {-2015, -2014}:
+                self.logger.error("invalid api-key/permissions")
         else:
-            self.account_permissions = "SPOT OK"
+            self.margin_permission_ok = True
+            self.account_permissions = "MARGIN OK"
+
+        if spot_permissions == "READ-ONLY" and self.account_permissions == "MARGIN OK":
+            self.account_permissions = "MARGIN OK (READ-ONLY SPOT)"
         if not test_only:
             self._update_balance_from_spot_account(account)
+            if margin_account:
+                self._update_balance_from_margin_account(margin_account)
         return True
 
     def _handle_connection_error(self, message: str) -> None:
@@ -988,6 +1292,8 @@ class MainWindow(QMainWindow):
         QMessageBox.warning(self, "Connection Error", message)
 
     def _entry_allowed(self) -> bool:
+        if self.settings_tab.live_enabled_checkbox.isChecked() and not self.margin_permission_ok:
+            return False
         return (
             self.connected
             and self.state_machine.state == BotState.READY

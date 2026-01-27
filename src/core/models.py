@@ -18,6 +18,7 @@ class ConnectionSettings:
     mode: ConnectionMode = ConnectionMode.MARGIN
     leverage: int = 1
     save_local: bool = True
+    live_enabled: bool = False
 
 
 @dataclass

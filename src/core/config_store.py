@@ -43,6 +43,7 @@ class SettingsStore:
             "mode": data.get("BINANCE_MODE", ConnectionMode.MARGIN.value),
             "leverage": int(data.get("BINANCE_LEVERAGE", "1")),
             "save_local": True,
+            "live_enabled": data.get("BINANCE_LIVE_ENABLED", "false").lower() == "true",
         }
         return self._settings_from_payload(payload)
 
@@ -58,4 +59,5 @@ class SettingsStore:
             mode=mode,
             leverage=int(payload.get("leverage", 1)),
             save_local=bool(payload.get("save_local", True)),
+            live_enabled=bool(payload.get("live_enabled", False)),
         )
