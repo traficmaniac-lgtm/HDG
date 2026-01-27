@@ -39,7 +39,28 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 Write-Host "[INFO] Starting GUI..."
-& $venvPython -m src.app.main
+$logFile = Join-Path -Path $PSScriptRoot -ChildPath "run_gui.log"
+if (Test-Path $logFile) {
+    Remove-Item $logFile -Force -ErrorAction SilentlyContinue
+}
+
+Write-Host "[INFO] Logs will be written to: $logFile"
+& $venvPython -m src.app.main 1> $logFile 2>&1
+$exitCode = $LASTEXITCODE
+
+if ($exitCode -ne 0) {
+    Write-Host "[ERROR] GUI failed to start. Exit code: $exitCode"
+    Write-Host "[ERROR] Last output:"
+    if (Test-Path $logFile) {
+        Get-Content $logFile
+    } else {
+        Write-Host "[ERROR] Log file not found: $logFile"
+    }
+    Write-Host ""
+    Write-Host "[INFO] Full log: $logFile"
+    Read-Host "Press Enter to exit"
+    exit $exitCode
+}
 
 Write-Host "[INFO] GUI exited."
 Read-Host "Press Enter to exit"
