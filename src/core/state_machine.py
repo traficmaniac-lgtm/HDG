@@ -68,11 +68,11 @@ class BotStateMachine:
             BotState.ERROR,
         }:
             self.state = BotState.COOLDOWN
-            self.active_cycle = False
 
     def end_cooldown(self) -> None:
         if self.state == BotState.COOLDOWN:
             self.state = BotState.ARMED
+            self.active_cycle = False
 
     def set_error(self, message: str) -> None:
         self.state = BotState.ERROR

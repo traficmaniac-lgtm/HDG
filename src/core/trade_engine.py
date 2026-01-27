@@ -217,6 +217,25 @@ class TradeEngine(QObject):
             return
         self.depth_snapshot.emit(depth)
 
+    def fetch_open_orders(self, symbol: str) -> list[dict]:
+        return self._rest_client.get_open_margin_orders(symbol) or []
+
+    def fetch_position_state(self, symbol: str) -> dict[str, float]:
+        base_asset = symbol.replace("USDT", "")
+        margin_account = self._rest_client.get_margin_account() or {}
+        assets = margin_account.get("userAssets", [])
+        asset = next((item for item in assets if item.get("asset") == base_asset), None)
+        net_asset = float(asset.get("netAsset", 0.0)) if asset else 0.0
+        long_qty = max(net_asset, 0.0)
+        short_qty = max(-net_asset, 0.0)
+        return {"long_qty": long_qty, "short_qty": short_qty, "net_qty": net_asset}
+
+    def is_flat(self, symbol: str, tolerance: float = 0.0) -> bool:
+        open_orders = self.fetch_open_orders(symbol)
+        pos = self.fetch_position_state(symbol)
+        net_qty = pos.get("net_qty", 0.0)
+        return not open_orders and abs(net_qty) <= tolerance
+
     @Slot()
     def fetch_http_fallback(self) -> None:
         data = self._http_fallback.get_book_ticker("BTCUSDT")
@@ -318,6 +337,12 @@ class TradeEngine(QObject):
             state=state.value,
             cycle_id=self._state_machine.cycle_id,
             active_cycle=active_cycle,
+            inflight_entry=telemetry.inflight_entry,
+            inflight_exit=telemetry.inflight_exit,
+            open_orders_count=telemetry.open_orders_count,
+            pos_long_qty=telemetry.pos_long_qty,
+            pos_short_qty=telemetry.pos_short_qty,
+            last_action=telemetry.last_action,
             start_ts=self._cycle.cycle_start,
             duration_s=telemetry.duration_s,
             entry_mid=telemetry.entry_mid,

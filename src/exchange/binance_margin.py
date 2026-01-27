@@ -67,6 +67,7 @@ class BinanceMarginExecution:
         side_effect_type: Optional[str] = None,
         time_in_force: Optional[str] = None,
         is_isolated: bool = False,
+        client_order_id: Optional[str] = None,
     ) -> Optional[dict[str, Any]]:
         resolved_side_effect = side_effect_type
         if resolved_side_effect not in self._VALID_SIDE_EFFECT_TYPES:
@@ -87,6 +88,8 @@ class BinanceMarginExecution:
             "isIsolated": "TRUE" if is_isolated else "FALSE",
             "sideEffectType": resolved_side_effect,
         }
+        if client_order_id:
+            payload["newClientOrderId"] = client_order_id
         if order_mode == "aggressive_limit":
             if price is None:
                 raise ValueError("price required for aggressive_limit")
