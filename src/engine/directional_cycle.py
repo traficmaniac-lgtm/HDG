@@ -116,6 +116,10 @@ class DirectionalCycle:
         self._last_position_refresh_ts = 0.0
         self._entry_pos_long_qty = 0.0
         self._entry_pos_short_qty = 0.0
+        self._trades_count = 0
+        self._phase_seq = 0
+        self._ride_start_ts: Optional[float] = None
+        self._last_transition_reason: Optional[str] = None
         self._market_data.set_detect_window_ticks(self._detect_window_ticks)
 
     @property
@@ -165,6 +169,7 @@ class DirectionalCycle:
             total_net = winner_net + loser_net
         return CycleTelemetry(
             cycle_id=self._state_machine.cycle_id,
+            phase_seq=self._phase_seq,
             state=state.value,
             active_cycle=active_cycle,
             inflight_entry=self._inflight_entry,
@@ -222,6 +227,40 @@ class DirectionalCycle:
             BotState.ARMED: "ARMED",
             BotState.IDLE: "IDLE",
         }.get(state, state.value)
+
+    def _set_phase(self, state: BotState, reason: str, action: Optional[str] = None) -> None:
+        self._state_machine.state = state
+        self._phase_seq += 1
+        self._last_transition_reason = reason
+        if action:
+            self._last_action = action
+        self._log_cycle_state(reason=reason, action=self._last_action)
+
+    def _log_cycle_state(self, reason: str, action: Optional[str]) -> None:
+        tick = self._market_data.get_last_effective_tick() or {}
+        last_mid = tick.get("mid")
+        total_raw = None
+        total_net = None
+        if self._winner_raw_bps is not None and self._loser_raw_bps is not None:
+            total_raw = self._winner_raw_bps + self._loser_raw_bps
+        if self._winner_net_bps is not None and self._loser_net_bps is not None:
+            total_net = self._winner_net_bps + self._loser_net_bps
+        self._emit_log(
+            "CYCLE",
+            "INFO",
+            "[CYCLE]",
+            id=self._state_machine.cycle_id,
+            phase_seq=self._phase_seq,
+            state=self._state_machine.state.value,
+            reason=reason,
+            pos_long=self._pos_long_qty,
+            pos_short=self._pos_short_qty,
+            open_orders=self._open_orders_count,
+            last_mid=last_mid,
+            raw=total_raw,
+            net=total_net,
+            action=action,
+        )
 
     @property
     def exposure_open(self) -> bool:
@@ -381,6 +420,8 @@ class DirectionalCycle:
         self._waiting_for_data = False
         self._inflight_entry = True
         self._inflight_exit = False
+        self._phase_seq = 0
+        self._ride_start_ts = None
         self._entry_mid = None
         self._entry_qty = None
         self._detect_start_ts = None
@@ -404,6 +445,8 @@ class DirectionalCycle:
         self._last_cycle_result = None
         self._last_detect_sample_log_ts = 0.0
         self._last_action = None
+        self._trades_count = 0
+        self._set_phase(BotState.ENTERING, reason="cycle_start")
         self._reset_detect_buffer()
         self._emit_log(
             "CYCLE",
@@ -426,7 +469,7 @@ class DirectionalCycle:
             self._inflight_entry = False
             return
         self._inflight_entry = False
-        self._state_machine.state = BotState.DETECTING
+        self._set_phase(BotState.DETECTING, reason="enter_filled", action="ENTER_FILLED")
         self._detect_start_ts = time.monotonic()
         self._reset_detect_buffer()
         self._emit_log(
@@ -442,6 +485,14 @@ class DirectionalCycle:
     def _enter_hedge(self) -> bool:
         if self._inflight_entry is False:
             self._inflight_entry = True
+        if self._state_machine.state != BotState.ENTERING:
+            self._emit_log(
+                "GUARD",
+                "WARN",
+                "[GUARD] enter_not_allowed",
+                state=self._state_machine.state.value,
+            )
+            return False
         tick = self._market_data.get_last_ws_tick() or {}
         mid = float(tick.get("mid", 0.0))
         bid = float(tick.get("bid", 0.0))
@@ -485,6 +536,7 @@ class DirectionalCycle:
                 price=sell_price,
                 side_effect_type="AUTO_BORROW_REPAY",
                 client_order_id=sell_client_id,
+                order_kind="OPEN_SHORT",
             )
             if not sell_order:
                 self._log_partial("partial_hedge_entry", qty, None, sell_order)
@@ -495,6 +547,7 @@ class DirectionalCycle:
                 buy_mode,
                 price=buy_price,
                 client_order_id=buy_client_id,
+                order_kind="OPEN_LONG",
             )
         except Exception as exc:
             self._emit_log(
@@ -503,7 +556,7 @@ class DirectionalCycle:
                 "ENTER order exception",
                 error=str(exc),
             )
-            self._emergency_flatten(reason="enter_exception")
+            self._timeout_to_cooldown("enter_exception")
             return False
         buy_id = buy_order.get("orderId") if buy_order else None
         sell_id = sell_order.get("orderId") if sell_order else None
@@ -518,6 +571,7 @@ class DirectionalCycle:
             sell_id=sell_id,
             qty=qty,
         )
+        self._last_action = "ENTER_SENT"
         self._emit_log(
             "TRADE",
             "INFO",
@@ -537,6 +591,7 @@ class DirectionalCycle:
             buy_mode,
             buy_price,
             client_order_id=buy_client_id,
+            timeout_ms=self._strategy.wait_fill_timeout_ms,
         )
         sell_fill = self._wait_for_fill_with_fallback(
             "SELL",
@@ -546,6 +601,7 @@ class DirectionalCycle:
             sell_price,
             side_effect_type="AUTO_BORROW_REPAY",
             client_order_id=sell_client_id,
+            timeout_ms=self._strategy.wait_fill_timeout_ms,
         )
         if not buy_fill or not sell_fill:
             buy_status = self._execution.get_order(int(buy_id)) if buy_id else None
@@ -565,6 +621,9 @@ class DirectionalCycle:
         self._exposure_open = True
         self._emit_exposure(True)
         self._refresh_position_cache(force=True)
+        if not self._wait_for_positions("entry_positions", self._strategy.wait_positions_timeout_ms):
+            self._timeout_to_cooldown("entry_positions_timeout")
+            return False
         self._entry_pos_long_qty = self._pos_long_qty
         self._entry_pos_short_qty = self._pos_short_qty
         self._emit_log(
@@ -676,41 +735,61 @@ class DirectionalCycle:
             cycle_id=self._state_machine.cycle_id,
             winner=self._winner_side,
         )
-        self._state_machine.state = BotState.CUTTING
+        self._set_phase(BotState.CUTTING, reason="detect_winner", action="CUT_SENT")
         self._cut_loser()
 
     def _cut_loser(self) -> None:
         if not self._entry_qty or not self._loser_side:
             self._set_error("missing_loser")
             return
-        side = "BUY" if self._loser_side == "SHORT" else "SELL"
-        side_effect = "AUTO_REPAY" if self._loser_side == "SHORT" else None
-        order_mode, price = self._order_params(side)
-        client_order_id = self._build_client_order_id("LOSE", "EXIT")
-        order = self._place_order(
-            side,
-            self._entry_qty,
-            order_mode,
-            price=price,
-            side_effect_type=side_effect,
-            client_order_id=client_order_id,
-        )
-        if not order:
-            self._emergency_flatten(reason="cut_loser_failed")
-            self._set_error("cut_loser_failed")
-            return
-        fill = self._wait_for_fill_with_fallback(
-            side,
-            order.get("orderId"),
-            self._entry_qty,
-            order_mode,
-            price,
-            side_effect_type=side_effect,
-            client_order_id=client_order_id,
-        )
-        if not fill:
-            self._emergency_flatten(reason="cut_loser_timeout")
-            self._set_error("cut_loser_timeout")
+        try:
+            self._refresh_position_cache(force=True)
+            qty = (
+                self._pos_short_qty
+                if self._loser_side == "SHORT"
+                else self._pos_long_qty
+            )
+            qty = self._normalize_qty(qty)
+            if qty <= 0:
+                self._timeout_to_cooldown("cut_qty_zero")
+                return
+            side = "BUY" if self._loser_side == "SHORT" else "SELL"
+            side_effect = "AUTO_REPAY" if self._loser_side == "SHORT" else None
+            order_mode, price = self._order_params(side)
+            client_order_id = self._build_client_order_id("LOSE", "EXIT")
+            order = self._place_order(
+                side,
+                qty,
+                order_mode,
+                price=price,
+                side_effect_type=side_effect,
+                client_order_id=client_order_id,
+                order_kind="CLOSE_SHORT" if self._loser_side == "SHORT" else "CLOSE_LONG",
+            )
+            if not order:
+                self._timeout_to_cooldown("cut_loser_failed")
+                return
+            fill = self._wait_for_fill_with_fallback(
+                side,
+                order.get("orderId"),
+                qty,
+                order_mode,
+                price,
+                side_effect_type=side_effect,
+                client_order_id=client_order_id,
+                timeout_ms=self._strategy.wait_fill_timeout_ms,
+            )
+            if not fill:
+                self._timeout_to_cooldown("cut_loser_timeout")
+                return
+        except Exception as exc:
+            self._emit_log(
+                "ERROR",
+                "ERROR",
+                "CUT order exception",
+                error=str(exc),
+            )
+            self._timeout_to_cooldown("cut_loser_exception")
             return
         self._loser_exit_price = fill[0]
         self._loser_raw_bps = self._calc_raw_bps(
@@ -742,6 +821,17 @@ class DirectionalCycle:
             self._emergency_flatten(reason="cut_loser_not_reduced")
             self._set_error("cut_loser_not_reduced")
             return
+        step = self._filters.step_size or 0.0
+        if self._pos_long_qty > step and self._pos_short_qty > step:
+            self._emit_log(
+                "GUARD",
+                "WARN",
+                "[GUARD] cut_loser_multiple_positions",
+                pos_long_qty=self._pos_long_qty,
+                pos_short_qty=self._pos_short_qty,
+            )
+            self._timeout_to_cooldown("cut_loser_multi_pos")
+            return
         self._emit_log(
             "TRADE",
             "INFO",
@@ -759,7 +849,8 @@ class DirectionalCycle:
             client_order_id=client_order_id,
         )
         self._emit_log("STATE", "INFO", "CUT_DONE", cycle_id=self._state_machine.cycle_id)
-        self._state_machine.state = BotState.RIDING
+        self._set_phase(BotState.RIDING, reason="cut_done", action="CUT_FILLED")
+        self._ride_start_ts = time.monotonic()
         self._evaluate_riding()
 
     def _evaluate_riding(self) -> None:
@@ -767,7 +858,8 @@ class DirectionalCycle:
             return
         if not self._last_tick or not self._entry_mid or not self._winner_side:
             return
-        effective_age_ms = self._market_data.get_snapshot().effective_age_ms
+        snapshot = self._market_data.get_snapshot()
+        effective_age_ms = snapshot.effective_age_ms
         tick = self._market_data.get_last_effective_tick() or self._last_tick
         mid_now = self._mid_from_tick_decimal(tick or {})
         if mid_now is None:
@@ -795,9 +887,14 @@ class DirectionalCycle:
                 net_bps=f"{winner_net_bps:.2f}",
             )
             self._last_ride_log_ts = now
-        if effective_age_ms > 1500:
-            self._exit_winner("data_stale")
+        if snapshot.data_stale or effective_age_ms > self._strategy.data_stale_exit_ms:
+            self._timeout_to_cooldown("data_stale")
             return
+        if self._ride_start_ts:
+            ride_elapsed_ms = (now - self._ride_start_ts) * 1000
+            if ride_elapsed_ms >= self._strategy.max_ride_ms:
+                self._exit_winner("max_ride_timeout")
+                return
         if winner_raw_bps <= -self._strategy.emergency_stop_bps:
             self._exit_winner("emergency_stop")
             return
@@ -810,37 +907,57 @@ class DirectionalCycle:
     def _exit_winner(self, note: str) -> None:
         if not self._entry_qty or not self._winner_side:
             return
-        self._state_machine.state = BotState.EXITING
+        self._set_phase(BotState.EXITING, reason=note, action="EXIT_SENT")
         self._last_reason = note
         self._inflight_exit = True
-        side = "SELL" if self._winner_side == "LONG" else "BUY"
-        side_effect = "AUTO_REPAY" if self._winner_side == "SHORT" else None
-        order_mode, price = self._order_params(side)
-        client_order_id = self._build_client_order_id("WIN", "EXIT")
-        order = self._place_order(
-            side,
-            self._entry_qty,
-            order_mode,
-            price=price,
-            side_effect_type=side_effect,
-            client_order_id=client_order_id,
-        )
-        if not order:
-            self._emergency_flatten(reason="exit_winner_failed")
-            self._set_error("exit_winner_failed")
-            return
-        fill = self._wait_for_fill_with_fallback(
-            side,
-            order.get("orderId"),
-            self._entry_qty,
-            order_mode,
-            price,
-            side_effect_type=side_effect,
-            client_order_id=client_order_id,
-        )
-        if not fill:
-            self._emergency_flatten(reason="exit_winner_timeout")
-            self._set_error("exit_winner_timeout")
+        try:
+            self._refresh_position_cache(force=True)
+            qty = (
+                self._pos_long_qty
+                if self._winner_side == "LONG"
+                else self._pos_short_qty
+            )
+            qty = self._normalize_qty(qty)
+            if qty <= 0:
+                self._timeout_to_cooldown("exit_qty_zero")
+                return
+            side = "SELL" if self._winner_side == "LONG" else "BUY"
+            side_effect = "AUTO_REPAY" if self._winner_side == "SHORT" else None
+            order_mode, price = self._order_params(side)
+            client_order_id = self._build_client_order_id("WIN", "EXIT")
+            order = self._place_order(
+                side,
+                qty,
+                order_mode,
+                price=price,
+                side_effect_type=side_effect,
+                client_order_id=client_order_id,
+                order_kind="CLOSE_LONG" if self._winner_side == "LONG" else "CLOSE_SHORT",
+            )
+            if not order:
+                self._timeout_to_cooldown("exit_winner_failed")
+                return
+            fill = self._wait_for_fill_with_fallback(
+                side,
+                order.get("orderId"),
+                qty,
+                order_mode,
+                price,
+                side_effect_type=side_effect,
+                client_order_id=client_order_id,
+                timeout_ms=self._strategy.wait_exit_timeout_ms,
+            )
+            if not fill:
+                self._timeout_to_cooldown("exit_winner_timeout")
+                return
+        except Exception as exc:
+            self._emit_log(
+                "ERROR",
+                "ERROR",
+                "EXIT order exception",
+                error=str(exc),
+            )
+            self._timeout_to_cooldown("exit_winner_exception")
             return
         self._winner_exit_price = fill[0]
         self._exit_mid = self._winner_exit_price
@@ -877,7 +994,7 @@ class DirectionalCycle:
         self._exposure_open = False
         self._emit_exposure(False)
         self._settle_borrow()
-        if not self._is_flat(force=True):
+        if not self._wait_for_positions("exit_flat", self._strategy.wait_positions_timeout_ms):
             self._emit_log(
                 "GUARD",
                 "WARN",
@@ -886,11 +1003,89 @@ class DirectionalCycle:
                 pos_long_qty=self._pos_long_qty,
                 pos_short_qty=self._pos_short_qty,
             )
-            self._controlled_flatten(reason="exit_not_flat")
+            if not self._cleanup_close_winner():
+                self._timeout_to_cooldown("exit_not_flat")
+                return
         self._state_machine.finish_cycle()
         self._inflight_exit = False
         self._emit_log("STATE", "INFO", "CYCLE_DONE", cycle_id=self._state_machine.cycle_id)
         self._log_cycle_end("OK", reason=note)
+
+    def _timeout_to_cooldown(self, reason: str) -> None:
+        self._last_reason = reason
+        self._last_action = "FLATTEN_SENT"
+        self._emit_log(
+            "ERROR",
+            "ERROR",
+            "[TIMEOUT] fallback",
+            cycle_id=self._state_machine.cycle_id,
+            reason=reason,
+        )
+        self._execution.cancel_open_orders()
+        if not self._abort_if_not_authorized("timeout_cancel_orders"):
+            self._emergency_flatten(reason=reason)
+        self._state_machine.finish_cycle()
+        self._inflight_entry = False
+        self._inflight_exit = False
+        self._emit_log("STATE", "INFO", "CYCLE_DONE", cycle_id=self._state_machine.cycle_id)
+        self._log_cycle_end("TIMEOUT", reason=reason)
+
+    def _wait_for_positions(self, label: str, timeout_ms: float) -> bool:
+        start = time.monotonic()
+        while (time.monotonic() - start) * 1000 < timeout_ms:
+            self._refresh_position_cache(force=True)
+            if self._open_orders_count == 0 and abs(self._pos_net_qty) <= (
+                self._filters.step_size or 0.0
+            ):
+                return True
+            time.sleep(0.1)
+        self._emit_log(
+            "WARN",
+            "WARN",
+            "[WAIT] positions_timeout",
+            cycle_id=self._state_machine.cycle_id,
+            label=label,
+            open_orders_count=self._open_orders_count,
+            pos_long_qty=self._pos_long_qty,
+            pos_short_qty=self._pos_short_qty,
+        )
+        return False
+
+    def _cleanup_close_winner(self) -> bool:
+        if not self._winner_side:
+            return False
+        self._refresh_position_cache(force=True)
+        qty = (
+            self._pos_long_qty
+            if self._winner_side == "LONG"
+            else self._pos_short_qty
+        )
+        qty = self._normalize_qty(qty)
+        if qty <= 0:
+            return True
+        side = "SELL" if self._winner_side == "LONG" else "BUY"
+        side_effect = "AUTO_REPAY" if self._winner_side == "SHORT" else None
+        order = self._place_order(
+            side,
+            qty,
+            "market",
+            side_effect_type=side_effect,
+            client_order_id=self._build_client_order_id("WIN", "CLEANUP"),
+            order_kind="CLOSE_LONG" if self._winner_side == "LONG" else "CLOSE_SHORT",
+        )
+        if not order:
+            return False
+        fill = self._wait_for_fill_with_fallback(
+            side,
+            order.get("orderId"),
+            qty,
+            "market",
+            None,
+            side_effect_type=side_effect,
+            client_order_id=order.get("clientOrderId"),
+            timeout_ms=self._strategy.wait_exit_timeout_ms,
+        )
+        return bool(fill)
 
     def _no_winner_exit(self, reason: str, allow_flatten: bool, no_loss: bool) -> None:
         self._emit_log("TRADE", "INFO", "DETECT no winner", reason=reason)
@@ -959,6 +1154,7 @@ class DirectionalCycle:
     def _log_deal(self, order: dict[str, Any], tag: str) -> None:
         if not order:
             return
+        self._trades_count += 1
         self._emit_log(
             "DEALS",
             "INFO",
@@ -1040,7 +1236,19 @@ class DirectionalCycle:
         price: float,
         side_effect_type: Optional[str],
         client_order_id: Optional[str],
+        order_kind: Optional[str],
     ) -> Optional[dict[str, Any]]:
+        if order_kind in {"OPEN_LONG", "OPEN_SHORT"} and self._state_machine.state != BotState.ENTERING:
+            self._emit_log(
+                "GUARD",
+                "WARN",
+                "[GUARD] open_order_blocked",
+                cycle_id=self._state_machine.cycle_id,
+                state=self._state_machine.state.value,
+                kind=order_kind,
+                side=side,
+            )
+            return None
         order = self._execution.place_order(
             side,
             qty,
@@ -1054,10 +1262,15 @@ class DirectionalCycle:
             "ORDER",
             "INFO",
             "[ORDER] sent",
+            cycle_id=self._state_machine.cycle_id,
+            kind=order_kind,
             side=side,
             qty=qty,
             order_mode="aggressive_limit",
             price=price,
+            tif="IOC",
+            reduceOnly=False,
+            sideEffectType=side_effect_type,
             client_order_id=client_order_id,
         )
         self._abort_if_not_authorized("place_ioc_order")
@@ -1093,6 +1306,7 @@ class DirectionalCycle:
                 buy_price or 0.0,
                 buy_side_effect,
                 buy_client_id,
+                order_kind="CLOSE_SHORT",
             )
             sell_order = self._place_ioc_aggressive_limit(
                 "SELL",
@@ -1100,6 +1314,7 @@ class DirectionalCycle:
                 sell_price or 0.0,
                 sell_side_effect,
                 sell_client_id,
+                order_kind="CLOSE_LONG",
             )
         else:
             buy_order = self._place_order(
@@ -1108,6 +1323,7 @@ class DirectionalCycle:
                 "market",
                 side_effect_type=buy_side_effect,
                 client_order_id=buy_client_id,
+                order_kind="CLOSE_SHORT",
             )
             sell_order = self._place_order(
                 "SELL",
@@ -1115,6 +1331,7 @@ class DirectionalCycle:
                 "market",
                 side_effect_type=sell_side_effect,
                 client_order_id=sell_client_id,
+                order_kind="CLOSE_LONG",
             )
         if self._abort_if_not_authorized("no_winner_place_orders"):
             return False
@@ -1126,6 +1343,7 @@ class DirectionalCycle:
             buy_price,
             side_effect_type=buy_side_effect,
             client_order_id=buy_client_id,
+            timeout_ms=self._strategy.wait_fill_timeout_ms,
         )
         sell_fill = self._wait_for_fill_with_fallback(
             "SELL",
@@ -1135,6 +1353,7 @@ class DirectionalCycle:
             sell_price,
             side_effect_type=sell_side_effect,
             client_order_id=sell_client_id,
+            timeout_ms=self._strategy.wait_fill_timeout_ms,
         )
         if not buy_fill or not sell_fill:
             self._emit_log(
@@ -1224,6 +1443,17 @@ class DirectionalCycle:
             winner=winner_side,
             reason=reason or self._last_reason,
             duration_ms=duration_ms,
+        )
+        self._emit_log(
+            "CYCLE",
+            "INFO",
+            "[CYCLE_SUMMARY]",
+            id=self._state_machine.cycle_id,
+            result=result,
+            pnl_est=self._last_net_usd,
+            fees_est=self._strategy.fee_total_bps,
+            duration_ms=duration_ms,
+            trades_count=self._trades_count,
         )
         self._reset_detect_buffer()
 
@@ -1404,12 +1634,7 @@ class DirectionalCycle:
             self._detect_mid_buffer.append(mid)
 
     def _handle_detect_timeout(self) -> None:
-        policy = self._strategy.no_winner_policy.upper()
-        allow_flatten = self._strategy.allow_no_winner_flatten and self._exposure_open
-        if policy == "NO_LOSS":
-            self._no_winner_exit("detect_timeout", allow_flatten=allow_flatten, no_loss=True)
-        else:
-            self._no_winner_exit("detect_timeout", allow_flatten=allow_flatten, no_loss=False)
+        self._timeout_to_cooldown("detect_timeout")
 
     def _round_step(self, qty: float) -> float:
         step = self._filters.step_size
@@ -1511,7 +1736,19 @@ class DirectionalCycle:
         price: Optional[float] = None,
         side_effect_type: Optional[str] = None,
         client_order_id: Optional[str] = None,
+        order_kind: Optional[str] = None,
     ) -> Optional[dict[str, Any]]:
+        if order_kind in {"OPEN_LONG", "OPEN_SHORT"} and self._state_machine.state != BotState.ENTERING:
+            self._emit_log(
+                "GUARD",
+                "WARN",
+                "[GUARD] open_order_blocked",
+                cycle_id=self._state_machine.cycle_id,
+                state=self._state_machine.state.value,
+                kind=order_kind,
+                side=side,
+            )
+            return None
         time_in_force = "GTC" if order_mode == "aggressive_limit" else None
         order = self._execution.place_order(
             side,
@@ -1526,10 +1763,15 @@ class DirectionalCycle:
             "ORDER",
             "INFO",
             "[ORDER] sent",
+            cycle_id=self._state_machine.cycle_id,
+            kind=order_kind,
             side=side,
             qty=qty,
             order_mode=order_mode,
             price=price,
+            tif=time_in_force,
+            reduceOnly=False,
+            sideEffectType=side_effect_type,
             client_order_id=client_order_id,
         )
         self._abort_if_not_authorized("place_order")
@@ -1544,10 +1786,12 @@ class DirectionalCycle:
         price: Optional[float],
         side_effect_type: Optional[str] = None,
         client_order_id: Optional[str] = None,
+        timeout_ms: Optional[int] = None,
     ) -> Optional[tuple[float, float, dict[str, Any]]]:
+        timeout_s = (timeout_ms or 3000) / 1000
         if order_mode != "aggressive_limit":
-            return self._execution.wait_for_fill(order_id, timeout_s=3.0)
-        fill = self._execution.wait_for_fill(order_id, timeout_s=0.4)
+            return self._execution.wait_for_fill(order_id, timeout_s=timeout_s)
+        fill = self._execution.wait_for_fill(order_id, timeout_s=min(0.4, timeout_s))
         if fill:
             return fill
         if order_id:
@@ -1568,6 +1812,8 @@ class DirectionalCycle:
             "ORDER",
             "INFO",
             "[ORDER] fallback",
+            cycle_id=self._state_machine.cycle_id,
+            kind="FALLBACK",
             side=side,
             qty=qty,
             order_mode="market",
@@ -1577,7 +1823,10 @@ class DirectionalCycle:
             return None
         if not market_order:
             return None
-        return self._execution.wait_for_fill(market_order.get("orderId"), timeout_s=3.0)
+        return self._execution.wait_for_fill(
+            market_order.get("orderId"),
+            timeout_s=timeout_s,
+        )
 
     def _current_data_source(self) -> str:
         return self._market_data.get_snapshot().effective_source
@@ -1696,7 +1945,7 @@ class DirectionalCycle:
         self._last_reason = reason
         self._inflight_exit = True
         self._last_action = "FLATTEN"
-        self._state_machine.state = BotState.CONTROLLED_FLATTEN
+        self._set_phase(BotState.CONTROLLED_FLATTEN, reason=reason, action="FLATTEN_SENT")
         self._emit_log(
             "STATE",
             "INFO",
@@ -1731,6 +1980,7 @@ class DirectionalCycle:
                     "market",
                     side_effect_type="NO_SIDE_EFFECT",
                     client_order_id=sell_client_id,
+                    order_kind="CLOSE_LONG",
                 )
                 if self._abort_if_not_authorized("controlled_sell"):
                     return False
@@ -1745,6 +1995,7 @@ class DirectionalCycle:
                     "market",
                     side_effect_type="AUTO_REPAY",
                     client_order_id=buy_client_id,
+                    order_kind="CLOSE_SHORT",
                 )
                 if self._abort_if_not_authorized("controlled_buy"):
                     return False
@@ -1864,6 +2115,7 @@ class DirectionalCycle:
                     sell_qty,
                     "market",
                     client_order_id=sell_client_id,
+                    order_kind="CLOSE_LONG",
                 )
                 if self._abort_if_not_authorized("emergency_sell"):
                     return
@@ -1876,6 +2128,7 @@ class DirectionalCycle:
                     "market",
                     side_effect_type="AUTO_REPAY",
                     client_order_id=buy_client_id,
+                    order_kind="CLOSE_SHORT",
                 )
                 if self._abort_if_not_authorized("emergency_buy"):
                     return
@@ -1958,6 +2211,10 @@ class DirectionalCycle:
     def _check_timeouts(self) -> None:
         if self._state_machine.state == BotState.DETECTING:
             self._evaluate_detecting()
+        if self._state_machine.state == BotState.RIDING and self._ride_start_ts:
+            elapsed_ms = (time.monotonic() - self._ride_start_ts) * 1000
+            if elapsed_ms >= self._strategy.max_ride_ms:
+                self._exit_winner("max_ride_timeout")
 
     def _log_skip(self, reason: str) -> None:
         now = time.monotonic()

@@ -124,6 +124,7 @@ class MainWindow(QMainWindow):
         self.pos_long_qty = 0.0
         self.pos_short_qty = 0.0
         self.last_action: Optional[str] = None
+        self.phase_seq = 0
 
         self.logger = setup_logger(Path("logs"))
         self.log_bus = LogBus(self.logger)
@@ -383,6 +384,7 @@ class MainWindow(QMainWindow):
         self.pos_long_label = QLabel("pos_long_qty: 0.0")
         self.pos_short_label = QLabel("pos_short_qty: 0.0")
         self.last_action_label = QLabel("last_action: —")
+        self.phase_seq_label = QLabel("phase_seq: 0")
 
         state_layout.addWidget(self.state_label, 0, 0)
         state_layout.addWidget(self.active_cycle_label, 0, 1)
@@ -395,6 +397,7 @@ class MainWindow(QMainWindow):
         state_layout.addWidget(self.pos_long_label, 3, 0)
         state_layout.addWidget(self.pos_short_label, 3, 1)
         state_layout.addWidget(self.last_action_label, 3, 2)
+        state_layout.addWidget(self.phase_seq_label, 4, 0)
 
         self.bps_panel = QFrame()
         self.bps_panel.setFrameShape(QFrame.StyledPanel)
@@ -972,6 +975,7 @@ class MainWindow(QMainWindow):
         self.pos_long_qty = float(view_model.pos_long_qty)
         self.pos_short_qty = float(view_model.pos_short_qty)
         self.last_action = view_model.last_action
+        self.phase_seq = int(view_model.phase_seq)
         if self.waiting_for_data:
             self.sim_reason = "WAIT_DATA"
         self._update_ui_state()
@@ -1168,6 +1172,7 @@ class MainWindow(QMainWindow):
         self.pos_long_label.setText(f"pos_long_qty: {self.pos_long_qty:.6f}")
         self.pos_short_label.setText(f"pos_short_qty: {self.pos_short_qty:.6f}")
         self.last_action_label.setText(f"last_action: {self.last_action or '—'}")
+        self.phase_seq_label.setText(f"phase_seq: {self.phase_seq}")
 
     def _update_ui_state(self) -> None:
         connection_text = "ПОДКЛЮЧЕНО" if self.connected else "ОТКЛЮЧЕНО"

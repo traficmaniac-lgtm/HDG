@@ -265,12 +265,36 @@ class TradeEngine(QObject):
             return
         if not self._auto_loop or self._stop_requested:
             return
+        if self._state_machine.active_cycle and self._state_machine.state not in {
+            BotState.IDLE,
+            BotState.ARMED,
+        }:
+            self._emit_log(
+                "GUARD",
+                "WARN",
+                "REENTRY_BLOCKED",
+                state=self._state_machine.state.value,
+                cycle_id=self._state_machine.cycle_id,
+            )
+            return
         self._cycle.attempt_entry()
         self._emit_cycle_state()
 
     @Slot()
     def start_trading(self) -> None:
         if self._trade_gate == "ERROR_NOT_AUTHORIZED":
+            return
+        if self._state_machine.active_cycle and self._state_machine.state not in {
+            BotState.IDLE,
+            BotState.ARMED,
+        }:
+            self._emit_log(
+                "GUARD",
+                "WARN",
+                "REENTRY_BLOCKED",
+                state=self._state_machine.state.value,
+                cycle_id=self._state_machine.cycle_id,
+            )
             return
         self._auto_loop = True
         self._stop_requested = False
@@ -336,6 +360,7 @@ class TradeEngine(QObject):
         view_model = CycleViewModel(
             state=state.value,
             cycle_id=self._state_machine.cycle_id,
+            phase_seq=telemetry.phase_seq,
             active_cycle=active_cycle,
             inflight_entry=telemetry.inflight_entry,
             inflight_exit=telemetry.inflight_exit,
