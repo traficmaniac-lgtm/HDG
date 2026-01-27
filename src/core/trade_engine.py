@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import faulthandler
-import io
+import sys
 import threading
 import time
+import traceback
 from datetime import datetime, timezone
 
 from PySide6.QtCore import QObject, Signal, Slot
@@ -249,13 +249,19 @@ class TradeEngine(QObject):
                 self._emit_log("ERROR", "ERROR", "Фриз GUI", lag_s=f"{lag:.2f}", dump=dump)
 
     def _dump_threads(self) -> str:
-        buffer = io.StringIO()
-        buffer.write("Thread dump:\n")
+        buffer_lines = ["Thread dump:"]
+        frames = sys._current_frames()
         for thread in threading.enumerate():
-            buffer.write(f"- {thread.name} (alive={thread.is_alive()})\n")
-        buffer.write("\nStack:\n")
-        faulthandler.dump_traceback(file=buffer)
-        return buffer.getvalue()
+            buffer_lines.append(f"- {thread.name} (alive={thread.is_alive()})")
+            frame = frames.get(thread.ident)
+            if frame is None:
+                buffer_lines.append("  <no frame available>")
+                continue
+            stack = traceback.format_stack(frame)
+            buffer_lines.append("  Stack:")
+            buffer_lines.extend(f"    {line.rstrip()}" for line in stack)
+            buffer_lines.append("")
+        return "\n".join(buffer_lines)
 
     def _emit_log(self, category: str, level: str, message: str, **fields: object) -> None:
         self.log.emit(
