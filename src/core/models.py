@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
+from decimal import Decimal
 from enum import Enum
 from typing import Optional
 
@@ -33,6 +34,9 @@ class MarketTick:
     ask: float = 0.0
     mid: float = 0.0
     spread_bps: float = 0.0
+    bid_raw: Decimal = Decimal("0")
+    ask_raw: Decimal = Decimal("0")
+    mid_raw: Decimal = Decimal("0")
     event_time: datetime = field(default_factory=datetime.utcnow)
     rx_time: datetime = field(default_factory=datetime.utcnow)
 
@@ -64,13 +68,17 @@ class StrategyParams:
     max_spread_bps: float = 8.0
     min_tick_rate: int = 5
     detect_timeout_ms: int = 800
+    use_impulse_filter: bool = True
     impulse_min_bps: float = 1.0
+    impulse_grace_ms: int = 2000
+    impulse_degrade_mode: str = "DISABLE_AFTER_GRACE"
     winner_threshold_bps: float = 1.0
     emergency_stop_bps: int = 10
     cooldown_s: int = 3
     detect_window_ticks: int = 2
     burst_volume_threshold: float = 0.0
     auto_loop: bool = False
+    max_cycles: int = 0
 
 
 @dataclass

@@ -4,6 +4,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any, Callable, Deque, Optional
 
 from src.core.models import MarketDataMode, StrategyParams, SymbolFilters
@@ -76,6 +77,7 @@ class DirectionalCycle:
         self._winner_net_bps: Optional[float] = None
         self._loser_raw_bps: Optional[float] = None
         self._loser_net_bps: Optional[float] = None
+        self._last_net_usd: Optional[float] = None
         self._last_reason: Optional[str] = None
         self._ws_age_ms: Optional[float] = None
         self._http_age_ms: Optional[float] = None
@@ -93,6 +95,8 @@ class DirectionalCycle:
         self._armed_ts: Optional[float] = None
         self._last_non_impulse_skip_ts = 0.0
         self._last_impulse_block_warn_ts = 0.0
+        self._last_impulse_degrade_log_ts = 0.0
+        self._ws_rx_times: Deque[float] = deque()
         self._market_data.set_detect_window_ticks(self._strategy.detect_window_ticks)
 
     @property
@@ -142,6 +146,13 @@ class DirectionalCycle:
     def update_tick(self, payload: dict[str, Any]) -> None:
         source = str(payload.get("source", "WS"))
         if source == "WS":
+            rx_time_ms = payload.get("rx_time_ms")
+            if rx_time_ms is None:
+                rx_time_ms = time.monotonic() * 1000
+            self._ws_rx_times.append(float(rx_time_ms))
+            cutoff_ms = float(rx_time_ms) - 1000.0
+            while self._ws_rx_times and self._ws_rx_times[0] < cutoff_ms:
+                self._ws_rx_times.popleft()
             now = time.monotonic()
             mid = float(payload.get("mid", 0.0))
             if mid > 0:
@@ -238,6 +249,15 @@ class DirectionalCycle:
         self._loser_net_bps = None
         self._entry_tick_count = len(self._tick_history)
         self._last_reason = None
+        self._last_net_usd = None
+        self._emit_log(
+            "CYCLE",
+            "INFO",
+            "[CYCLE] START",
+            n=self._state_machine.cycle_id,
+            side="HEDGE",
+            symbol=self._execution.symbol,
+        )
         self._emit_log("TRADE", "INFO", "ENTER cycle", cycle_id=self._state_machine.cycle_id)
         self._emit_log("STATE", "INFO", "ENTER_START", cycle_id=self._state_machine.cycle_id)
         if not self._enter_hedge():
@@ -265,6 +285,18 @@ class DirectionalCycle:
         if self._filters.min_notional and qty * mid < self._filters.min_notional:
             self._set_error("min_notional")
             return False
+        metrics = self._compute_entry_metrics()
+        self._emit_log(
+            "TRADE",
+            "INFO",
+            "[ENTRY] OK",
+            data=metrics["effective_source"],
+            spread_bps=f"{metrics['spread_bps']:.2f}",
+            tick_rate=metrics["tick_rate"],
+            impulse_bps=f"{metrics['impulse_bps']:.4f}",
+            qty=qty,
+            mid=f"{metrics['mid']:.2f}",
+        )
         self._entry_qty = qty
         try:
             sell_mode, sell_price = self._order_params("SELL", bid, ask)
@@ -528,6 +560,7 @@ class DirectionalCycle:
         self._settle_borrow()
         self._state_machine.finish_cycle()
         self._emit_log("STATE", "INFO", "CYCLE_DONE", cycle_id=self._state_machine.cycle_id)
+        self._log_cycle_end("OK", reason=note)
 
     def _no_winner_exit(self, reason: str) -> None:
         self._emit_log("TRADE", "INFO", "DETECT no winner", reason=reason)
@@ -536,6 +569,7 @@ class DirectionalCycle:
         self._last_reason = reason
         self._state_machine.finish_cycle()
         self._emit_log("STATE", "INFO", "CYCLE_DONE", cycle_id=self._state_machine.cycle_id)
+        self._log_cycle_end("NO_WINNER", reason=reason)
 
     def _log_partial(self, reason: str, qty: float) -> None:
         self._emit_log(
@@ -551,6 +585,7 @@ class DirectionalCycle:
         self._emergency_flatten(reason=reason)
         self._state_machine.set_error(reason)
         self._state_machine.finish_cycle()
+        self._log_cycle_end("ERROR", reason=reason)
 
     def _log_deal(self, order: dict[str, Any], tag: str) -> None:
         if not order:
@@ -581,6 +616,7 @@ class DirectionalCycle:
         loser_net = loser_raw - self._strategy.fee_total_bps
         net_total = winner_net + loser_net
         net_usd = (self._strategy.usd_notional / 10_000) * net_total
+        self._last_net_usd = net_usd
         self._emit_trade_row(
             {
                 "ts": now,
@@ -610,6 +646,24 @@ class DirectionalCycle:
             note=note,
         )
 
+    def _log_cycle_end(self, result: str, reason: Optional[str] = None) -> None:
+        if not self._cycle_start:
+            return
+        now = datetime.now(timezone.utc)
+        duration_ms = int((now - self._cycle_start).total_seconds() * 1000)
+        winner_side = self._winner_side or "—"
+        self._emit_log(
+            "CYCLE",
+            "INFO",
+            "[CYCLE] END",
+            n=self._state_machine.cycle_id,
+            result=result,
+            pnl_usdt=self._last_net_usd,
+            winner=winner_side,
+            reason=reason or self._last_reason,
+            duration_ms=duration_ms,
+        )
+
     def _entry_filter_reason(self) -> Optional[str]:
         metrics = self._compute_entry_metrics()
         if metrics["data_stale"]:
@@ -618,14 +672,54 @@ class DirectionalCycle:
             return "spread"
         if metrics["tick_rate"] < self._strategy.min_tick_rate:
             return "tick_rate"
-        if self._strategy.impulse_min_bps > 0:
+        if self._strategy.use_impulse_filter and self._strategy.impulse_min_bps > 0:
+            impulse_reason: Optional[str] = None
             if not metrics["impulse_ready"]:
-                return "wait_ticks"
-            if metrics["impulse_bps"] < self._strategy.impulse_min_bps:
-                return "impulse"
+                impulse_reason = "wait_ticks"
+            elif metrics["impulse_bps"] < self._strategy.impulse_min_bps:
+                impulse_reason = "impulse"
+            if impulse_reason:
+                if self._should_degrade_impulse(metrics):
+                    self._maybe_log_impulse_degraded(metrics)
+                else:
+                    return impulse_reason
         if metrics["mid"] > 0 and not self._leverage_ok(metrics["mid"]):
             return "leverage_limit"
         return None
+
+    def _should_degrade_impulse(self, metrics: dict[str, float | bool]) -> bool:
+        if not self._strategy.use_impulse_filter:
+            return False
+        if self._strategy.impulse_grace_ms <= 0:
+            return False
+        if self._armed_ts is None:
+            return False
+        elapsed_ms = (time.monotonic() - self._armed_ts) * 1000
+        if elapsed_ms < self._strategy.impulse_grace_ms:
+            return False
+        if metrics["data_stale"]:
+            return False
+        if metrics["spread_bps"] > self._strategy.max_spread_bps:
+            return False
+        if metrics["tick_rate"] < self._strategy.min_tick_rate:
+            return False
+        return True
+
+    def _maybe_log_impulse_degraded(self, metrics: dict[str, float | bool]) -> None:
+        now = time.monotonic()
+        if now - self._last_impulse_degrade_log_ts < 1.0:
+            return
+        self._last_impulse_degrade_log_ts = now
+        self._emit_log(
+            "TRADE",
+            "INFO",
+            "[ENTRY] impulse_degraded",
+            grace_ms=self._strategy.impulse_grace_ms,
+            impulse_bps=f"{metrics['impulse_bps']:.4f}",
+            tick_rate=metrics["tick_rate"],
+            spread_bps=f"{metrics['spread_bps']:.2f}",
+            mode=self._strategy.impulse_degrade_mode,
+        )
 
     def _compute_entry_metrics(self) -> dict[str, float | bool]:
         tick = (
@@ -638,22 +732,27 @@ class DirectionalCycle:
         ask = float(tick.get("ask", 0.0))
         mid = float(tick.get("mid", 0.0))
         spread = float(tick.get("spread_bps", 0.0))
-        now = time.monotonic()
-        cutoff = now - 1.0
-        ticks = [tick_data for tick_data in self._tick_history if tick_data[0] >= cutoff]
-        tick_rate = len(ticks) / 1.0 if ticks else 0.0
+        now_ms = time.monotonic() * 1000
+        cutoff_ms = now_ms - 1000.0
+        while self._ws_rx_times and self._ws_rx_times[0] < cutoff_ms:
+            self._ws_rx_times.popleft()
+        tick_rate = int(len(self._ws_rx_times))
         impulse_bps = 0.0
         ref_mid = 0.0
         delta_mid = 0.0
         impulse_ready = False
-        ws_mid_buffer = self._market_data.get_ws_mid_buffer()
-        if len(ws_mid_buffer) >= 2:
+        prev_mid_raw, last_mid_raw = self._market_data.get_ws_mid_raws()
+        if prev_mid_raw is not None and last_mid_raw is not None:
             impulse_ready = True
-            ref_mid = ws_mid_buffer[0]
-            mid_now = ws_mid_buffer[-1]
-            if ref_mid > 0:
-                delta_mid = mid_now - ref_mid
-                impulse_bps = abs(delta_mid) / ref_mid * 10_000
+            ref_mid_raw = prev_mid_raw
+            mid_now_raw = last_mid_raw
+            if ref_mid_raw > 0:
+                delta_raw = mid_now_raw - ref_mid_raw
+                impulse_bps = float(
+                    (abs(delta_raw) / ref_mid_raw) * Decimal("10000")
+                )
+                ref_mid = float(ref_mid_raw)
+                delta_mid = float(delta_raw)
         snapshot = self._market_data.get_snapshot()
         ws_age_ms = snapshot.ws_age_ms
         http_age_ms = snapshot.http_age_ms
@@ -936,14 +1035,28 @@ class DirectionalCycle:
         if reason == "data_stale":
             self._log_wait_data(metrics)
         self._maybe_warn_impulse_block(now, reason)
+        skip_flags = []
+        if metrics["data_stale"]:
+            skip_flags.append("data")
+        if metrics["spread_bps"] > self._strategy.max_spread_bps:
+            skip_flags.append("spread")
+        if metrics["tick_rate"] < self._strategy.min_tick_rate:
+            skip_flags.append("tick")
+        if self._strategy.use_impulse_filter and self._strategy.impulse_min_bps > 0:
+            if not metrics["impulse_ready"] or metrics["impulse_bps"] < self._strategy.impulse_min_bps:
+                skip_flags.append("impulse")
+        if reason == "leverage_limit":
+            skip_flags.append("leverage")
         self._emit_log(
             "TRADE",
             "INFO",
             "SKIP entry",
             reason=reason,
+            blocked_by=reason,
+            skip_flags=skip_flags,
             spread_bps=f"{metrics['spread_bps']:.2f}",
             spread_limit=self._strategy.max_spread_bps,
-            tick_rate=f"{metrics['tick_rate']:.2f}",
+            tick_rate=metrics["tick_rate"],
             tick_rate_limit=self._strategy.min_tick_rate,
             impulse_bps=f"{metrics['impulse_bps']:.2f}",
             impulse_limit=self._strategy.impulse_min_bps,
@@ -963,7 +1076,7 @@ class DirectionalCycle:
     def _maybe_warn_impulse_block(self, now: float, reason: str) -> None:
         if reason not in {"impulse", "wait_ticks"}:
             return
-        if self._strategy.impulse_min_bps <= 0:
+        if not self._strategy.use_impulse_filter or self._strategy.impulse_min_bps <= 0:
             return
         if self._armed_ts is None:
             return
