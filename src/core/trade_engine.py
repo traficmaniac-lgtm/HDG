@@ -387,6 +387,7 @@ class TradeEngine(QObject):
         self._trade_gate = "ERROR_NOT_AUTHORIZED"
         self._auto_loop = False
         self._stop_requested = True
+        self._margin_permission_ok = False
         path = self._rest_client.last_error_path or "<unknown>"
         params = self._rest_client.last_error_params or {}
         safe_params = {
@@ -395,6 +396,14 @@ class TradeEngine(QObject):
             if str(key).lower() not in {"signature", "api_key", "apikey"}
         }
         print(f"\033[31m[NOT_AUTHORIZED] endpoint={path} params={safe_params}\033[0m")
+        self.balance_update.emit(
+            {
+                "spot_account": None,
+                "margin_account": None,
+                "margin_permission_ok": False,
+                "error": self._rest_client.last_error,
+            }
+        )
         self._emit_log(
             "ERROR",
             "ERROR",
