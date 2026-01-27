@@ -1,91 +1,131 @@
 # Алгоритмы расчётов (метрики и фильтры)
 
-Этот документ описывает формулы, вычисления и пороговые проверки,
-которые используются алгоритмом в разных фазах цикла.
+Документ описывает фактические вычисления, которые используются в `DirectionalCycle`
+и `MarketDataService`.
 
 ## Базовые вычисления цены
 
-- **Mid price**: `mid = (bid + ask) / 2` (или приходит напрямую в тике).
+- **Mid price**: `mid = (bid + ask) / 2`.
 - **Spread в bps**: `spread_bps = (ask - bid) / mid * 10_000`.
-- **Raw bps**:
-  - LONG: `(to_mid - from_mid) / from_mid * 10_000`.
-  - SHORT: `(from_mid - to_mid) / from_mid * 10_000`.
+- **Raw bps** относительно `entry_mid`:
+  - LONG: `(mid_now - entry_mid) / entry_mid * 10_000`.
+  - SHORT: `(entry_mid - mid_now) / entry_mid * 10_000`.
 
-## Скорость тиков и импульс
+> В live WS потоках используются Decimal (`bid_raw`, `ask_raw`, `mid_raw`) для
+> избежания потерь точности при расчёте импульса.
 
-- **Tick rate** — количество тиков за последнюю секунду:
-  `tick_rate = ticks_last_1s / 1s`.
-- **Импульс (impulse_bps)** — абсолютное изменение mid между двумя последними WS-тика:
-  `abs(last_ws_mid - prev_ws_mid) / prev_ws_mid * 10_000`.
+## Выбор effective tick
 
-## Проверка свежести данных
+Алгоритм использует `MarketDataService` для выбора актуального тика:
 
-Для вычислений берётся **effective tick** (WS/HTTP в зависимости от режима). Значение
-`data_stale = True`, если источник данных `NONE`.
+- `WS_ONLY` → используется только WS (если свежий).
+- `HTTP_ONLY` → используется только HTTP (если свежий).
+- `HYBRID` → автоматическое переключение:
+  - WS «свежий», если `ws_age_ms <= 500`.
+  - HTTP «свежий», если `http_age_ms <= 1200`.
+  - При падении WS держится HTTP ещё `1500ms` (`http_hold_ms`).
+  - Возврат на WS требует `ws_recovery_ticks` подряд свежих тиков.
 
-- **Возраст WS данных**: `ws_age_ms = now_ms - last_ws_tick_ms`.
-- **Возраст HTTP данных**: `http_age_ms = now_ms - last_http_tick_ms`.
-- **Effective age**:
-  - WS → `ws_age_ms`,
-  - HTTP → `http_age_ms`,
-  - NONE → `9999`.
+Если `effective_source == NONE`, то `data_stale=True`.
 
-Пороговые значения:
+## Tick rate
 
-- На входе: `data_stale = True` ⇒ вход запрещён.
-- В сопровождении: выход при `effective_age_ms > 1500`.
+Tick rate измеряется по WS-такту за последние 1 секунду:
+
+```
+rx_count_1s = ws_ticks_in_last_1s
+```
+
+Если WS подключён и «свежий» (`ws_age_ms < 500`), но `rx_count_1s == 0`,
+тикрейт форсируется до `1` (логируется как `forced_alive`).
+
+## Импульс (impulse_bps)
+
+Импульс рассчитывается **только** по последним двум WS mid-значениям (`mid_raw`).
+
+```
+impulse_bps = abs(last_ws_mid_raw - prev_ws_mid_raw) / prev_ws_mid_raw * 10_000
+```
+
+Флаг `impulse_ready` становится `True`, когда есть минимум два WS mid значения.
 
 ## Фильтры входа (entry filters)
 
-Вход в цикл запрещён, если выполнено хоть одно условие:
+Вход запрещён, если выполнено любое условие:
 
-1. `data_stale = True` — нет актуального источника данных.
-2. `spread_bps > max_spread_bps` — слишком широкий спред.
-3. `tick_rate < min_tick_rate` — недостаточная активность рынка.
-4. `impulse_bps < impulse_min_bps` — слабое ценовое движение.
-5. **Leverage check**:
-   - `total_notional = 2 * (usd_notional / mid) * mid`.
-   - `equity_usdt = margin_free + spot_free`.
-   - вход запрещён, если `total_notional > equity_usdt * leverage_max`.
+1. `data_stale=True` — отсутствует актуальный источник данных.
+2. `spread_bps > max_spread_bps`.
+3. `tick_rate < min_tick_rate`.
+4. `impulse_bps < impulse_min_bps` (если импульс-фильтр включён).
+5. Нарушение лимита по плечу (см. ниже).
+
+### Деградация импульса
+
+Импульс-фильтр может быть автоматически «ослаблен» после `impulse_grace_ms`:
+
+- Если прошло достаточно времени после `ARMED`,
+- И остальные фильтры (data/spread/tick rate) выполняются,
+- Тогда импульс-фильтр логируется как `impulse_degraded` и не блокирует вход.
+
+Поведение фиксируется в логах и зависит от `impulse_degrade_mode`.
+
+## Проверка плеча (leverage_max)
+
+Суммарная экспозиция двух ног не должна превышать equity:
+
+```
+qty = usd_notional / mid
+notional_total = 2 * qty * mid
+leverage_ok = notional_total <= equity_usdt * leverage_max
+```
+
+`equity_usdt` вычисляется как сумма свободных средств в маржинальном и спотовом
+аккаунтах (см. `TradeEngine`).
 
 ## Расчёт количества и округление
 
 - Базовый объём: `qty = usd_notional / mid`.
-- Округление по шагу символа: `qty = floor(qty / step_size) * step_size`.
-- Дополнительные проверки:
+- Округление вниз по `step_size` (лот фильтр).
+- Дополнительные ограничения:
   - `qty >= min_qty`.
   - `qty * mid >= min_notional`.
 
-## Победитель/проигравший
+## Детект победителя
 
-- Алгоритм сравнивает движение **long_raw** и **short_raw** в bps.
-- Winner определяется по большему значению.
-- Winner фиксируется, если `max(long_raw, short_raw) >= winner_threshold_bps`.
+- Окно детекта: `detect_window_ticks` (минимум 5).
+- Таймаут детекта: `detect_timeout_ms`, но не меньше
+  `(detect_window_ticks / min_tick_rate) * 1000 + 500`.
 
-Если победитель не найден до `detect_timeout_ms`, цикл завершается
-через аварийное выравнивание.
+Победитель фиксируется, если:
 
-## Комиссии и net расчёт
+```
+best = max(long_raw_bps, short_raw_bps)
+if best >= winner_threshold_bps:
+    winner = LONG or SHORT
+```
 
-- **Net bps** для победителя: `winner_raw_bps - fee_total_bps`.
-- **Net bps** для проигравшего: `loser_raw_bps - fee_total_bps`.
-- **Net total bps**: `winner_net + loser_net`.
+До заполнения окна `detect_window_ticks` цикл ждёт.
+
+## Расчёт PnL и net метрик
+
+- **Net bps** по ноге: `raw_bps - fee_total_bps`.
+- **Net total bps**: `winner_net_bps + loser_net_bps`.
 - **Net USD**: `(usd_notional / 10_000) * net_total_bps`.
 
 ## Условия выхода победителя
 
-Алгоритм завершает сопровождение победителя при любом из условий:
+Выход из `RIDING` по любому условию:
 
-- `winner_net_bps >= target_net_bps` → выход по цели.
+- `winner_net_bps >= target_net_bps` → цель.
 - `winner_raw_bps <= -emergency_stop_bps` → экстренный стоп.
 - `winner_raw_bps <= -max_loss_bps` → обычный стоп-лосс.
-- `effective_age_ms > 1500` → устаревание данных.
+- `effective_age_ms > 1500` → данные устарели.
 
-## Логика «aggressive limit»
+## Aggressive limit
 
-Для режимов `aggressive_limit` цена устанавливается:
+Цена для `aggressive_limit`:
 
 - BUY: `ask * (1 + slip_bps / 10_000)`.
 - SELL: `bid * (1 - slip_bps / 10_000)`.
 
-Если параметры цены некорректны, ордер отправляется как `market`.
+При `aggressive_limit` ожидание fill — 0.4s, затем отмена и fallback на `market`.

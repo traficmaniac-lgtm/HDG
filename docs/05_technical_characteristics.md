@@ -3,9 +3,9 @@
 ## Режим торговли и рынок
 
 - Режим: **Cross Margin** (Binance).
-- Инструмент: `BTCUSDT` (зашито в `BinanceMarginExecution`).
-- Тип стратегии: **Directional Hedge Scalping**.
-- Хедж-вход: одновременный BUY и SELL с одинаковым `qty`.
+- Инструмент: `BTCUSDT` (по умолчанию в `BinanceMarginExecution`).
+- Стратегия: **Directional Hedge Scalping**.
+- Вход: одновременный BUY и SELL одинакового объёма.
 
 ## Состояния конечного автомата
 
@@ -16,73 +16,81 @@
 - `CUTTING` → закрытие проигравшей ноги.
 - `RIDING` → сопровождение победителя.
 - `EXITING` → выход победителя.
+- `CONTROLLED_FLATTEN` → управляемое выравнивание.
 - `COOLDOWN` → пауза перед следующим циклом.
 - `ERROR` → ошибка и остановка цикла.
 
 ## Источники данных и выбор effective tick
 
 - Источники:
-  - **WebSocket** тики (`ws_market`).
-  - **HTTP fallback** (`http_fallback`).
-- Режимы:
-  - `WS_ONLY` → используется только WS,
-  - `HTTP_ONLY` → используется только HTTP,
-  - `HYBRID` → автоматическое переключение.
+  - **WebSocket** (`ws_market.py`): `bookTicker` + `depth10@100ms`.
+  - **HTTP fallback** (`http_fallback.py`): `GET /api/v3/ticker/bookTicker`.
+- Режимы: `WS_ONLY`, `HTTP_ONLY`, `HYBRID`.
 
-Поведение в `HYBRID`:
+Параметры переключения (`MarketDataService`):
 
-- При «свежем» WS (моложе `ws_fresh_ms`) — WS становится источником.
-- При падении WS — используется HTTP, удерживается `http_hold_ms`.
-- Возврат на WS требует streak `ws_recovery_ticks` подряд свежих тиков.
+- WS «свежий», если `ws_age_ms <= 500`.
+- HTTP «свежий», если `http_age_ms <= 1200`.
+- При падении WS удерживается HTTP ещё `1500ms`.
+- Возврат на WS требует `ws_recovery_ticks = 3` подряд свежих тиков.
+
+## REST и синхронизация времени
+
+- Запросы к приватным эндпоинтам подписываются HMAC SHA256.
+- `TimeSync` синхронизирует offset времени через `GET /api/v3/time`.
+- При ошибке `-1021` происходит повторная синхронизация.
 
 ## Ордерная логика
 
 - Типы ордеров:
-  - `market` — немедленное исполнение.
-  - `aggressive_limit` — IOC лимит с проскальзыванием `slip_bps`.
+  - `market` — немедленное исполнение (ожидание до 3s).
+  - `aggressive_limit` — лимит с `slip_bps`, ожидание 0.4s, затем cancel + market.
 - Вход:
   - SELL с `AUTO_BORROW_REPAY`.
-  - BUY без side effect.
-- Закрытие ног:
+  - BUY без side-effect.
+- Закрытие:
   - Для шорта — `AUTO_REPAY`.
   - Для лонга — обычный SELL.
-- Тайминги:
-  - `aggressive_limit` ждёт 0.4s, затем fallback на market.
-  - `market` ждёт подтверждения до 3s.
+- No-winner:
+  - `NO_LOSS` → IOC лимитные заявки, fallback на market.
+  - `FLATTEN` → controlled flatten.
 
 ## Параметры стратегии (ключевые)
 
 - `usd_notional` — номинал входа в USD.
 - `max_spread_bps` — лимит спреда.
 - `min_tick_rate` — минимальная скорость тиков.
-- `impulse_min_bps` — минимальный импульс.
+- `use_impulse_filter` / `impulse_min_bps` — импульсный фильтр.
+- `impulse_grace_ms` — время, после которого импульс может деградировать.
 - `winner_threshold_bps` — порог определения победителя.
-- `target_net_bps` — целевая прибыль победителя после комиссий.
-- `emergency_stop_bps` — порог экстренного стопа.
-- `max_loss_bps` — базовый стоп-лосс.
-- `detect_timeout_ms` — таймаут ожидания победителя.
-- `detect_window_ticks` — количество тиков до сравнения победителя.
-- `cooldown_s` — длительность cooldown между циклами.
-- `order_mode` — `market` или `aggressive_limit`.
-- `slip_bps` — проскальзывание для aggressive limit.
+- `target_net_bps` — целевая прибыль после комиссий.
+- `emergency_stop_bps` — экстренный стоп.
+- `max_loss_bps` — стоп-лосс.
+- `detect_timeout_ms` — таймаут детекта.
+- `detect_window_ticks` — размер окна детекта (min 5).
+- `cooldown_s` — пауза между циклами.
+- `order_mode` / `slip_bps` — режим и проскальзывание.
+- `allow_no_winner_flatten` / `no_winner_policy` — политика no-winner.
+- `max_cycles` / `auto_loop` — автоцикл и лимит циклов.
 
 ## Контроль риска и безопасности
 
-- Запрет на вход при открытой экспозиции или незакрытых ордерах.
-- Проверка минимального лота/ноционала по фильтрам биржи.
-- Проверка equity для соблюдения `leverage_max`.
-- Аварийное выравнивание позиции при любых критических ошибках.
-- Принудительный выход при устаревании данных (> 1500 мс).
+- Запрет на вход при открытой экспозиции или активных ордерах.
+- Проверка минимального лота и ноционала по фильтрам биржи.
+- Ограничение по `leverage_max` относительно equity.
+- Controlled/emergency flatten при сбоях исполнения.
+- Выход при устаревании данных (`effective_age_ms > 1500`).
 
 ## Производительность и надёжность
 
-- `TradeEngine` работает в отдельном потоке для UI.
-- Watchdog проверяет «фриз» GUI по heartbeat каждые 2 секунды.
+- `TradeEngine` работает в отдельном потоке от UI.
+- Watchdog проверяет heartbeat UI каждые 2 секунды.
 - Логи выводятся в UI и пишутся в файл (rotating).
 
 ## Журналы и мониторинг
 
-- **TRADE** — ключевые события цикла (вход, победитель, выход).
-- **STATE** — переходы состояний и метрики цикла.
-- **DEALS** — подтверждения исполнения и сводка сделки.
-- **INFO/ERROR** — сервисная и аварийная диагностика.
+- **CYCLE** — начало/конец цикла.
+- **TRADE** — ключевые события входа/детекта/выхода.
+- **STATE** — переходы состояний.
+- **DEALS** — подтверждения ордеров и summary.
+- **INFO/ERROR** — системные сообщения.
