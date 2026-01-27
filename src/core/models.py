@@ -81,6 +81,11 @@ class StrategyParams:
     burst_volume_threshold: float = 0.0
     auto_loop: bool = False
     max_cycles: int = 10
+    wait_fill_timeout_ms: int = 4000
+    wait_positions_timeout_ms: int = 2000
+    wait_exit_timeout_ms: int = 4000
+    max_ride_ms: int = 30000
+    data_stale_exit_ms: int = 1500
 
 
 @dataclass
@@ -99,6 +104,7 @@ class CycleStatus:
 @dataclass
 class CycleTelemetry:
     cycle_id: int = 0
+    phase_seq: int = 0
     state: str = "IDLE"
     active_cycle: bool = False
     inflight_entry: bool = False
@@ -147,6 +153,7 @@ class CycleTelemetry:
 class CycleViewModel:
     state: str
     cycle_id: int
+    phase_seq: int
     active_cycle: bool
     inflight_entry: bool
     inflight_exit: bool
