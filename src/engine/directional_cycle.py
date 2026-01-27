@@ -60,8 +60,6 @@ class DirectionalCycle:
         self._market_data = market_data
         self._last_tick: Optional[dict[str, Any]] = None
         self._tick_history: Deque[tuple[float, float]] = deque(maxlen=500)
-        self._prev_ws_mid: Optional[float] = None
-        self._last_ws_mid: Optional[float] = None
         self._cycle_start: Optional[datetime] = None
         self._entry_mid: Optional[float] = None
         self._entry_qty: Optional[float] = None
@@ -92,6 +90,10 @@ class DirectionalCycle:
         self._last_data_log_source: Optional[str] = None
         self._last_data_log_ts = 0.0
         self._last_data_health_log_ts = 0.0
+        self._armed_ts: Optional[float] = None
+        self._last_non_impulse_skip_ts = 0.0
+        self._last_impulse_block_warn_ts = 0.0
+        self._market_data.set_detect_window_ticks(self._strategy.detect_window_ticks)
 
     @property
     def cycle_start(self) -> Optional[datetime]:
@@ -126,6 +128,7 @@ class DirectionalCycle:
 
     def update_strategy(self, strategy: StrategyParams) -> None:
         self._strategy = strategy
+        self._market_data.set_detect_window_ticks(self._strategy.detect_window_ticks)
 
     def update_filters(self, symbol_filters: SymbolFilters) -> None:
         self._filters = symbol_filters
@@ -142,8 +145,6 @@ class DirectionalCycle:
             now = time.monotonic()
             mid = float(payload.get("mid", 0.0))
             if mid > 0:
-                self._prev_ws_mid = self._last_ws_mid if self._last_ws_mid is not None else mid
-                self._last_ws_mid = mid
                 self._tick_history.append((now, mid))
         self._last_tick = self._market_data.get_last_effective_tick()
         snapshot = self._market_data.get_snapshot()
@@ -186,6 +187,8 @@ class DirectionalCycle:
     def arm(self) -> None:
         snapshot = self._market_data.get_snapshot()
         last_ws_tick = self._market_data.get_last_ws_tick() or {}
+        self._armed_ts = time.monotonic()
+        self._last_non_impulse_skip_ts = self._armed_ts
         self._emit_log(
             "INFO",
             "INFO",
@@ -615,8 +618,11 @@ class DirectionalCycle:
             return "spread"
         if metrics["tick_rate"] < self._strategy.min_tick_rate:
             return "tick_rate"
-        if metrics["impulse_bps"] < self._strategy.impulse_min_bps:
-            return "impulse"
+        if self._strategy.impulse_min_bps > 0:
+            if not metrics["impulse_ready"]:
+                return "wait_ticks"
+            if metrics["impulse_bps"] < self._strategy.impulse_min_bps:
+                return "impulse"
         if metrics["mid"] > 0 and not self._leverage_ok(metrics["mid"]):
             return "leverage_limit"
         return None
@@ -637,8 +643,17 @@ class DirectionalCycle:
         ticks = [tick_data for tick_data in self._tick_history if tick_data[0] >= cutoff]
         tick_rate = len(ticks) / 1.0 if ticks else 0.0
         impulse_bps = 0.0
-        if self._prev_ws_mid and self._last_ws_mid and self._prev_ws_mid > 0:
-            impulse_bps = abs(self._last_ws_mid - self._prev_ws_mid) / self._prev_ws_mid * 10_000
+        ref_mid = 0.0
+        delta_mid = 0.0
+        impulse_ready = False
+        ws_mid_buffer = self._market_data.get_ws_mid_buffer()
+        if len(ws_mid_buffer) >= 2:
+            impulse_ready = True
+            ref_mid = ws_mid_buffer[0]
+            mid_now = ws_mid_buffer[-1]
+            if ref_mid > 0:
+                delta_mid = mid_now - ref_mid
+                impulse_bps = abs(delta_mid) / ref_mid * 10_000
         snapshot = self._market_data.get_snapshot()
         ws_age_ms = snapshot.ws_age_ms
         http_age_ms = snapshot.http_age_ms
@@ -648,6 +663,9 @@ class DirectionalCycle:
             "spread_bps": spread,
             "tick_rate": tick_rate,
             "impulse_bps": impulse_bps,
+            "impulse_ready": impulse_ready,
+            "ref_mid": ref_mid,
+            "delta_mid": delta_mid,
             "mid": mid,
             "bid": bid,
             "ask": ask,
@@ -902,6 +920,8 @@ class DirectionalCycle:
         self._last_skip_reason = reason
         self._last_reason = reason
         self._waiting_for_data = reason == "data_stale"
+        if reason not in {"impulse", "wait_ticks"}:
+            self._last_non_impulse_skip_ts = now
         metrics = self._compute_entry_metrics()
         self._data_stale = bool(metrics["data_stale"])
         self._effective_source = str(metrics["effective_source"])
@@ -915,6 +935,7 @@ class DirectionalCycle:
             self._effective_age_ms = 9999.0
         if reason == "data_stale":
             self._log_wait_data(metrics)
+        self._maybe_warn_impulse_block(now, reason)
         self._emit_log(
             "TRADE",
             "INFO",
@@ -926,6 +947,8 @@ class DirectionalCycle:
             tick_rate_limit=self._strategy.min_tick_rate,
             impulse_bps=f"{metrics['impulse_bps']:.2f}",
             impulse_limit=self._strategy.impulse_min_bps,
+            ref_mid=f"{metrics['ref_mid']:.2f}",
+            delta_mid=f"{metrics['delta_mid']:.6f}",
             mid=f"{metrics['mid']:.2f}",
             bid=f"{metrics['bid']:.2f}",
             ask=f"{metrics['ask']:.2f}",
@@ -935,6 +958,27 @@ class DirectionalCycle:
             ws_fresh_ms=self._market_data.ws_fresh_ms,
             http_fresh_ms=self._market_data.http_fresh_ms,
             data_stale=metrics["data_stale"],
+        )
+
+    def _maybe_warn_impulse_block(self, now: float, reason: str) -> None:
+        if reason not in {"impulse", "wait_ticks"}:
+            return
+        if self._strategy.impulse_min_bps <= 0:
+            return
+        if self._armed_ts is None:
+            return
+        if now - self._armed_ts <= 10.0:
+            return
+        if now - self._last_non_impulse_skip_ts <= 10.0:
+            return
+        if now - self._last_impulse_block_warn_ts < 5.0:
+            return
+        self._last_impulse_block_warn_ts = now
+        self._emit_log(
+            "WARN",
+            "WARN",
+            "Impulse filter blocks entry; consider lowering impulse_limit or check impulse calc.",
+            impulse_limit=self._strategy.impulse_min_bps,
         )
 
     def _log_wait_data(self, metrics: dict[str, float | bool]) -> None:
