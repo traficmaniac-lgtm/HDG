@@ -33,6 +33,7 @@ class MarketDataService:
         self._ws_fresh_streak = 0
         self._http_hold_until_ms = 0.0
         self._ws_connected = False
+        self._ws_rx_times: Deque[float] = deque()
         self._ws_mid_buffer: Deque[Decimal] = deque(maxlen=5)
         self._prev_ws_mid_raw: Optional[Decimal] = None
         self._last_ws_mid_raw: Optional[Decimal] = None
@@ -48,6 +49,7 @@ class MarketDataService:
             if source == "WS":
                 self._last_ws_tick = dict(payload)
                 self._snapshot.last_ws_tick_ms = float(rx_time_ms)
+                self._ws_rx_times.append(float(rx_time_ms))
                 mid_raw = payload.get("mid_raw")
                 if mid_raw is None:
                     mid_raw = Decimal(str(payload.get("mid") or "0"))
@@ -105,6 +107,15 @@ class MarketDataService:
     def get_last_ws_rx_monotonic_ms(self) -> Optional[float]:
         with self._lock:
             return self._snapshot.last_ws_tick_ms
+
+    def get_ws_rx_count_1s(self, now_ms: Optional[float] = None) -> int:
+        if now_ms is None:
+            now_ms = time.monotonic() * 1000
+        cutoff_ms = now_ms - 1000.0
+        with self._lock:
+            while self._ws_rx_times and self._ws_rx_times[0] < cutoff_ms:
+                self._ws_rx_times.popleft()
+            return int(len(self._ws_rx_times))
 
     def is_ws_connected(self) -> bool:
         with self._lock:
