@@ -33,7 +33,13 @@ from PySide6.QtWidgets import (
 from src.core.version import VERSION
 from src.core.config_store import SettingsStore, StrategyParamsStore
 from src.core.logger import LogBus, setup_logger
-from src.core.models import ConnectionMode, ConnectionSettings, MarketTick, StrategyParams
+from src.core.models import (
+    ConnectionMode,
+    ConnectionSettings,
+    MarketDataMode,
+    MarketTick,
+    StrategyParams,
+)
 from src.core.state_machine import BotState, BotStateMachine
 from src.core.trade_engine import TradeEngine
 from src.gui.parameters_tab import ParametersTab
@@ -60,6 +66,8 @@ class MainWindow(QMainWindow):
     request_end_cooldown = Signal(bool)
     request_ui_heartbeat = Signal(float)
     request_on_tick = Signal(dict)
+    request_set_data_mode = Signal(str)
+    request_set_ws_status = Signal(str)
 
     def __init__(self) -> None:
         super().__init__()
@@ -75,6 +83,7 @@ class MainWindow(QMainWindow):
         self.market_tick = MarketTick()
         self.connected = False
         self.data_source = "WS"
+        self.data_mode = MarketDataMode.HYBRID
         self.ws_status = "DISCONNECTED"
         self.cycle_start_time: Optional[datetime] = None
         self.run_mode = False
@@ -91,6 +100,12 @@ class MainWindow(QMainWindow):
         self.sim_loser_net_bps: Optional[float] = None
         self.sim_reason: Optional[str] = None
         self.sim_ws_age_ms: Optional[float] = None
+        self.effective_source = "NONE"
+        self.effective_age_ms: Optional[float] = None
+        self.ws_age_ms: Optional[float] = None
+        self.http_age_ms: Optional[float] = None
+        self.data_stale = True
+        self.waiting_for_data = False
 
         self.logger = setup_logger(Path("logs"))
         self.log_bus = LogBus(self.logger)
@@ -229,13 +244,21 @@ class MainWindow(QMainWindow):
         layout.addWidget(QLabel("Символ"))
         layout.addWidget(self.symbol_combo)
 
-        self.price_source_label = QLabel("Источник: Авто (WS→HTTP)")
+        self.source_mode_combo = QComboBox()
+        self.source_mode_combo.addItem("WS only", MarketDataMode.WS_ONLY.value)
+        self.source_mode_combo.addItem("HTTP only", MarketDataMode.HTTP_ONLY.value)
+        self.source_mode_combo.addItem("Hybrid (WS→HTTP)", MarketDataMode.HYBRID.value)
+        layout.addWidget(QLabel("Источник данных"))
+        layout.addWidget(self.source_mode_combo)
+
+        self.price_source_label = QLabel("Режим: Hybrid (WS→HTTP)")
         layout.addWidget(self.price_source_label)
 
         self.mid_display = QLCDNumber()
-        self.mid_display.setDigitCount(10)
+        self.mid_display.setDigitCount(12)
         self.mid_display.setSegmentStyle(QLCDNumber.Flat)
         self.mid_display.setFixedHeight(48)
+        self.mid_display.setMinimumWidth(240)
         self.mid_display.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         layout.addWidget(self.mid_display)
 
@@ -247,11 +270,13 @@ class MainWindow(QMainWindow):
         self.bid_value = QLabel("—")
         self.ask_value = QLabel("—")
         self.spread_value = QLabel("—")
+        self.effective_source_value = QLabel("—")
         self.card_tick_age_value = QLabel("—")
         grid.addRow("Бид", self.bid_value)
         grid.addRow("Аск", self.ask_value)
         grid.addRow("Спред (bps)", self.spread_value)
-        grid.addRow("Возраст тика (мс)", self.card_tick_age_value)
+        grid.addRow("Effective source", self.effective_source_value)
+        grid.addRow("Возраст (мс)", self.card_tick_age_value)
         layout.addLayout(grid)
         return widget
 
@@ -483,6 +508,7 @@ class MainWindow(QMainWindow):
         self.dev_end_cycle_button.clicked.connect(self.on_end_cycle)
         self.parameters_tab.apply_params_button.clicked.connect(self.apply_params)
         self.parameters_tab.reset_params_button.clicked.connect(self.reset_params)
+        self.source_mode_combo.currentIndexChanged.connect(self.on_source_mode_changed)
         if DEBUG:
             self.add_test_trade_button.clicked.connect(self.add_test_trade)
         self.save_logs_button.clicked.connect(self.save_logs_to_file)
@@ -503,6 +529,8 @@ class MainWindow(QMainWindow):
         self.request_set_strategy.connect(self.trade_engine.set_strategy)
         self.request_set_connection.connect(self.trade_engine.set_connection)
         self.request_end_cooldown.connect(self.trade_engine.end_cooldown)
+        self.request_set_data_mode.connect(self.trade_engine.set_data_mode)
+        self.request_set_ws_status.connect(self.trade_engine.set_ws_status)
         self.request_ui_heartbeat.connect(
             self.trade_engine.update_ui_heartbeat, Qt.ConnectionType.DirectConnection
         )
@@ -553,6 +581,16 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Защита", "Нет доступа для старта авто-торговли.")
             return
         self.run_mode = True
+        self.strategy_store.save_strategy_params(
+            self.strategy_params, self.symbol_combo.currentText()
+        )
+        self.log_bus.log(
+            "INFO",
+            "INFO",
+            "Trade params saved",
+            path="config/strategy_params.json",
+            action="start",
+        )
         self.log_bus.log("INFO", "INFO", "AUTO trading started")
         self.request_start_trading.emit()
         self._update_ui_state()
@@ -613,12 +651,12 @@ class MainWindow(QMainWindow):
         self.strategy_store.save_strategy_params(
             self.strategy_params, self.symbol_combo.currentText()
         )
-        self.log_bus.log("INFO", "INFO", "PARAMS applied")
         self.log_bus.log(
             "INFO",
             "INFO",
-            "PARAMS saved",
+            "Trade params saved",
             path="config/strategy_params.json",
+            action="apply",
         )
         self.request_set_strategy.emit(self.strategy_params.__dict__)
         self._update_ui_state()
@@ -676,19 +714,35 @@ class MainWindow(QMainWindow):
 
     def on_ws_status(self, status: str) -> None:
         self.ws_status = status
-        self.data_source = "WS"
-        if status == "DEGRADED":
-            self.data_source = "HTTP"
+        self.request_set_ws_status.emit(status)
+        self._update_http_timer()
+        self._update_ui_state()
+
+    def on_source_mode_changed(self) -> None:
+        mode_value = self.source_mode_combo.currentData()
+        try:
+            self.data_mode = MarketDataMode(mode_value)
+        except ValueError:
+            self.data_mode = MarketDataMode.HYBRID
+        self.request_set_data_mode.emit(self.data_mode.value)
+        self._update_http_timer()
+        self._update_ui_state()
+
+    def _update_http_timer(self) -> None:
+        if self.data_mode == MarketDataMode.WS_ONLY:
+            if self.http_timer.isActive():
+                self.http_timer.stop()
+            return
+        if self.data_mode == MarketDataMode.HTTP_ONLY:
             if not self.http_timer.isActive():
                 self.http_timer.start()
-        elif status == "DISCONNECTED":
-            self.data_source = "HTTP"
+            return
+        if self.ws_status in {"DEGRADED", "DISCONNECTED"}:
             if not self.http_timer.isActive():
                 self.http_timer.start()
         else:
             if self.http_timer.isActive():
                 self.http_timer.stop()
-        self._update_ui_state()
 
     def on_depth_snapshot(self, payload: dict) -> None:
         self.orderbook.apply_snapshot(payload.get("bids", []), payload.get("asks", []))
@@ -777,6 +831,14 @@ class MainWindow(QMainWindow):
         self.sim_loser_net_bps = payload.get("loser_net_bps")
         self.sim_reason = payload.get("reason")
         self.sim_ws_age_ms = payload.get("ws_age_ms")
+        self.ws_age_ms = payload.get("ws_age_ms")
+        self.http_age_ms = payload.get("http_age_ms")
+        self.effective_source = payload.get("effective_source") or "NONE"
+        self.effective_age_ms = payload.get("effective_age_ms")
+        self.data_stale = bool(payload.get("data_stale", True))
+        self.waiting_for_data = bool(payload.get("waiting_for_data", False))
+        if self.waiting_for_data:
+            self.sim_reason = "WAIT_DATA"
         self._update_ui_state()
 
     def on_trade_row(self, payload: dict) -> None:
@@ -857,10 +919,14 @@ class MainWindow(QMainWindow):
         self.bid_value.setText(f"{self.market_tick.bid:,.2f}")
         self.ask_value.setText(f"{self.market_tick.ask:,.2f}")
         self.spread_value.setText(f"{self.market_tick.spread_bps:.2f}")
-        now = datetime.now(timezone.utc)
-        age_ms = (now - self.market_tick.rx_time).total_seconds() * 1000
+        if self.effective_age_ms is None:
+            now = datetime.now(timezone.utc)
+            age_ms = (now - self.market_tick.rx_time).total_seconds() * 1000
+        else:
+            age_ms = self.effective_age_ms
         self.tick_age_label.setText(f"Возраст тика: {age_ms:.0f} мс")
         self.card_tick_age_value.setText(f"{age_ms:.0f}")
+        self.effective_source_value.setText(self.effective_source)
         self.last_update_label.setText(
             f"Последнее обновление: {self.market_tick.rx_time.strftime('%H:%M:%S.%f')[:-3]}"
         )
@@ -895,8 +961,11 @@ class MainWindow(QMainWindow):
 
     def _update_state_labels(self) -> None:
         mode = "RUNNING" if self.run_mode else "IDLE"
+        state_value = self.state_machine.state.value
+        if self.run_mode and self.waiting_for_data:
+            state_value = "WAIT_DATA"
         self.state_label.setText(
-            f"Режим: {mode} | Состояние: {self.state_machine.state.value}"
+            f"Режим: {mode} | Состояние: {state_value}"
         )
         self.active_cycle_label.setText(
             f"активный цикл: {str(self.state_machine.active_cycle).lower()}"
@@ -921,15 +990,15 @@ class MainWindow(QMainWindow):
             self.connection_label.setStyleSheet("color: #e74c3c;")
             self.account_connection_label.setStyleSheet("color: #e74c3c;")
 
-        if self.ws_status == "CONNECTED":
-            data_status = "WS ОК"
+        if self.effective_source == "WS":
+            data_status = "WS"
             color = "color: #27ae60;"
-        elif self.ws_status == "DEGRADED":
-            data_status = "WS ДЕГРАД."
-            color = "color: #f1c40f;"
-        else:
+        elif self.effective_source == "HTTP":
             data_status = "HTTP"
             color = "color: #f1c40f;"
+        else:
+            data_status = "NONE"
+            color = "color: #e74c3c;"
         self.data_label.setText(f"Данные: {data_status}")
         self.data_label.setStyleSheet(color)
         self.account_data_label.setText(f"Данные: {data_status}")
@@ -949,7 +1018,12 @@ class MainWindow(QMainWindow):
             }
         )
 
-        self.price_source_label.setText("Источник: Авто (WS→HTTP)")
+        mode_text = {
+            MarketDataMode.WS_ONLY: "WS only",
+            MarketDataMode.HTTP_ONLY: "HTTP only",
+            MarketDataMode.HYBRID: "Hybrid (WS→HTTP)",
+        }.get(self.data_mode, "Hybrid (WS→HTTP)")
+        self.price_source_label.setText(f"Режим: {mode_text}")
         self.fee_label.setText(f"комиссия bps: {self.strategy_params.fee_total_bps:.2f}")
         self.target_label.setText(f"цель net bps: {self.strategy_params.target_net_bps}")
         self.max_loss_label.setText(f"макс. убыток bps: {self.strategy_params.max_loss_bps}")
@@ -1099,6 +1173,11 @@ class MainWindow(QMainWindow):
     def _initialize_defaults(self) -> None:
         self._load_strategy_params()
         self._sync_params_to_form()
+        self.source_mode_combo.setCurrentIndex(
+            self.source_mode_combo.findData(self.data_mode.value)
+        )
+        self.request_set_data_mode.emit(self.data_mode.value)
+        self._update_http_timer()
         self.cycle_start_time = None
         self.sim_entry_price = None
         self.sim_entry_qty = None
@@ -1113,7 +1192,13 @@ class MainWindow(QMainWindow):
             index = self.symbol_combo.findText(symbol)
             if index >= 0:
                 self.symbol_combo.setCurrentIndex(index)
-        self.log_bus.log("INFO", "INFO", "PARAMS loaded", path="config/strategy_params.json")
+        self.log_bus.log(
+            "INFO",
+            "INFO",
+            "Trade params loaded",
+            path="config/strategy_params.json",
+            symbol=symbol,
+        )
 
     def _sync_settings_from_form(self) -> None:
         self.connection_settings.api_key = self.settings_tab.api_key_input.text().strip()

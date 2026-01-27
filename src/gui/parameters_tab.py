@@ -30,49 +30,52 @@ class ParametersTab(QWidget):
         self.usd_notional_spin.setDecimals(2)
 
         self.leverage_max_spin = QSpinBox()
-        self.leverage_max_spin.setRange(1, 5)
+        self.leverage_max_spin.setRange(1, 9)
 
         self.slip_bps_spin = QDoubleSpinBox()
-        self.slip_bps_spin.setRange(0.5, 10.0)
-        self.slip_bps_spin.setDecimals(2)
+        self.slip_bps_spin.setRange(0.0, 50.0)
+        self.slip_bps_spin.setDecimals(1)
+        self.slip_bps_spin.setSingleStep(0.1)
 
         self.max_loss_spin = QSpinBox()
-        self.max_loss_spin.setRange(3, 6)
+        self.max_loss_spin.setRange(1, 50)
 
         self.fee_spin = QDoubleSpinBox()
-        self.fee_spin.setRange(0.0, 20.0)
+        self.fee_spin.setRange(0.0, 50.0)
         self.fee_spin.setDecimals(2)
 
         self.target_net_spin = QSpinBox()
-        self.target_net_spin.setRange(8, 15)
+        self.target_net_spin.setRange(1, 50)
 
         self.max_spread_spin = QDoubleSpinBox()
-        self.max_spread_spin.setRange(0.1, 50.0)
+        self.max_spread_spin.setRange(0.1, 200.0)
         self.max_spread_spin.setDecimals(2)
 
         self.min_tick_rate_spin = QSpinBox()
-        self.min_tick_rate_spin.setRange(1, 50)
+        self.min_tick_rate_spin.setRange(1, 200)
 
         self.detect_timeout_spin = QSpinBox()
-        self.detect_timeout_spin.setRange(100, 2000)
+        self.detect_timeout_spin.setRange(100, 5000)
         self.detect_timeout_spin.setSingleStep(50)
 
         self.impulse_min_spin = QDoubleSpinBox()
-        self.impulse_min_spin.setRange(0.1, 10.0)
-        self.impulse_min_spin.setDecimals(2)
+        self.impulse_min_spin.setRange(0.0, 50.0)
+        self.impulse_min_spin.setDecimals(1)
+        self.impulse_min_spin.setSingleStep(0.1)
 
         self.winner_threshold_spin = QDoubleSpinBox()
-        self.winner_threshold_spin.setRange(0.5, 10.0)
-        self.winner_threshold_spin.setDecimals(2)
+        self.winner_threshold_spin.setRange(0.0, 50.0)
+        self.winner_threshold_spin.setDecimals(1)
+        self.winner_threshold_spin.setSingleStep(0.1)
 
         self.emergency_stop_spin = QSpinBox()
-        self.emergency_stop_spin.setRange(6, 30)
+        self.emergency_stop_spin.setRange(1, 200)
 
         self.cooldown_spin = QSpinBox()
-        self.cooldown_spin.setRange(2, 5)
+        self.cooldown_spin.setRange(0, 60)
 
         self.direction_window_combo = QComboBox()
-        self.direction_window_combo.addItems(["1", "2", "3"])
+        self.direction_window_combo.addItems([str(value) for value in range(1, 21)])
 
         self.burst_volume_spin = QDoubleSpinBox()
         self.burst_volume_spin.setRange(0.0, 1_000_000.0)

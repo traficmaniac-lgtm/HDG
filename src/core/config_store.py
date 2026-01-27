@@ -71,14 +71,27 @@ class StrategyParamsStore:
         if not self.path.exists():
             return StrategyParams(), "BTCUSDT"
         data = json.loads(self.path.read_text(encoding="utf-8"))
-        params = StrategyParams(**data.get("strategy_params", {}))
-        symbol = str(data.get("symbol", "BTCUSDT"))
+        if "strategy_params" in data:
+            params = StrategyParams(**data.get("strategy_params", {}))
+            symbol = str(data.get("symbol", "BTCUSDT"))
+            return params, symbol
+        symbol = str(data.get("last_symbol", "BTCUSDT"))
+        default_payload = data.get("default", {})
+        by_symbol = data.get("by_symbol", {})
+        symbol_payload = by_symbol.get(symbol, default_payload)
+        params = StrategyParams(**symbol_payload)
         return params, symbol
 
     def save_strategy_params(self, params: StrategyParams, symbol: str) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        existing: dict[str, Any] = {}
+        if self.path.exists():
+            existing = json.loads(self.path.read_text(encoding="utf-8"))
+        by_symbol = existing.get("by_symbol", {})
+        by_symbol[symbol] = asdict(params)
         payload = {
-            "strategy_params": asdict(params),
-            "symbol": symbol,
+            "default": asdict(params),
+            "by_symbol": by_symbol,
+            "last_symbol": symbol,
         }
         self.path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
