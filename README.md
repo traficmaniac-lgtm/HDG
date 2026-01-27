@@ -1,13 +1,13 @@
-# Directional Hedge Scalper — v0.2.0 (Read-Only SIM)
+# Directional Hedge Scalper — v0.2.1 (Cross Margin + Live Micro-Trade)
 
-This repository contains the v0.2.0 GUI for the Directional Hedge Scalper. **No real trading or order execution is implemented in this version.**
+This repository contains the v0.2.1 GUI for the Directional Hedge Scalper. Live micro-trade (Cross Margin) is available when **LIVE ENABLED** is turned on.
 
-## What’s new in v0.2.0
+## What’s new in v0.2.1
 
-- Read-only account checks for Spot/Margin and Futures (GET-only endpoints).
-- USDT balance display with periodic refresh.
-- Settings tab with local key storage (config/settings.json) and test connection.
-- Read-only orderbook simulation for single-side cycles (no hedge, no orders).
+- Cross Margin only mode (no Spot/Futures selector).
+- Spot + Cross Margin USDT balance display with periodic refresh.
+- Live micro-trade execution (market/aggressive_limit) for $20 notional when LIVE ENABLED is on.
+- Borrow-based leverage target selector (1x–3x).
 
 ## Requirements
 
@@ -39,6 +39,5 @@ python -m src.app.main
 
 ## Notes
 
-- v0.2.0 is read-only: GET endpoints only, no order placement, no live positions.
+- Live trading is **OFF by default**. Enable via **LIVE ENABLED** in Settings.
 - The simulation uses orderbook-based fills for a single-side cycle (BUY or SELL).
-- Real order execution will be added in later versions.
