@@ -199,6 +199,7 @@ def main() -> None:
         emit_log=log_line,
         emit_trade_row=trade_row,
         emit_exposure=lambda _: None,
+        on_not_authorized=lambda _: None,
     )
 
     cycle.arm()

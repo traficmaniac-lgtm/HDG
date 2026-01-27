@@ -7,6 +7,8 @@ from typing import Any, Optional
 
 import httpx
 
+from src.services.time_sync import TimeSync
+
 
 class BinanceRestClient:
     def __init__(
@@ -19,8 +21,12 @@ class BinanceRestClient:
         self.api_secret = api_secret
         self.spot_base_url = spot_base_url
         self._client = httpx.Client(timeout=5.0)
+        self._time_sync = TimeSync(self._client, self.spot_base_url)
         self.last_error: Optional[str] = None
         self.last_error_code: Optional[int] = None
+        self.last_error_status: Optional[int] = None
+        self.last_error_path: Optional[str] = None
+        self.last_error_params: Optional[dict[str, Any]] = None
 
     def close(self) -> None:
         self._client.close()
@@ -65,6 +71,12 @@ class BinanceRestClient:
             return resp.json()
         except Exception:
             return None
+
+    def get_time_offset_ms(self) -> int:
+        return self._time_sync.offset_ms
+
+    def sync_time(self) -> bool:
+        return self._time_sync.sync()
 
     def place_order_margin(self, payload: dict[str, Any]) -> Optional[dict[str, Any]]:
         return self.place_margin_order(payload)
@@ -115,19 +127,26 @@ class BinanceRestClient:
         if not self.api_key or not self.api_secret:
             self.last_error = "Missing API key/secret"
             self.last_error_code = None
+            self.last_error_status = None
+            self.last_error_path = path
+            self.last_error_params = params
             return None
         self.last_error = None
         self.last_error_code = None
+        self.last_error_status = None
+        self.last_error_path = None
+        self.last_error_params = None
         retries = 2
+        resynced = False
         for attempt in range(retries + 1):
+            if attempt == 0 and self._time_sync.offset_ms == 0:
+                self._time_sync.sync()
             signed_params = {
                 **params,
-                "timestamp": int(time.time() * 1000),
+                "timestamp": self._time_sync.timestamp_ms(),
                 "recvWindow": 5000,
             }
-            query_string = "&".join(
-                f"{key}={value}" for key, value in signed_params.items()
-            )
+            query_string = self._build_query_string(signed_params)
             signature = hmac.new(
                 self.api_secret.encode("utf-8"),
                 query_string.encode("utf-8"),
@@ -143,6 +162,9 @@ class BinanceRestClient:
                 return resp.json()
             except httpx.HTTPStatusError as exc:
                 status = exc.response.status_code
+                self.last_error_status = status
+                self.last_error_path = path
+                self.last_error_params = params
                 try:
                     payload = exc.response.json()
                     self.last_error_code = (
@@ -152,8 +174,22 @@ class BinanceRestClient:
                 except Exception:
                     self.last_error = str(exc)
                     self.last_error_code = None
+                self._log_signed_failure(
+                    method=method,
+                    path=path,
+                    status=status,
+                    code=self.last_error_code,
+                    msg=self.last_error or "",
+                    params=params,
+                )
                 if self.last_error_code == -1021:
+                    if resynced:
+                        return None
+                    resynced = True
+                    self._time_sync.sync()
                     continue
+                if self.last_error_code == -1002:
+                    return None
                 if status >= 500 and attempt < retries:
                     time.sleep(0.2 * (attempt + 1))
                     continue
@@ -161,6 +197,9 @@ class BinanceRestClient:
             except httpx.RequestError as exc:
                 self.last_error = str(exc)
                 self.last_error_code = None
+                self.last_error_status = None
+                self.last_error_path = path
+                self.last_error_params = params
                 if attempt < retries:
                     time.sleep(0.2 * (attempt + 1))
                     continue
@@ -168,5 +207,32 @@ class BinanceRestClient:
             except Exception as exc:
                 self.last_error = str(exc)
                 self.last_error_code = None
+                self.last_error_status = None
+                self.last_error_path = path
+                self.last_error_params = params
                 return None
         return None
+
+    def _build_query_string(self, params: dict[str, Any]) -> str:
+        items = sorted(params.items(), key=lambda item: item[0])
+        return "&".join(f"{key}={value}" for key, value in items)
+
+    def _log_signed_failure(
+        self,
+        method: str,
+        path: str,
+        status: int,
+        code: Optional[int],
+        msg: str,
+        params: dict[str, Any],
+    ) -> None:
+        safe_params = {
+            key: value
+            for key, value in params.items()
+            if key.lower() not in {"signature", "api_key", "apikey"}
+        }
+        tag = "signed_fail" if code == -1002 else "signed_error"
+        print(
+            f"[REST] {tag} method={method} path={path} status={status} "
+            f"code={code} msg={msg} params={safe_params}"
+        )

@@ -5,6 +5,7 @@ import threading
 import time
 import traceback
 from datetime import datetime, timezone
+from typing import Optional
 
 from PySide6.QtCore import QObject, Signal, Slot
 
@@ -43,6 +44,8 @@ class TradeEngine(QObject):
         self._margin_btc_free = 0.0
         self._margin_btc_borrowed = 0.0
         self._margin_exec = BinanceMarginExecution(self._rest_client)
+        self._trade_gate: Optional[str] = None
+        self._not_authorized_abort_done = False
         self._cycle = DirectionalCycle(
             execution=self._margin_exec,
             state_machine=self._state_machine,
@@ -52,6 +55,7 @@ class TradeEngine(QObject):
             emit_log=self._emit_log,
             emit_trade_row=self._handle_trade_row,
             emit_exposure=self._emit_exposure_status,
+            on_not_authorized=self._abort_not_authorized,
         )
         self._cycle.update_data_mode(self._data_mode)
         self._cycle.update_ws_status(self._ws_status)
@@ -97,6 +101,8 @@ class TradeEngine(QObject):
         self._rest_client.close()
         self._rest_client = BinanceRestClient(api_key=api_key, api_secret=api_secret)
         self._margin_exec = BinanceMarginExecution(self._rest_client)
+        self._trade_gate = None
+        self._not_authorized_abort_done = False
         self._cycle = DirectionalCycle(
             execution=self._margin_exec,
             state_machine=self._state_machine,
@@ -106,6 +112,7 @@ class TradeEngine(QObject):
             emit_log=self._emit_log,
             emit_trade_row=self._handle_trade_row,
             emit_exposure=self._emit_exposure_status,
+            on_not_authorized=self._abort_not_authorized,
         )
         self._cycle.update_data_mode(self._data_mode)
         self._cycle.update_ws_status(self._ws_status)
@@ -227,6 +234,8 @@ class TradeEngine(QObject):
     def attempt_entry(self) -> None:
         if not self._connected or not self._margin_permission_ok:
             return
+        if self._trade_gate == "ERROR_NOT_AUTHORIZED":
+            return
         if not self._auto_loop or self._stop_requested:
             return
         self._cycle.attempt_entry()
@@ -234,6 +243,8 @@ class TradeEngine(QObject):
 
     @Slot()
     def start_trading(self) -> None:
+        if self._trade_gate == "ERROR_NOT_AUTHORIZED":
+            return
         self._auto_loop = True
         self._stop_requested = False
         self._cycles_done = 0
@@ -250,6 +261,11 @@ class TradeEngine(QObject):
     @Slot()
     def emergency_flatten(self) -> None:
         self._cycle.emergency_flatten(reason="manual")
+        self._emit_cycle_state()
+
+    @Slot()
+    def emergency_test(self) -> None:
+        self._cycle.emergency_test()
         self._emit_cycle_state()
 
     @Slot(bool)
@@ -289,6 +305,33 @@ class TradeEngine(QObject):
     def _emit_exposure_status(self, exposure_open: bool) -> None:
         exposure = exposure_open or self._margin_btc_free > 0 or self._margin_btc_borrowed > 0
         self.exposure_update.emit({"open_exposure": exposure})
+
+    def _abort_not_authorized(self, context: str) -> None:
+        if self._not_authorized_abort_done:
+            return
+        self._not_authorized_abort_done = True
+        self._trade_gate = "ERROR_NOT_AUTHORIZED"
+        self._auto_loop = False
+        self._stop_requested = True
+        path = self._rest_client.last_error_path or "<unknown>"
+        params = self._rest_client.last_error_params or {}
+        safe_params = {
+            key: value
+            for key, value in params.items()
+            if str(key).lower() not in {"signature", "api_key", "apikey"}
+        }
+        print(f"\033[31m[NOT_AUTHORIZED] endpoint={path} params={safe_params}\033[0m")
+        self._emit_log(
+            "ERROR",
+            "ERROR",
+            "API key not authorized for MARGIN endpoint",
+            context=context,
+            endpoint=path,
+            params=safe_params,
+            guidance="Enable Margin + IP whitelist",
+        )
+        self._state_machine.set_error("ERROR_NOT_AUTHORIZED")
+        self._emit_cycle_state()
 
     def _handle_trade_row(self, payload: dict) -> None:
         self.trade_row.emit(payload)
