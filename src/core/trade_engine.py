@@ -235,6 +235,12 @@ class TradeEngine(QObject):
                 "entry_price_short": snapshot.entry_short_price,
                 "winner_side": snapshot.winner_side or "—",
                 "loser_side": snapshot.loser_side or "—",
+                "winner_raw_bps": snapshot.winner_raw_bps,
+                "winner_net_bps": snapshot.winner_net_bps,
+                "loser_raw_bps": snapshot.loser_raw_bps,
+                "loser_net_bps": snapshot.loser_net_bps,
+                "reason": snapshot.reason,
+                "ws_age_ms": snapshot.ws_age_ms,
             }
         )
 

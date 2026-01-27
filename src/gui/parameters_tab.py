@@ -29,6 +29,13 @@ class ParametersTab(QWidget):
         self.usd_notional_spin.setRange(1.0, 1000.0)
         self.usd_notional_spin.setDecimals(2)
 
+        self.leverage_max_spin = QSpinBox()
+        self.leverage_max_spin.setRange(1, 5)
+
+        self.slip_bps_spin = QDoubleSpinBox()
+        self.slip_bps_spin.setRange(0.5, 10.0)
+        self.slip_bps_spin.setDecimals(2)
+
         self.max_loss_spin = QSpinBox()
         self.max_loss_spin.setRange(3, 6)
 
@@ -75,6 +82,8 @@ class ParametersTab(QWidget):
 
         form.addRow("Режим ордера", self.order_mode_combo)
         form.addRow("Номинал USD", self.usd_notional_spin)
+        form.addRow("Плечо max", self.leverage_max_spin)
+        form.addRow("Slip bps", self.slip_bps_spin)
         form.addRow("Макс. убыток (bps)", self.max_loss_spin)
         form.addRow("Комиссия всего (bps)", self.fee_spin)
         form.addRow("Цель net (bps)", self.target_net_spin)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -23,8 +24,9 @@ class HttpFallback:
             if bid <= 0 or ask <= 0:
                 return None
             mid = (bid + ask) / 2
-            spread_bps = (ask / bid - 1) * 10_000
+            spread_bps = (ask - bid) / mid * 10_000
             now = datetime.now(timezone.utc)
+            rx_time_ms = time.monotonic() * 1000
             return {
                 "bid": bid,
                 "ask": ask,
@@ -32,6 +34,7 @@ class HttpFallback:
                 "spread_bps": spread_bps,
                 "event_time": now,
                 "rx_time": now,
+                "rx_time_ms": rx_time_ms,
                 "source": "HTTP",
             }
         except Exception:

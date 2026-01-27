@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+import time
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -65,8 +66,9 @@ class MarketDataThread(QThread):
         if bid <= 0 or ask <= 0:
             return
         mid = (bid + ask) / 2
-        spread_bps = (ask / bid - 1) * 10_000
+        spread_bps = (ask - bid) / mid * 10_000
         now = datetime.now(timezone.utc)
+        rx_time_ms = time.monotonic() * 1000
         event_ts = data.get("E")
         event_time = (
             datetime.fromtimestamp(event_ts / 1000, tz=timezone.utc) if event_ts else now
@@ -79,6 +81,7 @@ class MarketDataThread(QThread):
                 "spread_bps": spread_bps,
                 "event_time": event_time,
                 "rx_time": now,
+                "rx_time_ms": rx_time_ms,
                 "source": "WS",
             }
         )

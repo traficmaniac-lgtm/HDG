@@ -47,11 +47,25 @@ class FakeExecution:
             ]
         }
 
+    def get_spot_account(self) -> dict[str, Any]:
+        return {
+            "balances": [
+                {
+                    "asset": "USDT",
+                    "free": "1000.000000",
+                    "locked": "0.000000",
+                }
+            ]
+        }
+
     def get_open_orders(self) -> list[dict[str, Any]]:
         return []
 
     def cancel_open_orders(self) -> None:
         return None
+
+    def cancel_order(self, order_id: int) -> None:
+        self._orders.pop(order_id, None)
 
     def repay_asset(self, asset: str, amount: float) -> None:
         if asset == "BTC":
@@ -138,6 +152,7 @@ def run_cycle(
                 "spread_bps": 0.2,
                 "event_time": datetime.now(timezone.utc),
                 "rx_time": datetime.now(timezone.utc),
+                "rx_time_ms": time.monotonic() * 1000,
                 "source": "WS",
             }
         )

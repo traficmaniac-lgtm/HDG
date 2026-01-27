@@ -84,6 +84,12 @@ class MainWindow(QMainWindow):
         self.sim_raw_bps: Optional[float] = None
         self.sim_net_bps: Optional[float] = None
         self.sim_condition: str = "—"
+        self.sim_winner_raw_bps: Optional[float] = None
+        self.sim_winner_net_bps: Optional[float] = None
+        self.sim_loser_raw_bps: Optional[float] = None
+        self.sim_loser_net_bps: Optional[float] = None
+        self.sim_reason: Optional[str] = None
+        self.sim_ws_age_ms: Optional[float] = None
 
         self.logger = setup_logger(Path("logs"))
         self.log_bus = LogBus(self.logger)
@@ -372,6 +378,10 @@ class MainWindow(QMainWindow):
         self.sim_exit_label = QLabel("выход_mid: —")
         self.sim_raw_label = QLabel("raw_bps победителя: —")
         self.sim_net_label = QLabel("net_bps победителя: —")
+        self.sim_loser_raw_label = QLabel("raw_bps лузера: —")
+        self.sim_loser_net_label = QLabel("net_bps лузера: —")
+        self.sim_reason_label = QLabel("reason: —")
+        self.sim_ws_age_label = QLabel("ws_age_ms: —")
         self.sim_condition_label = QLabel("условие: —")
 
         sim_layout.addWidget(self.sim_side_label, 0, 0)
@@ -380,6 +390,10 @@ class MainWindow(QMainWindow):
         sim_layout.addWidget(self.sim_exit_label, 1, 1)
         sim_layout.addWidget(self.sim_raw_label, 2, 0)
         sim_layout.addWidget(self.sim_net_label, 2, 1)
+        sim_layout.addWidget(self.sim_loser_raw_label, 3, 0)
+        sim_layout.addWidget(self.sim_loser_net_label, 3, 1)
+        sim_layout.addWidget(self.sim_reason_label, 4, 0)
+        sim_layout.addWidget(self.sim_ws_age_label, 4, 1)
         sim_layout.addWidget(self.sim_condition_label, 2, 2)
 
         layout.addWidget(self.state_panel)
@@ -572,6 +586,8 @@ class MainWindow(QMainWindow):
             or self.parameters_tab.order_mode_combo.currentText()
         )
         self.strategy_params.usd_notional = self.parameters_tab.usd_notional_spin.value()
+        self.strategy_params.leverage_max = self.parameters_tab.leverage_max_spin.value()
+        self.strategy_params.slip_bps = self.parameters_tab.slip_bps_spin.value()
         self.strategy_params.max_loss_bps = self.parameters_tab.max_loss_spin.value()
         self.strategy_params.fee_total_bps = self.parameters_tab.fee_spin.value()
         self.strategy_params.target_net_bps = self.parameters_tab.target_net_spin.value()
@@ -608,6 +624,8 @@ class MainWindow(QMainWindow):
         if index >= 0:
             self.parameters_tab.order_mode_combo.setCurrentIndex(index)
         self.parameters_tab.usd_notional_spin.setValue(self.strategy_params.usd_notional)
+        self.parameters_tab.leverage_max_spin.setValue(self.strategy_params.leverage_max)
+        self.parameters_tab.slip_bps_spin.setValue(self.strategy_params.slip_bps)
         self.parameters_tab.max_loss_spin.setValue(self.strategy_params.max_loss_bps)
         self.parameters_tab.fee_spin.setValue(self.strategy_params.fee_total_bps)
         self.parameters_tab.target_net_spin.setValue(self.strategy_params.target_net_bps)
@@ -732,8 +750,20 @@ class MainWindow(QMainWindow):
         if self.state_machine.state == BotState.ENTERING:
             self.sim_raw_bps = None
             self.sim_net_bps = None
+            self.sim_winner_raw_bps = None
+            self.sim_winner_net_bps = None
+            self.sim_loser_raw_bps = None
+            self.sim_loser_net_bps = None
+            self.sim_reason = None
+            self.sim_ws_age_ms = None
         if self.state_machine.state == BotState.COOLDOWN:
             self.cooldown_timer.start(self.strategy_params.cooldown_s * 1000)
+        self.sim_winner_raw_bps = payload.get("winner_raw_bps")
+        self.sim_winner_net_bps = payload.get("winner_net_bps")
+        self.sim_loser_raw_bps = payload.get("loser_raw_bps")
+        self.sim_loser_net_bps = payload.get("loser_net_bps")
+        self.sim_reason = payload.get("reason")
+        self.sim_ws_age_ms = payload.get("ws_age_ms")
         self._update_ui_state()
 
     def on_trade_row(self, payload: dict) -> None:
@@ -832,10 +862,22 @@ class MainWindow(QMainWindow):
         exit_mark = "—" if not self.sim_exit_price else f"{self.sim_exit_price:,.2f}"
         self.sim_entry_label.setText(f"вход_mid: {entry}")
         self.sim_exit_label.setText(f"выход_mid: {exit_mark}")
-        raw = "—" if self.sim_raw_bps is None else f"{self.sim_raw_bps:.2f}"
-        net = "—" if self.sim_net_bps is None else f"{self.sim_net_bps:.2f}"
+        raw = "—" if self.sim_winner_raw_bps is None else f"{self.sim_winner_raw_bps:.2f}"
+        net = "—" if self.sim_winner_net_bps is None else f"{self.sim_winner_net_bps:.2f}"
+        loser_raw = (
+            "—" if self.sim_loser_raw_bps is None else f"{self.sim_loser_raw_bps:.2f}"
+        )
+        loser_net = (
+            "—" if self.sim_loser_net_bps is None else f"{self.sim_loser_net_bps:.2f}"
+        )
+        reason = self.sim_reason or "—"
+        ws_age = "—" if self.sim_ws_age_ms is None else f"{self.sim_ws_age_ms:.0f}"
         self.sim_raw_label.setText(f"raw_bps победителя: {raw}")
         self.sim_net_label.setText(f"net_bps победителя: {net}")
+        self.sim_loser_raw_label.setText(f"raw_bps лузера: {loser_raw}")
+        self.sim_loser_net_label.setText(f"net_bps лузера: {loser_net}")
+        self.sim_reason_label.setText(f"reason: {reason}")
+        self.sim_ws_age_label.setText(f"ws_age_ms: {ws_age}")
         self.sim_condition_label.setText(f"условие: {winner}")
 
     def _update_state_labels(self) -> None:
