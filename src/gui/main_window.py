@@ -447,6 +447,7 @@ class MainWindow(QMainWindow):
 
         layout.addLayout(filter_layout)
         layout.addWidget(self.log_output)
+        self._refresh_log_view()
         return widget
 
     def _build_stats_tab(self) -> QWidget:
@@ -916,9 +917,11 @@ class MainWindow(QMainWindow):
 
     def on_log_entry(self, entry: dict) -> None:
         self.log_entries.append(entry)
+        if not hasattr(self, "log_output"):
+            return
         if self._log_entry_visible(entry):
             self.log_output.appendPlainText(self._format_log_line(entry))
-        if entry.get("category") == "DEALS":
+        if entry.get("category") == "DEALS" and hasattr(self, "deals_log_output"):
             self.deals_log_output.appendPlainText(self._format_log_line(entry))
 
     def _format_log_line(self, entry: dict) -> str:
@@ -937,6 +940,8 @@ class MainWindow(QMainWindow):
         return "\n".join(lines)
 
     def _log_entry_visible(self, entry: dict) -> bool:
+        if not hasattr(self, "log_filter_combo"):
+            return True
         category_filter = self.log_filter_combo.currentText()
         category_map = {
             "ВСЕ": None,
