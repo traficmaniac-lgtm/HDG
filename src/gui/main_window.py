@@ -53,10 +53,11 @@ class MainWindow(QMainWindow):
     request_http_fallback = Signal()
     request_attempt_entry = Signal()
     request_stop_cycle = Signal()
+    request_start_trading = Signal()
     request_emergency_flatten = Signal()
     request_set_strategy = Signal(dict)
     request_set_connection = Signal(dict)
-    request_end_cooldown = Signal()
+    request_end_cooldown = Signal(bool)
     request_ui_heartbeat = Signal(float)
     request_on_tick = Signal(dict)
 
@@ -482,6 +483,7 @@ class MainWindow(QMainWindow):
         self.request_http_fallback.connect(self.trade_engine.fetch_http_fallback)
         self.request_attempt_entry.connect(self.trade_engine.attempt_entry)
         self.request_stop_cycle.connect(self.trade_engine.stop)
+        self.request_start_trading.connect(self.trade_engine.start_trading)
         self.request_emergency_flatten.connect(self.trade_engine.emergency_flatten)
         self.request_set_strategy.connect(self.trade_engine.set_strategy)
         self.request_set_connection.connect(self.trade_engine.set_connection)
@@ -535,12 +537,14 @@ class MainWindow(QMainWindow):
             return
         self.run_mode = True
         self.log_bus.log("INFO", "INFO", "AUTO trading started")
+        self.request_start_trading.emit()
         self._update_ui_state()
         self._run_loop_check()
 
     def on_stop(self) -> None:
         self.run_mode = False
         self.log_bus.log("INFO", "INFO", "AUTO trading stopped by user")
+        self.request_stop_cycle.emit()
         self._update_ui_state()
 
     def on_emergency_flatten(self) -> None:
@@ -552,9 +556,12 @@ class MainWindow(QMainWindow):
         self.request_stop_cycle.emit()
 
     def on_cooldown_complete(self) -> None:
-        self.request_end_cooldown.emit()
+        auto_resume = self.run_mode and self.strategy_params.auto_loop
+        self.request_end_cooldown.emit(auto_resume)
+        if not auto_resume:
+            self.run_mode = False
         self._update_ui_state()
-        if self.run_mode:
+        if auto_resume:
             self._run_loop_check()
 
     def apply_params(self) -> None:
@@ -570,14 +577,14 @@ class MainWindow(QMainWindow):
         self.strategy_params.min_tick_rate = self.parameters_tab.min_tick_rate_spin.value()
         self.strategy_params.detect_timeout_ms = self.parameters_tab.detect_timeout_spin.value()
         self.strategy_params.impulse_min_bps = self.parameters_tab.impulse_min_spin.value()
-        self.strategy_params.winner_threshold_bps_raw = (
+        self.strategy_params.winner_threshold_bps = (
             self.parameters_tab.winner_threshold_spin.value()
         )
         self.strategy_params.emergency_stop_bps = (
             self.parameters_tab.emergency_stop_spin.value()
         )
         self.strategy_params.cooldown_s = self.parameters_tab.cooldown_spin.value()
-        self.strategy_params.direction_detect_window_ticks = int(
+        self.strategy_params.detect_window_ticks = int(
             self.parameters_tab.direction_window_combo.currentText()
         )
         self.strategy_params.burst_volume_threshold = (
@@ -607,12 +614,12 @@ class MainWindow(QMainWindow):
         self.parameters_tab.detect_timeout_spin.setValue(self.strategy_params.detect_timeout_ms)
         self.parameters_tab.impulse_min_spin.setValue(self.strategy_params.impulse_min_bps)
         self.parameters_tab.winner_threshold_spin.setValue(
-            self.strategy_params.winner_threshold_bps_raw
+            self.strategy_params.winner_threshold_bps
         )
         self.parameters_tab.emergency_stop_spin.setValue(self.strategy_params.emergency_stop_bps)
         self.parameters_tab.cooldown_spin.setValue(self.strategy_params.cooldown_s)
         self.parameters_tab.direction_window_combo.setCurrentText(
-            str(self.strategy_params.direction_detect_window_ticks)
+            str(self.strategy_params.detect_window_ticks)
         )
         self.parameters_tab.burst_volume_spin.setValue(
             self.strategy_params.burst_volume_threshold
@@ -709,9 +716,12 @@ class MainWindow(QMainWindow):
         self.state_machine.active_cycle = bool(payload.get("active_cycle"))
         self.state_machine.cycle_id = int(payload.get("cycle_id", 0))
         self.cycle_start_time = payload.get("start_time")
+        entry_mid = payload.get("entry_mid")
         entry_long = payload.get("entry_price_long")
         entry_short = payload.get("entry_price_short")
-        if entry_long and entry_short:
+        if entry_mid:
+            self.sim_entry_price = float(entry_mid)
+        elif entry_long and entry_short:
             self.sim_entry_price = (entry_long + entry_short) / 2
         else:
             self.sim_entry_price = entry_long or entry_short
@@ -875,9 +885,9 @@ class MainWindow(QMainWindow):
             in {
                 BotState.ENTERING,
                 BotState.DETECTING,
-                BotState.CUT_LOSER,
-                BotState.HOLD_WINNER,
-                BotState.EXIT_WINNER,
+                BotState.CUTTING,
+                BotState.RIDING,
+                BotState.EXITING,
                 BotState.COOLDOWN,
             }
         )

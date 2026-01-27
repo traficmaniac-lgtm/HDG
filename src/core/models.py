@@ -43,10 +43,10 @@ class StrategyParams:
     min_tick_rate: int = 5
     detect_timeout_ms: int = 800
     impulse_min_bps: float = 1.0
-    winner_threshold_bps_raw: float = 1.0
+    winner_threshold_bps: float = 1.0
     emergency_stop_bps: int = 10
     cooldown_s: int = 3
-    direction_detect_window_ticks: int = 2
+    detect_window_ticks: int = 2
     burst_volume_threshold: float = 0.0
     auto_loop: bool = False
 
@@ -57,12 +57,19 @@ class CycleStatus:
     active_cycle: bool = False
     cycle_id: int = 0
     start_time: Optional[datetime] = None
-    entry_price_long: Optional[float] = None
-    entry_price_short: Optional[float] = None
-    raw_bps_long: Optional[float] = None
-    raw_bps_short: Optional[float] = None
+    entry_mid: Optional[float] = None
+    detect_mid: Optional[float] = None
+    exit_mid: Optional[float] = None
     winner_side: str = "—"
     loser_side: str = "—"
+
+
+@dataclass
+class SymbolFilters:
+    step_size: float = 0.0
+    min_qty: float = 0.0
+    min_notional: float = 0.0
+    tick_size: float = 0.0
 
 
 @dataclass

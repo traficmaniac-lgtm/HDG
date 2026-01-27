@@ -32,6 +32,7 @@ class HttpFallback:
                 "spread_bps": spread_bps,
                 "event_time": now,
                 "rx_time": now,
+                "source": "HTTP",
             }
         except Exception:
             return None
