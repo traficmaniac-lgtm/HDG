@@ -10,7 +10,7 @@ from typing import Optional
 
 from PySide6.QtCore import QObject, Signal, Slot
 
-from src.core.models import MarketDataMode, StrategyParams, SymbolFilters
+from src.core.models import CycleViewModel, MarketDataMode, StrategyParams, SymbolFilters
 from src.core.state_machine import BotState, BotStateMachine
 from src.engine.directional_cycle import DirectionalCycle
 from src.exchange.binance_margin import BinanceMarginExecution
@@ -27,6 +27,7 @@ class TradeEngine(QObject):
     tick_update = Signal(dict)
     trade_row = Signal(dict)
     cycle_update = Signal(dict)
+    cycle_updated = Signal(object)
     connection_checked = Signal(dict)
     exposure_update = Signal(dict)
 
@@ -313,6 +314,39 @@ class TradeEngine(QObject):
                 "effective_age_ms": snapshot.effective_age_ms,
             }
         )
+        view_model = CycleViewModel(
+            state=state.value,
+            cycle_id=self._state_machine.cycle_id,
+            active_cycle=active_cycle,
+            start_ts=self._cycle.cycle_start,
+            duration_s=telemetry.duration_s,
+            entry_mid=telemetry.entry_mid,
+            last_mid=telemetry.last_mid,
+            exit_mid=telemetry.exit_mid,
+            impulse_bps=telemetry.impulse_bps,
+            tick_rate=telemetry.tick_rate,
+            spread_bps=telemetry.spread_bps,
+            ws_age_ms=telemetry.ws_age_ms,
+            effective_source=telemetry.effective_source,
+            effective_age_ms=snapshot.effective_age_ms,
+            long_raw_bps=telemetry.long_raw_bps,
+            short_raw_bps=telemetry.short_raw_bps,
+            winner=telemetry.winner_side,
+            loser=telemetry.loser_side,
+            reason=telemetry.reason,
+            target_net_bps=telemetry.target_net_bps,
+            fee_bps=telemetry.fee_total_bps,
+            max_loss_bps=telemetry.max_loss_bps,
+            detect_window_ticks=telemetry.detect_window_ticks,
+            detect_timeout_ms=telemetry.detect_timeout_ms,
+            cooldown_s=telemetry.cooldown_s,
+            result=telemetry.result,
+            pnl_usdt=telemetry.pnl_usdt,
+            net_bps_total=telemetry.total_net_bps,
+            data_stale=snapshot.data_stale,
+            waiting_for_data=snapshot.waiting_for_data,
+        )
+        self.cycle_updated.emit(view_model)
         self._last_cycle_emit_ts = now
         self._last_cycle_emit_state = state
         self._last_active_cycle = active_cycle

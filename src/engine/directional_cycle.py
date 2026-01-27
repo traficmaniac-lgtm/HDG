@@ -73,13 +73,18 @@ class DirectionalCycle:
         self._detect_mid: Optional[Decimal] = None
         self._loser_exit_price: Optional[float] = None
         self._winner_exit_price: Optional[float] = None
+        self._exit_mid: Optional[float] = None
         self._entry_long_price: Optional[float] = None
         self._entry_short_price: Optional[float] = None
         self._winner_raw_bps: Optional[float] = None
         self._winner_net_bps: Optional[float] = None
         self._loser_raw_bps: Optional[float] = None
         self._loser_net_bps: Optional[float] = None
+        self._long_raw_bps: Optional[float] = None
+        self._short_raw_bps: Optional[float] = None
         self._last_net_usd: Optional[float] = None
+        self._last_cycle_net_bps: Optional[float] = None
+        self._last_cycle_result: Optional[str] = None
         self._last_reason: Optional[str] = None
         self._ws_age_ms: Optional[float] = None
         self._http_age_ms: Optional[float] = None
@@ -161,21 +166,28 @@ class DirectionalCycle:
             max_spread_bps=self._strategy.max_spread_bps,
             min_tick_rate=self._strategy.min_tick_rate,
             cooldown_s=self._strategy.cooldown_s,
+            detect_window_ticks=self._detect_window_ticks,
+            detect_timeout_ms=self._strategy.detect_timeout_ms,
             tick_rate=metrics["tick_rate"],
             impulse_bps=metrics["impulse_bps"],
             spread_bps=metrics["spread_bps"],
             ws_age_ms=metrics["ws_age_ms"],
             effective_source=str(metrics["effective_source"]),
+            last_mid=self._float_from_decimal(self._get_effective_mid_decimal()),
             entry_mid=self._float_from_decimal(self._entry_mid),
-            exit_mid=self._winner_exit_price or self._loser_exit_price,
+            exit_mid=self._exit_mid or self._winner_exit_price or self._loser_exit_price,
             winner_side=self._winner_side,
             loser_side=self._loser_side,
+            long_raw_bps=self._long_raw_bps,
+            short_raw_bps=self._short_raw_bps,
             winner_raw_bps=winner_raw,
             loser_raw_bps=loser_raw,
             winner_net_bps=winner_net,
             loser_net_bps=loser_net,
             total_raw_bps=total_raw,
-            total_net_bps=total_net,
+            total_net_bps=total_net if total_net is not None else self._last_cycle_net_bps,
+            result=self._last_cycle_result,
+            pnl_usdt=self._last_net_usd,
             condition=self._condition_from_state(state),
             reason=self._last_reason,
             last_error=last_error,
@@ -315,14 +327,19 @@ class DirectionalCycle:
         self._detect_mid = None
         self._loser_exit_price = None
         self._winner_exit_price = None
+        self._exit_mid = None
         self._entry_long_price = None
         self._entry_short_price = None
         self._winner_raw_bps = None
         self._winner_net_bps = None
         self._loser_raw_bps = None
         self._loser_net_bps = None
+        self._long_raw_bps = None
+        self._short_raw_bps = None
         self._last_reason = None
         self._last_net_usd = None
+        self._last_cycle_net_bps = None
+        self._last_cycle_result = None
         self._last_detect_sample_log_ts = 0.0
         self._reset_detect_buffer()
         self._emit_log(
@@ -458,7 +475,10 @@ class DirectionalCycle:
         if not self._entry_mid or not self._detect_start_ts:
             return
         elapsed = (time.monotonic() - self._detect_start_ts) * 1000
-        if elapsed > self._strategy.detect_timeout_ms:
+        min_tick_rate = max(1, int(self._strategy.min_tick_rate))
+        min_timeout_ms = (self._detect_window_ticks / min_tick_rate) * 1000 + 500
+        detect_timeout_ms = max(float(self._strategy.detect_timeout_ms), min_timeout_ms)
+        if elapsed > detect_timeout_ms and len(self._detect_mid_buffer) >= self._detect_window_ticks:
             self._handle_detect_timeout()
             return
         tick = self._market_data.get_last_effective_tick() or {}
@@ -468,29 +488,38 @@ class DirectionalCycle:
         self._append_detect_mid(mid_now)
         long_raw = self._calc_raw_bps("LONG", self._entry_mid, mid_now)
         short_raw = self._calc_raw_bps("SHORT", self._entry_mid, mid_now)
+        self._long_raw_bps = long_raw
+        self._short_raw_bps = short_raw
         winner_threshold = self._strategy.winner_threshold_bps
         best = max(long_raw, short_raw)
         delta_mid_bps = None
         if len(self._detect_mid_buffer) >= self._detect_window_ticks:
             mid_first = self._detect_mid_buffer[0]
             mid_last = self._detect_mid_buffer[-1]
-            if mid_first > 0:
-                delta_mid_bps = float((mid_last - mid_first) / mid_first * Decimal("10000"))
+            if self._entry_mid and self._entry_mid > 0:
+                delta_mid_bps = float(
+                    (mid_last - mid_first) / self._entry_mid * Decimal("10000")
+                )
         now = time.monotonic()
         if now - self._last_detect_sample_log_ts > 0.3:
+            mid_disp = self._format_decimal(mid_now)
             self._emit_log(
                 "INFO",
                 "INFO",
                 "[DETECT] sample",
-                mid=self._format_decimal(mid_now),
+                mid_raw=f"{float(mid_now):.6f}",
+                mid_disp=mid_disp,
                 long_raw=f"{long_raw:.4f}",
                 short_raw=f"{short_raw:.4f}",
                 delta_window_bps=f"{delta_mid_bps:.4f}" if delta_mid_bps is not None else None,
             )
             self._last_detect_sample_log_ts = now
+        if len(self._detect_mid_buffer) < self._detect_window_ticks:
+            if self._last_reason != "wait_window":
+                self._last_reason = "wait_window"
+            return
         if best < winner_threshold:
-            if delta_mid_bps is None or abs(delta_mid_bps) < winner_threshold / 2:
-                return
+            return
         if long_raw >= short_raw:
             self._winner_side = "LONG"
             self._loser_side = "SHORT"
@@ -653,6 +682,7 @@ class DirectionalCycle:
             self._set_error("exit_winner_timeout")
             return
         self._winner_exit_price = fill[0]
+        self._exit_mid = self._winner_exit_price
         self._winner_raw_bps = self._calc_raw_bps(
             self._winner_side, self._entry_mid or Decimal("0"), self._winner_exit_price
         )
@@ -679,16 +709,30 @@ class DirectionalCycle:
         self._emit_log("STATE", "INFO", "CYCLE_DONE", cycle_id=self._state_machine.cycle_id)
         self._log_cycle_end("OK", reason=note)
 
-    def _no_winner_exit(self, reason: str, allow_flatten: bool) -> None:
+    def _no_winner_exit(self, reason: str, allow_flatten: bool, no_loss: bool) -> None:
         self._emit_log("TRADE", "INFO", "DETECT no winner", reason=reason)
         self._emit_log("STATE", "INFO", "DETECT_NO_WINNER", cycle_id=self._state_machine.cycle_id)
-        if allow_flatten:
+        result = "NO_WINNER"
+        success = False
+        if allow_flatten and no_loss:
+            self._emit_log("INFO", "INFO", "[DETECT] timeout -> no_loss_flatten")
+            success = self._close_no_winner_positions(reason=reason)
+            result = "NO_WINNER_NO_LOSS" if success else "ERROR"
+            if not success:
+                self._emergency_flatten(reason="no_winner_no_loss_failed")
+        elif allow_flatten:
             self._emit_log("INFO", "INFO", "[DETECT] timeout -> controlled_flatten")
             success = self._controlled_flatten(reason=reason)
             result = "NO_WINNER_ALLOWED" if success else "ERROR"
+            if not success:
+                self._emergency_flatten(reason="no_winner_flatten_failed")
         else:
-            self._emergency_flatten(reason=reason)
-            result = "NO_WINNER"
+            self._emit_log(
+                "INFO",
+                "INFO",
+                "[DETECT] timeout -> no_flatten_allowed",
+                policy=self._strategy.no_winner_policy,
+            )
         self._last_reason = reason
         if self._state_machine.state != BotState.ERROR:
             self._state_machine.finish_cycle()
@@ -753,6 +797,7 @@ class DirectionalCycle:
         net_total = winner_net + loser_net
         net_usd = (self._strategy.usd_notional / 10_000) * net_total
         self._last_net_usd = net_usd
+        self._last_cycle_net_bps = net_total
         entry_mid = float(self._entry_mid)
         self._emit_trade_row(
             {
@@ -783,9 +828,165 @@ class DirectionalCycle:
             note=note,
         )
 
+    def _no_winner_order_price(self, side: str) -> Optional[float]:
+        tick = self._last_tick or self._market_data.get_last_effective_tick() or {}
+        bid = float(tick.get("bid", 0.0))
+        ask = float(tick.get("ask", 0.0))
+        tick_size = self._filters.tick_size
+        if bid <= 0 or ask <= 0 or tick_size <= 0:
+            return None
+        if side == "BUY":
+            return (ask + tick_size) * (1 + self._strategy.slip_bps / 10_000)
+        price = bid - tick_size
+        if price <= 0:
+            return None
+        return price * (1 - self._strategy.slip_bps / 10_000)
+
+    def _place_ioc_aggressive_limit(
+        self, side: str, qty: float, price: float, side_effect_type: Optional[str]
+    ) -> Optional[dict[str, Any]]:
+        order = self._execution.place_order(
+            side,
+            qty,
+            "aggressive_limit",
+            price=price,
+            side_effect_type=side_effect_type,
+            time_in_force="IOC",
+        )
+        self._abort_if_not_authorized("place_ioc_order")
+        return order
+
+    def _close_no_winner_positions(self, reason: str) -> bool:
+        if not self._entry_qty or not self._entry_mid:
+            self._set_error("no_winner_missing_entry")
+            return False
+        self._state_machine.state = BotState.CONTROLLED_FLATTEN
+        order_mode = self._strategy.order_mode
+        buy_side_effect = "AUTO_REPAY"
+        sell_side_effect = "NO_SIDE_EFFECT"
+        buy_price = None
+        sell_price = None
+        if order_mode == "aggressive_limit":
+            buy_price = self._no_winner_order_price("BUY")
+            sell_price = self._no_winner_order_price("SELL")
+            if buy_price is None or sell_price is None:
+                self._emit_log(
+                    "INFO",
+                    "INFO",
+                    "[DETECT] no_loss fallback to market",
+                    reason="invalid_limit_price",
+                )
+                order_mode = "market"
+        if order_mode == "aggressive_limit":
+            buy_order = self._place_ioc_aggressive_limit(
+                "BUY",
+                self._entry_qty,
+                buy_price or 0.0,
+                buy_side_effect,
+            )
+            sell_order = self._place_ioc_aggressive_limit(
+                "SELL",
+                self._entry_qty,
+                sell_price or 0.0,
+                sell_side_effect,
+            )
+        else:
+            buy_order = self._execution.place_order(
+                "BUY",
+                self._entry_qty,
+                "market",
+                side_effect_type=buy_side_effect,
+            )
+            sell_order = self._execution.place_order(
+                "SELL",
+                self._entry_qty,
+                "market",
+                side_effect_type=sell_side_effect,
+            )
+        if self._abort_if_not_authorized("no_winner_place_orders"):
+            return False
+        buy_fill = self._wait_for_fill_with_fallback(
+            "BUY",
+            buy_order.get("orderId") if buy_order else None,
+            self._entry_qty,
+            order_mode,
+            buy_price,
+            side_effect_type=buy_side_effect,
+        )
+        sell_fill = self._wait_for_fill_with_fallback(
+            "SELL",
+            sell_order.get("orderId") if sell_order else None,
+            self._entry_qty,
+            order_mode,
+            sell_price,
+            side_effect_type=sell_side_effect,
+        )
+        if not buy_fill or not sell_fill:
+            self._emit_log(
+                "ERROR",
+                "ERROR",
+                "[DETECT] no_loss fill failed",
+                buy_filled=bool(buy_fill),
+                sell_filled=bool(sell_fill),
+            )
+            return False
+        buy_exit = buy_fill[0]
+        sell_exit = sell_fill[0]
+        long_raw = self._calc_raw_bps("LONG", self._entry_mid, sell_exit)
+        short_raw = self._calc_raw_bps("SHORT", self._entry_mid, buy_exit)
+        self._long_raw_bps = long_raw
+        self._short_raw_bps = short_raw
+        fees_est_bps = self._strategy.fee_total_bps * 2
+        net_total = (long_raw - self._strategy.fee_total_bps) + (
+            short_raw - self._strategy.fee_total_bps
+        )
+        net_usd = (self._strategy.usd_notional / 10_000) * net_total
+        self._last_cycle_net_bps = net_total
+        self._last_net_usd = net_usd
+        self._winner_exit_price = sell_exit
+        self._loser_exit_price = buy_exit
+        self._exit_mid = (sell_exit + buy_exit) / 2
+        self._emit_log(
+            "TRADE",
+            "INFO",
+            "NO_WINNER exit filled",
+            reason=reason,
+            long_exit=sell_exit,
+            short_exit=buy_exit,
+            fees_est_bps=fees_est_bps,
+            net_bps=f"{net_total:.4f}",
+            pnl_usdt=net_usd,
+        )
+        duration_ms = 0
+        if self._cycle_start:
+            duration_ms = int(
+                (datetime.now(timezone.utc) - self._cycle_start).total_seconds() * 1000
+            )
+        self._emit_trade_row(
+            {
+                "ts": datetime.now(timezone.utc),
+                "cycle_id": self._state_machine.cycle_id,
+                "phase": "cycle_summary",
+                "side": "NO_WINNER",
+                "qty": self._entry_qty,
+                "entry_price": float(self._entry_mid),
+                "exit_price": (sell_exit + buy_exit) / 2,
+                "raw_bps": long_raw + short_raw,
+                "net_bps": net_total,
+                "net_usd": net_usd,
+                "duration_ms": duration_ms,
+                "note": reason,
+            }
+        )
+        self._exposure_open = False
+        self._emit_exposure(False)
+        self._settle_borrow()
+        return True
+
     def _log_cycle_end(self, result: str, reason: Optional[str] = None) -> None:
         if not self._cycle_start:
             return
+        self._last_cycle_result = result
         now = datetime.now(timezone.utc)
         duration_ms = int((now - self._cycle_start).total_seconds() * 1000)
         winner_side = self._winner_side or "—"
@@ -945,6 +1146,11 @@ class DirectionalCycle:
         return f"{float(value):.{precision}f}"
 
     def _mid_from_tick_decimal(self, tick: dict[str, Any]) -> Optional[Decimal]:
+        mid_raw = tick.get("mid_raw")
+        if mid_raw is not None:
+            mid_value = self._to_decimal(mid_raw)
+            if mid_value > 0:
+                return mid_value
         bid_raw = tick.get("bid_raw")
         ask_raw = tick.get("ask_raw")
         if bid_raw is not None and ask_raw is not None:
@@ -958,6 +1164,9 @@ class DirectionalCycle:
         return (bid + ask) / Decimal("2")
 
     def _get_effective_mid_decimal(self) -> Optional[Decimal]:
+        mid_raw = self._market_data.get_mid_raw()
+        if mid_raw is not None and mid_raw > 0:
+            return mid_raw
         tick = self._market_data.get_last_effective_tick() or {}
         return self._mid_from_tick_decimal(tick)
 
@@ -971,8 +1180,12 @@ class DirectionalCycle:
             self._detect_mid_buffer.append(mid)
 
     def _handle_detect_timeout(self) -> None:
+        policy = self._strategy.no_winner_policy.upper()
         allow_flatten = self._strategy.allow_no_winner_flatten and self._exposure_open
-        self._no_winner_exit("detect_timeout", allow_flatten=allow_flatten)
+        if policy == "NO_LOSS":
+            self._no_winner_exit("detect_timeout", allow_flatten=allow_flatten, no_loss=True)
+        else:
+            self._no_winner_exit("detect_timeout", allow_flatten=allow_flatten, no_loss=False)
 
     def _round_step(self, qty: float) -> float:
         step = self._filters.step_size

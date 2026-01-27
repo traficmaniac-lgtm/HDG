@@ -55,7 +55,7 @@ class ParametersTab(QWidget):
         self.min_tick_rate_spin.setRange(1, 200)
 
         self.detect_timeout_spin = QSpinBox()
-        self.detect_timeout_spin.setRange(100, 5000)
+        self.detect_timeout_spin.setRange(100, 10_000)
         self.detect_timeout_spin.setSingleStep(50)
 
         self.use_impulse_checkbox = QCheckBox("Использовать импульс-фильтр")
@@ -88,6 +88,10 @@ class ParametersTab(QWidget):
 
         self.allow_no_winner_checkbox = QCheckBox("Разрешить выход без победителя")
 
+        self.no_winner_policy_combo = QComboBox()
+        self.no_winner_policy_combo.addItem("No-loss (IOC)", "NO_LOSS")
+        self.no_winner_policy_combo.addItem("Flatten", "FLATTEN")
+
         self.burst_volume_spin = QDoubleSpinBox()
         self.burst_volume_spin.setRange(0.0, 1_000_000.0)
         self.burst_volume_spin.setDecimals(2)
@@ -114,6 +118,7 @@ class ParametersTab(QWidget):
         form.addRow("Окно детекта (тик)", self.direction_window_combo)
         form.addRow("Фильтр объема", self.burst_volume_spin)
         form.addRow("", self.allow_no_winner_checkbox)
+        form.addRow("No-winner policy", self.no_winner_policy_combo)
         form.addRow("", self.auto_loop_checkbox)
 
         layout.addLayout(form)
