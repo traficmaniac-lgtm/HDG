@@ -22,7 +22,6 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
-    QSpinBox,
     QSizePolicy,
     QTabWidget,
     QTableWidget,
@@ -94,8 +93,8 @@ class MainWindow(QMainWindow):
         self.sim_entry_price: Optional[float] = None
         self.sim_entry_qty: Optional[float] = None
         self.sim_exit_price: Optional[float] = None
-        self.sim_raw_bps: Optional[float] = None
-        self.sim_net_bps: Optional[float] = None
+        self.sim_total_raw_bps: Optional[float] = None
+        self.sim_total_net_bps: Optional[float] = None
         self.sim_condition: str = "—"
         self.sim_winner_raw_bps: Optional[float] = None
         self.sim_winner_net_bps: Optional[float] = None
@@ -103,6 +102,9 @@ class MainWindow(QMainWindow):
         self.sim_loser_net_bps: Optional[float] = None
         self.sim_reason: Optional[str] = None
         self.sim_ws_age_ms: Optional[float] = None
+        self.sim_tick_rate: Optional[float] = None
+        self.sim_impulse_bps: Optional[float] = None
+        self.sim_spread_bps: Optional[float] = None
         self.effective_source = "NONE"
         self.effective_age_ms: Optional[float] = None
         self.ws_age_ms: Optional[float] = None
@@ -315,11 +317,6 @@ class MainWindow(QMainWindow):
         self.stop_button = QPushButton("СТОП")
         cycle_layout.addWidget(self.start_cycle_button)
         cycle_layout.addWidget(self.stop_button)
-        self.max_cycles_spin = QSpinBox()
-        self.max_cycles_spin.setRange(0, 1000)
-        self.max_cycles_spin.setFixedWidth(80)
-        cycle_layout.addWidget(QLabel("Max cycles"))
-        cycle_layout.addWidget(self.max_cycles_spin)
         layout.addLayout(cycle_layout)
 
         self.emergency_button = QPushButton("ЗАКРЫТЬ ВСЁ")
@@ -379,17 +376,25 @@ class MainWindow(QMainWindow):
         bps_layout = QGridLayout(self.bps_panel)
         bps_layout.setContentsMargins(10, 10, 10, 10)
 
-        self.raw_bps_label = QLabel("сырой bps: —")
-        self.net_bps_label = QLabel("net bps: —")
+        self.raw_bps_label = QLabel("raw_bps всего: —")
+        self.net_bps_label = QLabel("net_bps всего: —")
+        self.winner_raw_label = QLabel("raw_bps победителя: —")
+        self.winner_net_label = QLabel("net_bps победителя: —")
+        self.loser_raw_label = QLabel("raw_bps лузера: —")
+        self.loser_net_label = QLabel("net_bps лузера: —")
         self.fee_label = QLabel("комиссия bps: —")
         self.target_label = QLabel("цель net bps: —")
         self.max_loss_label = QLabel("макс. убыток bps: —")
 
         bps_layout.addWidget(self.raw_bps_label, 0, 0)
         bps_layout.addWidget(self.net_bps_label, 0, 1)
-        bps_layout.addWidget(self.fee_label, 1, 0)
-        bps_layout.addWidget(self.target_label, 1, 1)
-        bps_layout.addWidget(self.max_loss_label, 1, 2)
+        bps_layout.addWidget(self.fee_label, 0, 2)
+        bps_layout.addWidget(self.winner_raw_label, 1, 0)
+        bps_layout.addWidget(self.winner_net_label, 1, 1)
+        bps_layout.addWidget(self.target_label, 1, 2)
+        bps_layout.addWidget(self.loser_raw_label, 2, 0)
+        bps_layout.addWidget(self.loser_net_label, 2, 1)
+        bps_layout.addWidget(self.max_loss_label, 2, 2)
 
         self.filters_panel = QFrame()
         self.filters_panel.setFrameShape(QFrame.StyledPanel)
@@ -413,25 +418,25 @@ class MainWindow(QMainWindow):
         self.sim_notional_label = QLabel("номинал USD: —")
         self.sim_entry_label = QLabel("вход_mid: —")
         self.sim_exit_label = QLabel("выход_mid: —")
-        self.sim_raw_label = QLabel("raw_bps победителя: —")
-        self.sim_net_label = QLabel("net_bps победителя: —")
-        self.sim_loser_raw_label = QLabel("raw_bps лузера: —")
-        self.sim_loser_net_label = QLabel("net_bps лузера: —")
         self.sim_reason_label = QLabel("reason: —")
         self.sim_ws_age_label = QLabel("ws_age_ms: —")
+        self.sim_source_label = QLabel("source: —")
         self.sim_condition_label = QLabel("условие: —")
+        self.sim_tick_label = QLabel("tick_rate: —")
+        self.sim_impulse_label = QLabel("impulse_bps: —")
+        self.sim_spread_label = QLabel("spread_bps: —")
 
         sim_layout.addWidget(self.sim_side_label, 0, 0)
         sim_layout.addWidget(self.sim_notional_label, 0, 1)
+        sim_layout.addWidget(self.sim_condition_label, 0, 2)
         sim_layout.addWidget(self.sim_entry_label, 1, 0)
         sim_layout.addWidget(self.sim_exit_label, 1, 1)
-        sim_layout.addWidget(self.sim_raw_label, 2, 0)
-        sim_layout.addWidget(self.sim_net_label, 2, 1)
-        sim_layout.addWidget(self.sim_loser_raw_label, 3, 0)
-        sim_layout.addWidget(self.sim_loser_net_label, 3, 1)
-        sim_layout.addWidget(self.sim_reason_label, 4, 0)
-        sim_layout.addWidget(self.sim_ws_age_label, 4, 1)
-        sim_layout.addWidget(self.sim_condition_label, 2, 2)
+        sim_layout.addWidget(self.sim_reason_label, 1, 2)
+        sim_layout.addWidget(self.sim_tick_label, 2, 0)
+        sim_layout.addWidget(self.sim_impulse_label, 2, 1)
+        sim_layout.addWidget(self.sim_spread_label, 2, 2)
+        sim_layout.addWidget(self.sim_ws_age_label, 3, 0)
+        sim_layout.addWidget(self.sim_source_label, 3, 1)
 
         layout.addWidget(self.state_panel)
         layout.addWidget(self.bps_panel)
@@ -594,7 +599,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Защита", "Нет доступа для старта авто-торговли.")
             return
         self.run_mode = True
-        self.strategy_params.max_cycles = self.max_cycles_spin.value()
+        self.strategy_params.max_cycles = self.parameters_tab.max_cycles_spin.value()
         self.request_set_strategy.emit(self.strategy_params.__dict__)
         self.strategy_store.save_strategy_params(
             self.strategy_params, self.symbol_combo.currentText()
@@ -669,8 +674,11 @@ class MainWindow(QMainWindow):
         self.strategy_params.burst_volume_threshold = (
             self.parameters_tab.burst_volume_spin.value()
         )
+        self.strategy_params.allow_no_winner_flatten = (
+            self.parameters_tab.allow_no_winner_checkbox.isChecked()
+        )
         self.strategy_params.auto_loop = self.parameters_tab.auto_loop_checkbox.isChecked()
-        self.strategy_params.max_cycles = self.max_cycles_spin.value()
+        self.strategy_params.max_cycles = self.parameters_tab.max_cycles_spin.value()
         self.strategy_store.save_strategy_params(
             self.strategy_params, self.symbol_combo.currentText()
         )
@@ -716,14 +724,16 @@ class MainWindow(QMainWindow):
         )
         self.parameters_tab.emergency_stop_spin.setValue(self.strategy_params.emergency_stop_bps)
         self.parameters_tab.cooldown_spin.setValue(self.strategy_params.cooldown_s)
-        self.parameters_tab.direction_window_combo.setCurrentText(
-            str(self.strategy_params.detect_window_ticks)
-        )
+        detect_ticks = max(5, self.strategy_params.detect_window_ticks)
+        self.parameters_tab.direction_window_combo.setCurrentText(str(detect_ticks))
         self.parameters_tab.burst_volume_spin.setValue(
             self.strategy_params.burst_volume_threshold
         )
+        self.parameters_tab.allow_no_winner_checkbox.setChecked(
+            self.strategy_params.allow_no_winner_flatten
+        )
         self.parameters_tab.auto_loop_checkbox.setChecked(self.strategy_params.auto_loop)
-        self.max_cycles_spin.setValue(self.strategy_params.max_cycles)
+        self.parameters_tab.max_cycles_spin.setValue(self.strategy_params.max_cycles)
 
     def on_price_update(self, payload: dict) -> None:
         self.market_tick.bid = payload["bid"]
@@ -837,37 +847,41 @@ class MainWindow(QMainWindow):
         self.state_machine.active_cycle = bool(payload.get("active_cycle"))
         self.state_machine.cycle_id = int(payload.get("cycle_id", 0))
         self.cycle_start_time = payload.get("start_time")
-        entry_mid = payload.get("entry_mid")
-        entry_long = payload.get("entry_price_long")
-        entry_short = payload.get("entry_price_short")
-        if entry_mid:
-            self.sim_entry_price = float(entry_mid)
-        elif entry_long and entry_short:
-            self.sim_entry_price = (entry_long + entry_short) / 2
-        else:
-            self.sim_entry_price = entry_long or entry_short
-        self.sim_exit_price = None
-        self.sim_condition = f"{payload.get('winner_side')} / {payload.get('loser_side')}"
+        telemetry = payload.get("telemetry") or {}
+        entry_mid = telemetry.get("entry_mid")
+        self.sim_entry_price = float(entry_mid) if entry_mid else None
+        self.sim_exit_price = telemetry.get("exit_mid")
+        winner_side = telemetry.get("winner_side") or "—"
+        loser_side = telemetry.get("loser_side") or "—"
+        self.sim_condition = f"{winner_side} / {loser_side}"
         if self.state_machine.state == BotState.ENTERING:
-            self.sim_raw_bps = None
-            self.sim_net_bps = None
+            self.sim_total_raw_bps = None
+            self.sim_total_net_bps = None
             self.sim_winner_raw_bps = None
             self.sim_winner_net_bps = None
             self.sim_loser_raw_bps = None
             self.sim_loser_net_bps = None
             self.sim_reason = None
             self.sim_ws_age_ms = None
+            self.sim_tick_rate = None
+            self.sim_impulse_bps = None
+            self.sim_spread_bps = None
         if self.state_machine.state == BotState.COOLDOWN:
             self.cooldown_timer.start(self.strategy_params.cooldown_s * 1000)
-        self.sim_winner_raw_bps = payload.get("winner_raw_bps")
-        self.sim_winner_net_bps = payload.get("winner_net_bps")
-        self.sim_loser_raw_bps = payload.get("loser_raw_bps")
-        self.sim_loser_net_bps = payload.get("loser_net_bps")
-        self.sim_reason = payload.get("reason")
-        self.sim_ws_age_ms = payload.get("ws_age_ms")
-        self.ws_age_ms = payload.get("ws_age_ms")
-        self.http_age_ms = payload.get("http_age_ms")
-        self.effective_source = payload.get("effective_source") or "NONE"
+        self.sim_total_raw_bps = telemetry.get("total_raw_bps")
+        self.sim_total_net_bps = telemetry.get("total_net_bps")
+        self.sim_winner_raw_bps = telemetry.get("winner_raw_bps")
+        self.sim_winner_net_bps = telemetry.get("winner_net_bps")
+        self.sim_loser_raw_bps = telemetry.get("loser_raw_bps")
+        self.sim_loser_net_bps = telemetry.get("loser_net_bps")
+        self.sim_reason = telemetry.get("reason")
+        self.sim_ws_age_ms = telemetry.get("ws_age_ms")
+        self.sim_tick_rate = telemetry.get("tick_rate")
+        self.sim_impulse_bps = telemetry.get("impulse_bps")
+        self.sim_spread_bps = telemetry.get("spread_bps")
+        self.ws_age_ms = telemetry.get("ws_age_ms")
+        self.http_age_ms = None
+        self.effective_source = telemetry.get("effective_source") or "NONE"
         self.effective_age_ms = payload.get("effective_age_ms")
         self.data_stale = bool(payload.get("data_stale", True))
         self.waiting_for_data = bool(payload.get("waiting_for_data", False))
@@ -877,8 +891,8 @@ class MainWindow(QMainWindow):
 
     def on_trade_row(self, payload: dict) -> None:
         if payload.get("phase") == "cycle_summary":
-            self.sim_raw_bps = payload.get("raw_bps")
-            self.sim_net_bps = payload.get("net_bps")
+            self.sim_total_raw_bps = payload.get("raw_bps")
+            self.sim_total_net_bps = payload.get("net_bps")
             self.sim_exit_price = payload.get("exit_price")
         self.add_trade_row(payload)
 
@@ -975,8 +989,18 @@ class MainWindow(QMainWindow):
         exit_mark = "—" if not self.sim_exit_price else f"{self.sim_exit_price:,.2f}"
         self.sim_entry_label.setText(f"вход_mid: {entry}")
         self.sim_exit_label.setText(f"выход_mid: {exit_mark}")
-        raw = "—" if self.sim_winner_raw_bps is None else f"{self.sim_winner_raw_bps:.2f}"
-        net = "—" if self.sim_winner_net_bps is None else f"{self.sim_winner_net_bps:.2f}"
+        total_raw = (
+            "—" if self.sim_total_raw_bps is None else f"{self.sim_total_raw_bps:.2f}"
+        )
+        total_net = (
+            "—" if self.sim_total_net_bps is None else f"{self.sim_total_net_bps:.2f}"
+        )
+        winner_raw = (
+            "—" if self.sim_winner_raw_bps is None else f"{self.sim_winner_raw_bps:.2f}"
+        )
+        winner_net = (
+            "—" if self.sim_winner_net_bps is None else f"{self.sim_winner_net_bps:.2f}"
+        )
         loser_raw = (
             "—" if self.sim_loser_raw_bps is None else f"{self.sim_loser_raw_bps:.2f}"
         )
@@ -985,13 +1009,24 @@ class MainWindow(QMainWindow):
         )
         reason = self.sim_reason or "—"
         ws_age = "—" if self.sim_ws_age_ms is None else f"{self.sim_ws_age_ms:.0f}"
-        self.sim_raw_label.setText(f"raw_bps победителя: {raw}")
-        self.sim_net_label.setText(f"net_bps победителя: {net}")
-        self.sim_loser_raw_label.setText(f"raw_bps лузера: {loser_raw}")
-        self.sim_loser_net_label.setText(f"net_bps лузера: {loser_net}")
         self.sim_reason_label.setText(f"reason: {reason}")
         self.sim_ws_age_label.setText(f"ws_age_ms: {ws_age}")
+        self.sim_source_label.setText(f"source: {self.effective_source}")
+        tick_rate = "—" if self.sim_tick_rate is None else f"{self.sim_tick_rate:.0f}"
+        impulse = "—" if self.sim_impulse_bps is None else f"{self.sim_impulse_bps:.4f}"
+        spread = "—" if self.sim_spread_bps is None else f"{self.sim_spread_bps:.2f}"
+        self.sim_tick_label.setText(f"tick_rate: {tick_rate}")
+        self.sim_impulse_label.setText(f"impulse_bps: {impulse}")
+        self.sim_spread_label.setText(f"spread_bps: {spread}")
         self.sim_condition_label.setText(f"условие: {winner}")
+        total_raw_label = "—" if total_raw == "—" else total_raw
+        total_net_label = "—" if total_net == "—" else total_net
+        self.raw_bps_label.setText(f"raw_bps всего: {total_raw_label}")
+        self.net_bps_label.setText(f"net_bps всего: {total_net_label}")
+        self.winner_raw_label.setText(f"raw_bps победителя: {winner_raw}")
+        self.winner_net_label.setText(f"net_bps победителя: {winner_net}")
+        self.loser_raw_label.setText(f"raw_bps лузера: {loser_raw}")
+        self.loser_net_label.setText(f"net_bps лузера: {loser_net}")
 
     def _update_state_labels(self) -> None:
         mode = "RUNNING" if self.run_mode else "IDLE"
@@ -1048,6 +1083,7 @@ class MainWindow(QMainWindow):
                 BotState.CUTTING,
                 BotState.RIDING,
                 BotState.EXITING,
+                BotState.CONTROLLED_FLATTEN,
                 BotState.COOLDOWN,
             }
         )
@@ -1216,8 +1252,8 @@ class MainWindow(QMainWindow):
         self.sim_entry_price = None
         self.sim_entry_qty = None
         self.sim_exit_price = None
-        self.sim_raw_bps = None
-        self.sim_net_bps = None
+        self.sim_total_raw_bps = None
+        self.sim_total_net_bps = None
 
     def _load_strategy_params(self) -> None:
         params, symbol = self.strategy_store.load_strategy_params()

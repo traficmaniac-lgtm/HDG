@@ -12,6 +12,7 @@ class BotState(str, Enum):
     CUTTING = "CUTTING"
     RIDING = "RIDING"
     EXITING = "EXITING"
+    CONTROLLED_FLATTEN = "CONTROLLED_FLATTEN"
     COOLDOWN = "COOLDOWN"
     ERROR = "ERROR"
 
@@ -50,6 +51,7 @@ class BotStateMachine:
             BotState.CUTTING,
             BotState.RIDING,
             BotState.EXITING,
+            BotState.CONTROLLED_FLATTEN,
             BotState.COOLDOWN,
         }:
             self.state = BotState.IDLE
@@ -62,6 +64,7 @@ class BotStateMachine:
             BotState.CUTTING,
             BotState.RIDING,
             BotState.EXITING,
+            BotState.CONTROLLED_FLATTEN,
             BotState.ERROR,
         }:
             self.state = BotState.COOLDOWN

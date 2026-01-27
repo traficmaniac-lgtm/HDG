@@ -4,13 +4,14 @@ import sys
 import threading
 import time
 import traceback
+from dataclasses import asdict
 from datetime import datetime, timezone
 from typing import Optional
 
 from PySide6.QtCore import QObject, Signal, Slot
 
 from src.core.models import MarketDataMode, StrategyParams, SymbolFilters
-from src.core.state_machine import BotStateMachine
+from src.core.state_machine import BotState, BotStateMachine
 from src.engine.directional_cycle import DirectionalCycle
 from src.exchange.binance_margin import BinanceMarginExecution
 from src.services.binance_rest import BinanceRestClient
@@ -64,6 +65,10 @@ class TradeEngine(QObject):
         self._stop_requested = False
         self._cycles_done = 0
         self._max_cycles = self._strategy.max_cycles
+        self._last_cycle_telemetry: Optional[dict] = None
+        self._last_cycle_emit_ts = 0.0
+        self._last_cycle_emit_state = self._state_machine.state
+        self._last_active_cycle = False
         self._heartbeat_lock = threading.Lock()
         self._ui_heartbeat = time.monotonic()
         self._watchdog_thread = threading.Thread(
@@ -103,6 +108,8 @@ class TradeEngine(QObject):
         self._margin_exec = BinanceMarginExecution(self._rest_client)
         self._trade_gate = None
         self._not_authorized_abort_done = False
+        self._last_cycle_telemetry = None
+        self._last_active_cycle = False
         self._cycle = DirectionalCycle(
             execution=self._margin_exec,
             state_machine=self._state_machine,
@@ -273,34 +280,42 @@ class TradeEngine(QObject):
         self._cycle.end_cooldown(auto_resume)
         self._emit_cycle_state()
 
-    def _emit_cycle_state(self) -> None:
+    def _emit_cycle_state(self, force: bool = False) -> None:
+        state = self._state_machine.state
+        active_cycle = self._state_machine.active_cycle
+        now = time.monotonic()
+        state_changed = state != self._last_cycle_emit_state
+        if not force:
+            if state in {BotState.DETECTING, BotState.RIDING} and not state_changed:
+                if now - self._last_cycle_emit_ts < 0.25:
+                    return
+            elif not state_changed and now - self._last_cycle_emit_ts < 0.1:
+                return
+        telemetry = self._cycle.build_telemetry(state, active_cycle, self._state_machine.last_error)
+        telemetry_dict = asdict(telemetry)
+        if not active_cycle and self._last_active_cycle:
+            self._last_cycle_telemetry = telemetry_dict
+        if not active_cycle and self._last_cycle_telemetry:
+            display_telemetry = self._last_cycle_telemetry
+        else:
+            display_telemetry = telemetry_dict
         snapshot = self._cycle.snapshot
         self.cycle_update.emit(
             {
-                "state": self._state_machine.state.value,
-                "active_cycle": self._state_machine.active_cycle,
+                "state": state.value,
+                "active_cycle": active_cycle,
                 "cycle_id": self._state_machine.cycle_id,
                 "start_time": self._cycle.cycle_start,
-                "entry_mid": snapshot.entry_mid,
-                "detect_mid": snapshot.detect_mid,
-                "exit_mid": snapshot.exit_mid,
-                "entry_price_long": snapshot.entry_long_price,
-                "entry_price_short": snapshot.entry_short_price,
-                "winner_side": snapshot.winner_side or "—",
-                "loser_side": snapshot.loser_side or "—",
-                "winner_raw_bps": snapshot.winner_raw_bps,
-                "winner_net_bps": snapshot.winner_net_bps,
-                "loser_raw_bps": snapshot.loser_raw_bps,
-                "loser_net_bps": snapshot.loser_net_bps,
-                "reason": snapshot.reason,
-                "ws_age_ms": snapshot.ws_age_ms,
-                "http_age_ms": snapshot.http_age_ms,
-                "effective_source": snapshot.effective_source,
-                "effective_age_ms": snapshot.effective_age_ms,
+                "telemetry": display_telemetry,
+                "last_cycle": self._last_cycle_telemetry,
                 "data_stale": snapshot.data_stale,
                 "waiting_for_data": snapshot.waiting_for_data,
+                "effective_age_ms": snapshot.effective_age_ms,
             }
         )
+        self._last_cycle_emit_ts = now
+        self._last_cycle_emit_state = state
+        self._last_active_cycle = active_cycle
 
     def _emit_exposure_status(self, exposure_open: bool) -> None:
         exposure = exposure_open or self._margin_btc_free > 0 or self._margin_btc_borrowed > 0

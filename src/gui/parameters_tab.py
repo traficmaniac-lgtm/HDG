@@ -71,7 +71,7 @@ class ParametersTab(QWidget):
 
         self.winner_threshold_spin = QDoubleSpinBox()
         self.winner_threshold_spin.setRange(0.0, 50.0)
-        self.winner_threshold_spin.setDecimals(1)
+        self.winner_threshold_spin.setDecimals(2)
         self.winner_threshold_spin.setSingleStep(0.1)
 
         self.emergency_stop_spin = QSpinBox()
@@ -81,7 +81,12 @@ class ParametersTab(QWidget):
         self.cooldown_spin.setRange(0, 60)
 
         self.direction_window_combo = QComboBox()
-        self.direction_window_combo.addItems([str(value) for value in range(1, 21)])
+        self.direction_window_combo.addItems([str(value) for value in range(5, 21)])
+
+        self.max_cycles_spin = QSpinBox()
+        self.max_cycles_spin.setRange(0, 1000)
+
+        self.allow_no_winner_checkbox = QCheckBox("Разрешить выход без победителя")
 
         self.burst_volume_spin = QDoubleSpinBox()
         self.burst_volume_spin.setRange(0.0, 1_000_000.0)
@@ -99,6 +104,7 @@ class ParametersTab(QWidget):
         form.addRow("Макс. спред (bps)", self.max_spread_spin)
         form.addRow("Мин. тик-рейт (в сек)", self.min_tick_rate_spin)
         form.addRow("Таймаут детекта (мс)", self.detect_timeout_spin)
+        form.addRow("Max cycles", self.max_cycles_spin)
         form.addRow("", self.use_impulse_checkbox)
         form.addRow("Импульс min (bps)", self.impulse_min_spin)
         form.addRow("Импульс grace (мс)", self.impulse_grace_spin)
@@ -107,6 +113,7 @@ class ParametersTab(QWidget):
         form.addRow("Cooldown (сек)", self.cooldown_spin)
         form.addRow("Окно детекта (тик)", self.direction_window_combo)
         form.addRow("Фильтр объема", self.burst_volume_spin)
+        form.addRow("", self.allow_no_winner_checkbox)
         form.addRow("", self.auto_loop_checkbox)
 
         layout.addLayout(form)

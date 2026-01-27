@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Callable, Deque, Optional
 
-from src.core.models import MarketDataMode, StrategyParams, SymbolFilters
+from src.core.models import CycleTelemetry, MarketDataMode, StrategyParams, SymbolFilters
 from src.core.state_machine import BotState, BotStateMachine
 from src.exchange.binance_margin import BinanceMarginExecution
 from src.services.market_data import MarketDataService
@@ -62,15 +62,15 @@ class DirectionalCycle:
 
         self._market_data = market_data
         self._last_tick: Optional[dict[str, Any]] = None
-        self._tick_history: Deque[tuple[float, float]] = deque(maxlen=500)
+        self._detect_mid_buffer: Deque[Decimal] = deque(maxlen=5)
+        self._detect_window_ticks = max(5, int(self._strategy.detect_window_ticks))
         self._cycle_start: Optional[datetime] = None
-        self._entry_mid: Optional[float] = None
+        self._entry_mid: Optional[Decimal] = None
         self._entry_qty: Optional[float] = None
-        self._entry_tick_count = 0
         self._detect_start_ts: Optional[float] = None
         self._winner_side: Optional[str] = None
         self._loser_side: Optional[str] = None
-        self._detect_mid: Optional[float] = None
+        self._detect_mid: Optional[Decimal] = None
         self._loser_exit_price: Optional[float] = None
         self._winner_exit_price: Optional[float] = None
         self._entry_long_price: Optional[float] = None
@@ -100,7 +100,8 @@ class DirectionalCycle:
         self._last_impulse_degrade_log_ts = 0.0
         self._last_tick_rate_block_log_ts = 0.0
         self._last_tickrate_force_log_ts = 0.0
-        self._market_data.set_detect_window_ticks(self._strategy.detect_window_ticks)
+        self._last_detect_sample_log_ts = 0.0
+        self._market_data.set_detect_window_ticks(self._detect_window_ticks)
 
     @property
     def cycle_start(self) -> Optional[datetime]:
@@ -109,8 +110,8 @@ class DirectionalCycle:
     @property
     def snapshot(self) -> CycleSnapshot:
         return CycleSnapshot(
-            entry_mid=self._entry_mid,
-            detect_mid=self._detect_mid,
+            entry_mid=self._float_from_decimal(self._entry_mid),
+            detect_mid=self._float_from_decimal(self._detect_mid),
             exit_mid=self._winner_exit_price,
             entry_long_price=self._entry_long_price,
             entry_short_price=self._entry_short_price,
@@ -129,13 +130,83 @@ class DirectionalCycle:
             waiting_for_data=self._waiting_for_data,
         )
 
+    def build_telemetry(
+        self, state: BotState, active_cycle: bool, last_error: Optional[str]
+    ) -> CycleTelemetry:
+        metrics = self._compute_entry_metrics()
+        now = datetime.now(timezone.utc)
+        duration_s = None
+        if self._cycle_start:
+            duration_s = (now - self._cycle_start).total_seconds()
+        winner_raw = self._winner_raw_bps
+        loser_raw = self._loser_raw_bps
+        winner_net = self._winner_net_bps
+        loser_net = self._loser_net_bps
+        total_raw = None
+        total_net = None
+        if winner_raw is not None and loser_raw is not None:
+            total_raw = winner_raw + loser_raw
+        if winner_net is not None and loser_net is not None:
+            total_net = winner_net + loser_net
+        return CycleTelemetry(
+            cycle_id=self._state_machine.cycle_id,
+            state=state.value,
+            active_cycle=active_cycle,
+            started_at=self._cycle_start,
+            duration_s=duration_s,
+            nominal_usd=self._strategy.usd_notional,
+            fee_total_bps=self._strategy.fee_total_bps,
+            target_net_bps=self._strategy.target_net_bps,
+            max_loss_bps=self._strategy.max_loss_bps,
+            max_spread_bps=self._strategy.max_spread_bps,
+            min_tick_rate=self._strategy.min_tick_rate,
+            cooldown_s=self._strategy.cooldown_s,
+            tick_rate=metrics["tick_rate"],
+            impulse_bps=metrics["impulse_bps"],
+            spread_bps=metrics["spread_bps"],
+            ws_age_ms=metrics["ws_age_ms"],
+            effective_source=str(metrics["effective_source"]),
+            entry_mid=self._float_from_decimal(self._entry_mid),
+            exit_mid=self._winner_exit_price or self._loser_exit_price,
+            winner_side=self._winner_side,
+            loser_side=self._loser_side,
+            winner_raw_bps=winner_raw,
+            loser_raw_bps=loser_raw,
+            winner_net_bps=winner_net,
+            loser_net_bps=loser_net,
+            total_raw_bps=total_raw,
+            total_net_bps=total_net,
+            condition=self._condition_from_state(state),
+            reason=self._last_reason,
+            last_error=last_error,
+        )
+
+    def _condition_from_state(self, state: BotState) -> str:
+        return {
+            BotState.ENTERING: "ENTER",
+            BotState.DETECTING: "DETECT_WAIT",
+            BotState.CUTTING: "CUT_LOSER",
+            BotState.RIDING: "RIDE_TARGET",
+            BotState.EXITING: "EXIT",
+            BotState.CONTROLLED_FLATTEN: "FLATTEN",
+            BotState.COOLDOWN: "COOLDOWN",
+            BotState.ERROR: "ERROR",
+            BotState.ARMED: "ARMED",
+            BotState.IDLE: "IDLE",
+        }.get(state, state.value)
+
     @property
     def exposure_open(self) -> bool:
         return self._exposure_open
 
     def update_strategy(self, strategy: StrategyParams) -> None:
         self._strategy = strategy
-        self._market_data.set_detect_window_ticks(self._strategy.detect_window_ticks)
+        self._detect_window_ticks = max(5, int(self._strategy.detect_window_ticks))
+        self._market_data.set_detect_window_ticks(self._detect_window_ticks)
+        self._detect_mid_buffer = deque(
+            list(self._detect_mid_buffer)[-self._detect_window_ticks :],
+            maxlen=self._detect_window_ticks,
+        )
 
     def update_filters(self, symbol_filters: SymbolFilters) -> None:
         self._filters = symbol_filters
@@ -147,12 +218,6 @@ class DirectionalCycle:
         self._market_data.set_ws_connected(status == "CONNECTED")
 
     def update_tick(self, payload: dict[str, Any]) -> None:
-        source = str(payload.get("source", "WS"))
-        if source == "WS":
-            now = time.monotonic()
-            mid = float(payload.get("mid", 0.0))
-            if mid > 0:
-                self._tick_history.append((now, mid))
         self._last_tick = self._market_data.get_last_effective_tick()
         snapshot = self._market_data.get_snapshot()
         self._ws_age_ms = snapshot.ws_age_ms
@@ -240,10 +305,9 @@ class DirectionalCycle:
     def _start_cycle(self) -> None:
         if not self._state_machine.start_cycle():
             return
-        tick = self._market_data.get_last_ws_tick() or self._last_tick or {}
         self._cycle_start = datetime.now(timezone.utc)
         self._waiting_for_data = False
-        self._entry_mid = float(tick.get("mid", 0.0))
+        self._entry_mid = None
         self._entry_qty = None
         self._detect_start_ts = None
         self._winner_side = None
@@ -257,9 +321,10 @@ class DirectionalCycle:
         self._winner_net_bps = None
         self._loser_raw_bps = None
         self._loser_net_bps = None
-        self._entry_tick_count = len(self._tick_history)
         self._last_reason = None
         self._last_net_usd = None
+        self._last_detect_sample_log_ts = 0.0
+        self._reset_detect_buffer()
         self._emit_log(
             "CYCLE",
             "INFO",
@@ -274,6 +339,15 @@ class DirectionalCycle:
             return
         self._state_machine.state = BotState.DETECTING
         self._detect_start_ts = time.monotonic()
+        self._reset_detect_buffer()
+        self._emit_log(
+            "INFO",
+            "INFO",
+            "[DETECT] start",
+            entry_mid=self._format_decimal(self._entry_mid),
+            thr=self._strategy.winner_threshold_bps,
+            win_ticks=self._detect_window_ticks,
+        )
         self._emit_log("STATE", "INFO", "DETECT_START", cycle_id=self._state_machine.cycle_id)
 
     def _enter_hedge(self) -> bool:
@@ -319,7 +393,7 @@ class DirectionalCycle:
                 side_effect_type="AUTO_BORROW_REPAY",
             )
             if not sell_order:
-                self._log_partial("partial_hedge_entry", qty)
+                self._log_partial("partial_hedge_entry", qty, None, sell_order)
                 return False
             buy_order = self._place_order("BUY", qty, buy_mode, price=buy_price)
         except Exception as exc:
@@ -343,7 +417,7 @@ class DirectionalCycle:
             type=self._strategy.order_mode,
         )
         if not buy_order or not sell_order:
-            self._log_partial("partial_hedge_entry", qty)
+            self._log_partial("partial_hedge_entry", qty, buy_order, sell_order)
             return False
         buy_fill = self._wait_for_fill_with_fallback("BUY", buy_id, qty, buy_mode, buy_price)
         sell_fill = self._wait_for_fill_with_fallback(
@@ -355,10 +429,16 @@ class DirectionalCycle:
             side_effect_type="AUTO_BORROW_REPAY",
         )
         if not buy_fill or not sell_fill:
-            self._log_partial("partial_hedge_entry", qty)
+            buy_status = self._execution.get_order(int(buy_id)) if buy_id else None
+            sell_status = self._execution.get_order(int(sell_id)) if sell_id else None
+            self._log_partial("partial_hedge_entry", qty, buy_status, sell_status)
             return False
         self._entry_long_price = buy_fill[0]
         self._entry_short_price = sell_fill[0]
+        effective_mid = self._get_effective_mid_decimal()
+        if effective_mid is None:
+            effective_mid = Decimal(str((self._entry_long_price + self._entry_short_price) / 2))
+        self._entry_mid = effective_mid
         self._log_deal(buy_fill[2], "ENTER_LONG")
         self._log_deal(sell_fill[2], "ENTER_SHORT")
         self._exposure_open = True
@@ -379,20 +459,38 @@ class DirectionalCycle:
             return
         elapsed = (time.monotonic() - self._detect_start_ts) * 1000
         if elapsed > self._strategy.detect_timeout_ms:
-            self._no_winner_exit("timeout")
+            self._handle_detect_timeout()
             return
-        ticks_seen = len(self._tick_history) - self._entry_tick_count
-        if ticks_seen < self._strategy.detect_window_ticks:
+        tick = self._market_data.get_last_effective_tick() or {}
+        mid_now = self._mid_from_tick_decimal(tick)
+        if mid_now is None:
             return
-        tick = self._last_tick or {}
-        mid_now = float(tick.get("mid", 0.0))
-        if mid_now <= 0:
-            return
-        long_raw = (mid_now - self._entry_mid) / self._entry_mid * 10_000
-        short_raw = (self._entry_mid - mid_now) / self._entry_mid * 10_000
+        self._append_detect_mid(mid_now)
+        long_raw = self._calc_raw_bps("LONG", self._entry_mid, mid_now)
+        short_raw = self._calc_raw_bps("SHORT", self._entry_mid, mid_now)
         winner_threshold = self._strategy.winner_threshold_bps
-        if max(long_raw, short_raw) < winner_threshold:
-            return
+        best = max(long_raw, short_raw)
+        delta_mid_bps = None
+        if len(self._detect_mid_buffer) >= self._detect_window_ticks:
+            mid_first = self._detect_mid_buffer[0]
+            mid_last = self._detect_mid_buffer[-1]
+            if mid_first > 0:
+                delta_mid_bps = float((mid_last - mid_first) / mid_first * Decimal("10000"))
+        now = time.monotonic()
+        if now - self._last_detect_sample_log_ts > 0.3:
+            self._emit_log(
+                "INFO",
+                "INFO",
+                "[DETECT] sample",
+                mid=self._format_decimal(mid_now),
+                long_raw=f"{long_raw:.4f}",
+                short_raw=f"{short_raw:.4f}",
+                delta_window_bps=f"{delta_mid_bps:.4f}" if delta_mid_bps is not None else None,
+            )
+            self._last_detect_sample_log_ts = now
+        if best < winner_threshold:
+            if delta_mid_bps is None or abs(delta_mid_bps) < winner_threshold / 2:
+                return
         if long_raw >= short_raw:
             self._winner_side = "LONG"
             self._loser_side = "SHORT"
@@ -400,7 +498,7 @@ class DirectionalCycle:
             self._winner_side = "SHORT"
             self._loser_side = "LONG"
         self._detect_mid = mid_now
-        self._winner_raw_bps = max(long_raw, short_raw)
+        self._winner_raw_bps = best
         self._winner_net_bps = self._winner_raw_bps - self._strategy.fee_total_bps
         self._emit_log(
             "TRADE",
@@ -408,7 +506,14 @@ class DirectionalCycle:
             "DETECT winner",
             winner=self._winner_side,
             loser=self._loser_side,
-            detect_mid=f"{mid_now:.2f}",
+            detect_mid=self._format_decimal(mid_now),
+        )
+        self._emit_log(
+            "INFO",
+            "INFO",
+            "[DETECT] winner",
+            side=self._winner_side,
+            best_bps=f"{best:.4f}",
         )
         self._emit_log(
             "STATE",
@@ -452,7 +557,7 @@ class DirectionalCycle:
             return
         self._loser_exit_price = fill[0]
         self._loser_raw_bps = self._calc_raw_bps(
-            self._loser_side, self._entry_mid or 0.0, self._loser_exit_price
+            self._loser_side, self._entry_mid or Decimal("0"), self._loser_exit_price
         )
         self._loser_net_bps = (
             self._loser_raw_bps - self._strategy.fee_total_bps
@@ -477,8 +582,10 @@ class DirectionalCycle:
         if not self._last_tick or not self._entry_mid or not self._winner_side:
             return
         effective_age_ms = self._market_data.get_snapshot().effective_age_ms
-        tick = self._last_tick
-        mid_now = float(tick.get("mid", 0.0))
+        tick = self._market_data.get_last_effective_tick() or self._last_tick
+        mid_now = self._mid_from_tick_decimal(tick or {})
+        if mid_now is None:
+            return
         winner_raw_bps = self._calc_raw_bps(self._winner_side, self._entry_mid, mid_now)
         winner_net_bps = winner_raw_bps - self._strategy.fee_total_bps
         self._winner_raw_bps = winner_raw_bps
@@ -547,7 +654,7 @@ class DirectionalCycle:
             return
         self._winner_exit_price = fill[0]
         self._winner_raw_bps = self._calc_raw_bps(
-            self._winner_side, self._entry_mid or 0.0, self._winner_exit_price
+            self._winner_side, self._entry_mid or Decimal("0"), self._winner_exit_price
         )
         self._winner_net_bps = (
             self._winner_raw_bps - self._strategy.fee_total_bps
@@ -572,22 +679,41 @@ class DirectionalCycle:
         self._emit_log("STATE", "INFO", "CYCLE_DONE", cycle_id=self._state_machine.cycle_id)
         self._log_cycle_end("OK", reason=note)
 
-    def _no_winner_exit(self, reason: str) -> None:
+    def _no_winner_exit(self, reason: str, allow_flatten: bool) -> None:
         self._emit_log("TRADE", "INFO", "DETECT no winner", reason=reason)
         self._emit_log("STATE", "INFO", "DETECT_NO_WINNER", cycle_id=self._state_machine.cycle_id)
-        self._emergency_flatten(reason=reason)
+        if allow_flatten:
+            self._emit_log("INFO", "INFO", "[DETECT] timeout -> controlled_flatten")
+            success = self._controlled_flatten(reason=reason)
+            result = "NO_WINNER_ALLOWED" if success else "ERROR"
+        else:
+            self._emergency_flatten(reason=reason)
+            result = "NO_WINNER"
         self._last_reason = reason
-        self._state_machine.finish_cycle()
-        self._emit_log("STATE", "INFO", "CYCLE_DONE", cycle_id=self._state_machine.cycle_id)
-        self._log_cycle_end("NO_WINNER", reason=reason)
+        if self._state_machine.state != BotState.ERROR:
+            self._state_machine.finish_cycle()
+            self._emit_log("STATE", "INFO", "CYCLE_DONE", cycle_id=self._state_machine.cycle_id)
+        self._log_cycle_end(result, reason=reason)
 
-    def _log_partial(self, reason: str, qty: float) -> None:
+    def _log_partial(
+        self,
+        reason: str,
+        qty: float,
+        buy_order: Optional[dict[str, Any]],
+        sell_order: Optional[dict[str, Any]],
+    ) -> None:
         self._emit_log(
             "ERROR",
             "ERROR",
-            "Partial hedge on entry",
+            "[ENTER] partial hedge -> emergency",
             reason=reason,
             qty=qty,
+            buy_status=buy_order.get("status") if buy_order else None,
+            buy_exec=buy_order.get("executedQty") if buy_order else None,
+            buy_order_id=buy_order.get("orderId") if buy_order else None,
+            sell_status=sell_order.get("status") if sell_order else None,
+            sell_exec=sell_order.get("executedQty") if sell_order else None,
+            sell_order_id=sell_order.get("orderId") if sell_order else None,
             error=self._execution.last_error,
             error_code=self._execution.last_error_code,
         )
@@ -595,7 +721,7 @@ class DirectionalCycle:
         self._emergency_flatten(reason=reason)
         self._state_machine.set_error(reason)
         self._state_machine.finish_cycle()
-        self._log_cycle_end("ERROR", reason=reason)
+        self._log_cycle_end("ENTER_FAILED", reason=reason)
 
     def _log_deal(self, order: dict[str, Any], tag: str) -> None:
         if not order:
@@ -627,6 +753,7 @@ class DirectionalCycle:
         net_total = winner_net + loser_net
         net_usd = (self._strategy.usd_notional / 10_000) * net_total
         self._last_net_usd = net_usd
+        entry_mid = float(self._entry_mid)
         self._emit_trade_row(
             {
                 "ts": now,
@@ -634,7 +761,7 @@ class DirectionalCycle:
                 "phase": "cycle_summary",
                 "side": f"{winner_side}/{loser_side}",
                 "qty": self._entry_qty,
-                "entry_price": self._entry_mid,
+                "entry_price": entry_mid,
                 "exit_price": winner_exit or loser_exit,
                 "raw_bps": winner_raw + loser_raw,
                 "net_bps": net_total,
@@ -673,6 +800,7 @@ class DirectionalCycle:
             reason=reason or self._last_reason,
             duration_ms=duration_ms,
         )
+        self._reset_detect_buffer()
 
     def _entry_filter_reason(self) -> Optional[str]:
         metrics = self._compute_entry_metrics()
@@ -801,6 +929,51 @@ class DirectionalCycle:
             "ws_connected": ws_connected,
         }
 
+    def _to_decimal(self, value: Decimal | float | int) -> Decimal:
+        if isinstance(value, Decimal):
+            return value
+        return Decimal(str(value))
+
+    def _float_from_decimal(self, value: Optional[Decimal]) -> Optional[float]:
+        if value is None:
+            return None
+        return float(value)
+
+    def _format_decimal(self, value: Optional[Decimal], precision: int = 2) -> Optional[str]:
+        if value is None:
+            return None
+        return f"{float(value):.{precision}f}"
+
+    def _mid_from_tick_decimal(self, tick: dict[str, Any]) -> Optional[Decimal]:
+        bid_raw = tick.get("bid_raw")
+        ask_raw = tick.get("ask_raw")
+        if bid_raw is not None and ask_raw is not None:
+            bid = self._to_decimal(bid_raw)
+            ask = self._to_decimal(ask_raw)
+        else:
+            bid = self._to_decimal(tick.get("bid", 0.0))
+            ask = self._to_decimal(tick.get("ask", 0.0))
+        if bid <= 0 or ask <= 0:
+            return None
+        return (bid + ask) / Decimal("2")
+
+    def _get_effective_mid_decimal(self) -> Optional[Decimal]:
+        tick = self._market_data.get_last_effective_tick() or {}
+        return self._mid_from_tick_decimal(tick)
+
+    def _reset_detect_buffer(self) -> None:
+        self._detect_mid_buffer = deque(maxlen=self._detect_window_ticks)
+
+    def _append_detect_mid(self, mid: Decimal) -> None:
+        if mid <= 0:
+            return
+        if not self._detect_mid_buffer or mid != self._detect_mid_buffer[-1]:
+            self._detect_mid_buffer.append(mid)
+
+    def _handle_detect_timeout(self) -> None:
+        allow_flatten = self._strategy.allow_no_winner_flatten and self._exposure_open
+        self._no_winner_exit("detect_timeout", allow_flatten=allow_flatten)
+
     def _round_step(self, qty: float) -> float:
         step = self._filters.step_size
         if step <= 0:
@@ -833,12 +1006,16 @@ class DirectionalCycle:
         self._on_not_authorized(context)
         return True
 
-    def _calc_raw_bps(self, side: str, from_mid: float, to_mid: float) -> float:
-        if from_mid <= 0 or to_mid <= 0:
+    def _calc_raw_bps(self, side: str, from_mid: Decimal | float, to_mid: Decimal | float) -> float:
+        from_value = self._to_decimal(from_mid)
+        to_value = self._to_decimal(to_mid)
+        if from_value <= 0 or to_value <= 0:
             return 0.0
         if side == "LONG":
-            return (to_mid - from_mid) / from_mid * 10_000
-        return (from_mid - to_mid) / from_mid * 10_000
+            return float((to_value - from_value) / from_value * Decimal("10000"))
+        if side == "SHORT":
+            return float((from_value - to_value) / from_value * Decimal("10000"))
+        return 0.0
 
     def _order_params(
         self, side: str, bid: Optional[float] = None, ask: Optional[float] = None
@@ -1012,6 +1189,118 @@ class DirectionalCycle:
             if usdt_borrowed > 0:
                 return True
         return False
+
+    def _controlled_flatten(self, reason: str) -> bool:
+        self._last_reason = reason
+        self._state_machine.state = BotState.CONTROLLED_FLATTEN
+        self._emit_log(
+            "STATE",
+            "INFO",
+            "CONTROLLED_FLATTEN_START",
+            cycle_id=self._state_machine.cycle_id,
+            reason=reason,
+        )
+        self._execution.cancel_open_orders()
+        if self._abort_if_not_authorized("controlled_cancel_orders"):
+            return False
+        snapshot = self._execution.get_margin_account() or {}
+        if self._abort_if_not_authorized("controlled_snapshot"):
+            return False
+        assets = snapshot.get("userAssets", [])
+        btc = next((item for item in assets if item.get("asset") == "BTC"), None)
+        usdt = next((item for item in assets if item.get("asset") == "USDT"), None)
+        btc_free = float(btc.get("free", 0.0)) if btc else 0.0
+        btc_borrowed = float(btc.get("borrowed", 0.0)) if btc else 0.0
+        btc_net = float(btc.get("netAsset", 0.0)) if btc else 0.0
+        usdt_free = float(usdt.get("free", 0.0)) if usdt else 0.0
+        usdt_borrowed = float(usdt.get("borrowed", 0.0)) if usdt else 0.0
+        mid = self._float_from_decimal(self._get_effective_mid_decimal()) or 0.0
+        step = self._filters.step_size or 0.0
+        if btc_net > step:
+            sell_qty = self._normalize_qty(btc_net)
+            if self._qty_ok(sell_qty, mid):
+                sell_order = self._execution.place_order(
+                    "SELL", sell_qty, "market", side_effect_type="NO_SIDE_EFFECT"
+                )
+                if self._abort_if_not_authorized("controlled_sell"):
+                    return False
+                if not sell_order:
+                    self._set_error("controlled_sell_failed")
+        if btc_net < -step:
+            buy_qty = self._normalize_qty(abs(btc_net))
+            if self._qty_ok(buy_qty, mid):
+                buy_order = self._execution.place_order(
+                    "BUY", buy_qty, "market", side_effect_type="AUTO_REPAY"
+                )
+                if self._abort_if_not_authorized("controlled_buy"):
+                    return False
+                if not buy_order:
+                    self._set_error("controlled_buy_failed")
+        repay_snapshot = self._execution.get_margin_account() or {}
+        if self._abort_if_not_authorized("controlled_repay_snapshot"):
+            return False
+        repay_assets = repay_snapshot.get("userAssets", [])
+        repay_btc = next((item for item in repay_assets if item.get("asset") == "BTC"), None)
+        repay_usdt = next(
+            (item for item in repay_assets if item.get("asset") == "USDT"), None
+        )
+        repay_btc_borrowed = float(repay_btc.get("borrowed", 0.0)) if repay_btc else 0.0
+        repay_btc_free = float(repay_btc.get("free", 0.0)) if repay_btc else 0.0
+        repay_usdt_borrowed = float(repay_usdt.get("borrowed", 0.0)) if repay_usdt else 0.0
+        repay_usdt_free = float(repay_usdt.get("free", 0.0)) if repay_usdt else 0.0
+        if repay_btc_borrowed > 0 and repay_btc_free > 0:
+            repay_amount = min(repay_btc_borrowed, repay_btc_free)
+            self._execution.repay_asset("BTC", repay_amount)
+            if self._abort_if_not_authorized("controlled_repay_btc"):
+                return False
+        if repay_usdt_borrowed > 0 and repay_usdt_free > 0:
+            repay_amount = min(repay_usdt_borrowed, repay_usdt_free)
+            self._execution.repay_asset("USDT", repay_amount)
+            if self._abort_if_not_authorized("controlled_repay_usdt"):
+                return False
+        final_snapshot = self._execution.get_margin_account() or {}
+        if self._abort_if_not_authorized("controlled_final_snapshot"):
+            return False
+        final_open_orders = self._execution.get_open_orders()
+        if self._abort_if_not_authorized("controlled_final_open_orders"):
+            return False
+        final_assets = final_snapshot.get("userAssets", [])
+        final_btc = next((item for item in final_assets if item.get("asset") == "BTC"), None)
+        final_usdt = next((item for item in final_assets if item.get("asset") == "USDT"), None)
+        final_btc_borrowed = float(final_btc.get("borrowed", 0.0)) if final_btc else 0.0
+        final_btc_net = float(final_btc.get("netAsset", 0.0)) if final_btc else 0.0
+        final_usdt_borrowed = float(final_usdt.get("borrowed", 0.0)) if final_usdt else 0.0
+        self._emit_log(
+            "INFO",
+            "INFO",
+            "CONTROLLED_FLATTEN_DONE",
+            reason=reason,
+            exposure_btc=final_btc_net,
+            borrowed_btc=final_btc_borrowed,
+            borrowed_usdt=final_usdt_borrowed,
+            open_orders_count=len(final_open_orders),
+        )
+        success = True
+        if (
+            abs(final_btc_net) > step
+            or final_btc_borrowed > step
+            or final_usdt_borrowed > step
+            or final_open_orders
+        ):
+            self._emit_log(
+                "ERROR",
+                "ERROR",
+                "CONTROLLED_FLATTEN_FAILED",
+                exposure_btc=final_btc_net,
+                borrowed_btc=final_btc_borrowed,
+                borrowed_usdt=final_usdt_borrowed,
+                open_orders_count=len(final_open_orders),
+            )
+            self._state_machine.set_error("controlled_flatten_failed")
+            success = False
+        self._exposure_open = False
+        self._emit_exposure(False)
+        return success
 
     def _emergency_flatten(self, reason: str) -> None:
         self._last_reason = reason
