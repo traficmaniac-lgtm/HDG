@@ -67,18 +67,19 @@ class StrategyParams:
     target_net_bps: int = 10
     max_spread_bps: float = 8.0
     min_tick_rate: int = 5
-    detect_timeout_ms: int = 800
+    detect_timeout_ms: int = 2500
     use_impulse_filter: bool = True
     impulse_min_bps: float = 1.0
     impulse_grace_ms: int = 2000
     impulse_degrade_mode: str = "DISABLE_AFTER_GRACE"
-    winner_threshold_bps: float = 1.0
+    winner_threshold_bps: float = 0.2
     emergency_stop_bps: int = 10
     cooldown_s: int = 3
-    detect_window_ticks: int = 2
+    detect_window_ticks: int = 8
+    allow_no_winner_flatten: bool = True
     burst_volume_threshold: float = 0.0
     auto_loop: bool = False
-    max_cycles: int = 0
+    max_cycles: int = 10
 
 
 @dataclass
@@ -92,6 +93,40 @@ class CycleStatus:
     exit_mid: Optional[float] = None
     winner_side: str = "—"
     loser_side: str = "—"
+
+
+@dataclass
+class CycleTelemetry:
+    cycle_id: int = 0
+    state: str = "IDLE"
+    active_cycle: bool = False
+    started_at: Optional[datetime] = None
+    duration_s: Optional[float] = None
+    nominal_usd: float = 0.0
+    fee_total_bps: float = 0.0
+    target_net_bps: float = 0.0
+    max_loss_bps: float = 0.0
+    max_spread_bps: float = 0.0
+    min_tick_rate: float = 0.0
+    cooldown_s: float = 0.0
+    tick_rate: Optional[float] = None
+    impulse_bps: Optional[float] = None
+    spread_bps: Optional[float] = None
+    ws_age_ms: Optional[float] = None
+    effective_source: Optional[str] = None
+    entry_mid: Optional[float] = None
+    exit_mid: Optional[float] = None
+    winner_side: Optional[str] = None
+    loser_side: Optional[str] = None
+    winner_raw_bps: Optional[float] = None
+    loser_raw_bps: Optional[float] = None
+    winner_net_bps: Optional[float] = None
+    loser_net_bps: Optional[float] = None
+    total_raw_bps: Optional[float] = None
+    total_net_bps: Optional[float] = None
+    condition: Optional[str] = None
+    reason: Optional[str] = None
+    last_error: Optional[str] = None
 
 
 @dataclass
