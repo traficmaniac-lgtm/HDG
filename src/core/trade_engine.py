@@ -14,6 +14,7 @@ from src.engine.directional_cycle import DirectionalCycle
 from src.exchange.binance_margin import BinanceMarginExecution
 from src.services.binance_rest import BinanceRestClient
 from src.services.http_fallback import HttpFallback
+from src.services.market_data import MarketDataService
 
 
 class TradeEngine(QObject):
@@ -27,10 +28,11 @@ class TradeEngine(QObject):
     connection_checked = Signal(dict)
     exposure_update = Signal(dict)
 
-    def __init__(self) -> None:
+    def __init__(self, market_data: MarketDataService | None = None) -> None:
         super().__init__()
         self._rest_client = BinanceRestClient()
         self._http_fallback = HttpFallback()
+        self._market_data = market_data or MarketDataService()
         self._state_machine = BotStateMachine()
         self._strategy = StrategyParams()
         self._symbol_filters = SymbolFilters()
@@ -46,6 +48,7 @@ class TradeEngine(QObject):
             state_machine=self._state_machine,
             strategy=self._strategy,
             symbol_filters=self._symbol_filters,
+            market_data=self._market_data,
             emit_log=self._emit_log,
             emit_trade_row=self.trade_row.emit,
             emit_exposure=self._emit_exposure_status,
@@ -96,6 +99,7 @@ class TradeEngine(QObject):
             state_machine=self._state_machine,
             strategy=self._strategy,
             symbol_filters=self._symbol_filters,
+            market_data=self._market_data,
             emit_log=self._emit_log,
             emit_trade_row=self.trade_row.emit,
             emit_exposure=self._emit_exposure_status,
@@ -199,6 +203,7 @@ class TradeEngine(QObject):
     def fetch_http_fallback(self) -> None:
         data = self._http_fallback.get_book_ticker("BTCUSDT")
         if data:
+            self._market_data.update_tick(data)
             self.on_tick(data)
 
     @Slot(str)

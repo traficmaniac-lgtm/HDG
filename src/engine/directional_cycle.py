@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Deque, Optional
 
-from src.core.models import MarketDataMode, MarketSnapshot, StrategyParams, SymbolFilters
+from src.core.models import MarketDataMode, StrategyParams, SymbolFilters
 from src.core.state_machine import BotState, BotStateMachine
 from src.exchange.binance_margin import BinanceMarginExecution
+from src.services.market_data import MarketDataService
 
 
 TradeRowFn = Callable[[dict[str, Any]], None]
@@ -36,137 +37,6 @@ class CycleSnapshot:
     waiting_for_data: Optional[bool] = None
 
 
-@dataclass
-class DataRouter:
-    ws_fresh_ms: int = 500
-    http_fresh_ms: int = 1200
-    mode: MarketDataMode = MarketDataMode.HYBRID
-    http_hold_ms: int = 1500
-    ws_recovery_ticks: int = 3
-    last_ws_tick: Optional[dict[str, Any]] = None
-    last_http_tick: Optional[dict[str, Any]] = None
-    last_effective_tick: Optional[dict[str, Any]] = None
-    snapshot: MarketSnapshot = field(default_factory=MarketSnapshot)
-    last_effective_source: str = "NONE"
-    last_source_change_ms: float = field(default_factory=lambda: time.monotonic() * 1000)
-    ws_fresh_streak: int = 0
-    http_hold_until_ms: float = 0.0
-    ws_connected: bool = False
-
-    def update_tick(self, payload: dict[str, Any]) -> None:
-        source = str(payload.get("source", "WS"))
-        rx_time_ms = payload.get("rx_time_ms")
-        if rx_time_ms is None:
-            rx_time_ms = time.monotonic() * 1000
-            payload["rx_time_ms"] = rx_time_ms
-        now_ms = time.monotonic() * 1000
-        if source == "WS":
-            self.last_ws_tick = payload
-            self.snapshot.last_ws_tick_ms = float(rx_time_ms)
-        elif source == "HTTP":
-            self.last_http_tick = payload
-            self.snapshot.last_http_tick_ms = float(rx_time_ms)
-        self._update_snapshot_prices(payload)
-        self._update_effective_tick(now_ms)
-
-    def set_mode(self, mode: MarketDataMode) -> None:
-        self.mode = mode
-        self._update_effective_tick(time.monotonic() * 1000)
-
-    def set_ws_connected(self, connected: bool) -> None:
-        self.ws_connected = connected
-
-    def refresh_snapshot(self) -> MarketSnapshot:
-        self._update_effective_tick(time.monotonic() * 1000)
-        return self.snapshot
-
-    def ws_age_ms(self) -> float:
-        last_tick_ms = self.snapshot.last_ws_tick_ms
-        if last_tick_ms is None:
-            return 9999.0
-        return max(0.0, time.monotonic() * 1000 - last_tick_ms)
-
-    def http_age_ms(self) -> float:
-        last_tick_ms = self.snapshot.last_http_tick_ms
-        if last_tick_ms is None:
-            return 9999.0
-        return max(0.0, time.monotonic() * 1000 - last_tick_ms)
-
-    def effective_source(self, now_ms: Optional[float] = None) -> str:
-        if now_ms is None:
-            now_ms = time.monotonic() * 1000
-        ws_fresh = self._is_ws_fresh(now_ms)
-        http_fresh = self._is_http_fresh(now_ms)
-        if self.mode == MarketDataMode.WS_ONLY:
-            return "WS" if ws_fresh else "NONE"
-        if self.mode == MarketDataMode.HTTP_ONLY:
-            return "HTTP" if http_fresh else "NONE"
-        if self.last_effective_source == "HTTP":
-            if http_fresh and now_ms < self.http_hold_until_ms:
-                return "HTTP"
-            if ws_fresh and self.ws_fresh_streak >= self.ws_recovery_ticks:
-                return "WS"
-            if http_fresh:
-                return "HTTP"
-            if ws_fresh:
-                return "WS"
-            return "NONE"
-        if ws_fresh:
-            return "WS"
-        if http_fresh:
-            return "HTTP"
-        return "NONE"
-
-    def effective_tick(self, now_ms: Optional[float] = None) -> Optional[dict[str, Any]]:
-        source = self.effective_source(now_ms)
-        if source == "WS":
-            return self.last_ws_tick
-        if source == "HTTP":
-            return self.last_http_tick
-        return None
-
-    def _is_ws_fresh(self, now_ms: float) -> bool:
-        last_tick_ms = self.snapshot.last_ws_tick_ms
-        if last_tick_ms is None:
-            return False
-        return (now_ms - last_tick_ms) <= self.ws_fresh_ms
-
-    def _is_http_fresh(self, now_ms: float) -> bool:
-        last_tick_ms = self.snapshot.last_http_tick_ms
-        if last_tick_ms is None:
-            return False
-        return (now_ms - last_tick_ms) <= self.http_fresh_ms
-
-    def _update_snapshot_prices(self, payload: dict[str, Any]) -> None:
-        self.snapshot.bid = float(payload.get("bid", self.snapshot.bid) or 0.0)
-        self.snapshot.ask = float(payload.get("ask", self.snapshot.ask) or 0.0)
-        self.snapshot.mid = float(payload.get("mid", self.snapshot.mid) or 0.0)
-
-    def _update_effective_tick(self, now_ms: float) -> None:
-        ws_fresh = self._is_ws_fresh(now_ms)
-        if ws_fresh and self.last_ws_tick:
-            self.ws_fresh_streak += 1
-        else:
-            self.ws_fresh_streak = 0
-        source = self.effective_source(now_ms)
-        if source != self.last_effective_source:
-            self.last_effective_source = source
-            self.last_source_change_ms = now_ms
-            if source == "HTTP":
-                self.http_hold_until_ms = now_ms + self.http_hold_ms
-        self.last_effective_tick = self.effective_tick(now_ms)
-        self.snapshot.ws_age_ms = self.ws_age_ms()
-        self.snapshot.http_age_ms = self.http_age_ms()
-        self.snapshot.effective_source = self.last_effective_source
-        if self.snapshot.effective_source == "WS":
-            self.snapshot.effective_age_ms = self.snapshot.ws_age_ms
-        elif self.snapshot.effective_source == "HTTP":
-            self.snapshot.effective_age_ms = self.snapshot.http_age_ms
-        else:
-            self.snapshot.effective_age_ms = 9999.0
-        self.snapshot.data_stale = self.snapshot.effective_source == "NONE"
-
-
 class DirectionalCycle:
     def __init__(
         self,
@@ -174,6 +44,7 @@ class DirectionalCycle:
         state_machine: BotStateMachine,
         strategy: StrategyParams,
         symbol_filters: SymbolFilters,
+        market_data: MarketDataService,
         emit_log: Callable[..., None],
         emit_trade_row: TradeRowFn,
         emit_exposure: Callable[[bool], None],
@@ -186,7 +57,7 @@ class DirectionalCycle:
         self._emit_trade_row = emit_trade_row
         self._emit_exposure = emit_exposure
 
-        self._data_router = DataRouter()
+        self._market_data = market_data
         self._last_tick: Optional[dict[str, Any]] = None
         self._tick_history: Deque[tuple[float, float]] = deque(maxlen=500)
         self._prev_ws_mid: Optional[float] = None
@@ -260,14 +131,13 @@ class DirectionalCycle:
         self._filters = symbol_filters
 
     def update_data_mode(self, mode: MarketDataMode) -> None:
-        self._data_router.set_mode(mode)
+        self._market_data.set_mode(mode)
 
     def update_ws_status(self, status: str) -> None:
-        self._data_router.set_ws_connected(status == "CONNECTED")
+        self._market_data.set_ws_connected(status == "CONNECTED")
 
     def update_tick(self, payload: dict[str, Any]) -> None:
         source = str(payload.get("source", "WS"))
-        self._data_router.update_tick(payload)
         if source == "WS":
             now = time.monotonic()
             mid = float(payload.get("mid", 0.0))
@@ -275,8 +145,8 @@ class DirectionalCycle:
                 self._prev_ws_mid = self._last_ws_mid if self._last_ws_mid is not None else mid
                 self._last_ws_mid = mid
                 self._tick_history.append((now, mid))
-        self._last_tick = self._data_router.last_effective_tick
-        snapshot = self._data_router.refresh_snapshot()
+        self._last_tick = self._market_data.get_last_effective_tick()
+        snapshot = self._market_data.get_snapshot()
         self._ws_age_ms = snapshot.ws_age_ms
         self._http_age_ms = snapshot.http_age_ms
         self._effective_source = snapshot.effective_source
@@ -285,6 +155,7 @@ class DirectionalCycle:
         if not self._data_stale:
             self._waiting_for_data = False
         self._maybe_log_data_source()
+        self._maybe_log_data_health()
         if self._state_machine.state == BotState.DETECTING:
             self._evaluate_detecting()
         elif self._state_machine.state == BotState.RIDING:
@@ -297,7 +168,7 @@ class DirectionalCycle:
             return
         if self._state_machine.state != BotState.ARMED:
             return
-        if not self._data_router.last_ws_tick and not self._data_router.last_http_tick:
+        if not self._market_data.get_last_ws_tick() and not self._market_data.get_last_http_tick():
             self._log_skip("no_tick")
             return
         if not self._filters.step_size or not self._filters.min_qty:
@@ -313,6 +184,19 @@ class DirectionalCycle:
         self._start_cycle()
 
     def arm(self) -> None:
+        snapshot = self._market_data.get_snapshot()
+        last_ws_tick = self._market_data.get_last_ws_tick() or {}
+        self._emit_log(
+            "INFO",
+            "INFO",
+            "snapshot_before_start",
+            bid=snapshot.bid,
+            ask=snapshot.ask,
+            mid=snapshot.mid,
+            ws_age_ms=snapshot.ws_age_ms,
+            last_ws_tick_time=last_ws_tick.get("rx_time"),
+            ws_connected=self._market_data.is_ws_connected(),
+        )
         self._state_machine.arm()
 
     def stop(self) -> None:
@@ -332,7 +216,7 @@ class DirectionalCycle:
     def _start_cycle(self) -> None:
         if not self._state_machine.start_cycle():
             return
-        tick = self._data_router.last_ws_tick or self._last_tick or {}
+        tick = self._market_data.get_last_ws_tick() or self._last_tick or {}
         self._cycle_start = datetime.now(timezone.utc)
         self._waiting_for_data = False
         self._entry_mid = float(tick.get("mid", 0.0))
@@ -360,7 +244,7 @@ class DirectionalCycle:
         self._emit_log("STATE", "INFO", "DETECT_START", cycle_id=self._state_machine.cycle_id)
 
     def _enter_hedge(self) -> bool:
-        tick = self._data_router.last_ws_tick or {}
+        tick = self._market_data.get_last_ws_tick() or {}
         mid = float(tick.get("mid", 0.0))
         bid = float(tick.get("bid", 0.0))
         ask = float(tick.get("ask", 0.0))
@@ -547,7 +431,7 @@ class DirectionalCycle:
             return
         if not self._last_tick or not self._entry_mid or not self._winner_side:
             return
-        effective_age_ms = self._data_router.snapshot.effective_age_ms
+        effective_age_ms = self._market_data.get_snapshot().effective_age_ms
         tick = self._last_tick
         mid_now = float(tick.get("mid", 0.0))
         winner_raw_bps = self._calc_raw_bps(self._winner_side, self._entry_mid, mid_now)
@@ -739,9 +623,9 @@ class DirectionalCycle:
 
     def _compute_entry_metrics(self) -> dict[str, float | bool]:
         tick = (
-            self._data_router.last_effective_tick
-            or self._data_router.last_ws_tick
-            or self._data_router.last_http_tick
+            self._market_data.get_last_effective_tick()
+            or self._market_data.get_last_ws_tick()
+            or self._market_data.get_last_http_tick()
             or {}
         )
         bid = float(tick.get("bid", 0.0))
@@ -755,7 +639,7 @@ class DirectionalCycle:
         impulse_bps = 0.0
         if self._prev_ws_mid and self._last_ws_mid and self._prev_ws_mid > 0:
             impulse_bps = abs(self._last_ws_mid - self._prev_ws_mid) / self._prev_ws_mid * 10_000
-        snapshot = self._data_router.refresh_snapshot()
+        snapshot = self._market_data.get_snapshot()
         ws_age_ms = snapshot.ws_age_ms
         http_age_ms = snapshot.http_age_ms
         effective_source = snapshot.effective_source
@@ -853,22 +737,24 @@ class DirectionalCycle:
         return self._execution.wait_for_fill(market_order.get("orderId"), timeout_s=3.0)
 
     def _current_data_source(self) -> str:
-        return self._data_router.snapshot.effective_source
+        return self._market_data.get_snapshot().effective_source
 
     def _maybe_log_data_source(self) -> None:
         source = self._current_data_source()
         now = time.monotonic()
-        if self._last_data_log_source == source and now - self._last_data_log_ts < 5.0:
+        if self._last_data_log_source == source:
             return
         self._last_data_log_source = source
         self._last_data_log_ts = now
-        snapshot = self._data_router.snapshot
+        snapshot = self._market_data.get_snapshot()
         last_ws_time = None
         last_http_time = None
-        if self._data_router.last_ws_tick:
-            last_ws_time = self._data_router.last_ws_tick.get("rx_time")
-        if self._data_router.last_http_tick:
-            last_http_time = self._data_router.last_http_tick.get("rx_time")
+        last_ws_tick = self._market_data.get_last_ws_tick()
+        last_http_tick = self._market_data.get_last_http_tick()
+        if last_ws_tick:
+            last_ws_time = last_ws_tick.get("rx_time")
+        if last_http_tick:
+            last_http_time = last_http_tick.get("rx_time")
         self._emit_log(
             "INFO",
             "INFO",
@@ -876,10 +762,31 @@ class DirectionalCycle:
             source=source,
             ws_age_ms=snapshot.ws_age_ms,
             http_age_ms=snapshot.http_age_ms,
-            ws_fresh_ms=self._data_router.ws_fresh_ms,
-            http_fresh_ms=self._data_router.http_fresh_ms,
+            ws_fresh_ms=self._market_data.ws_fresh_ms,
+            http_fresh_ms=self._market_data.http_fresh_ms,
             last_ws_tick_time=last_ws_time,
             last_http_tick_time=last_http_time,
+        )
+
+    def _maybe_log_data_health(self) -> None:
+        if self._state_machine.state == BotState.IDLE:
+            return
+        now = time.monotonic()
+        if now - self._last_data_health_log_ts < 2.0:
+            return
+        self._last_data_health_log_ts = now
+        snapshot = self._market_data.get_snapshot()
+        last_tick = self._market_data.get_last_effective_tick() or {}
+        self._emit_log(
+            "INFO",
+            "INFO",
+            "DATA runtime",
+            ws_connected=self._market_data.is_ws_connected(),
+            ws_age_ms=snapshot.ws_age_ms,
+            last_ws_rx_monotonic_ms=self._market_data.get_last_ws_rx_monotonic_ms(),
+            last_tick_mid=last_tick.get("mid"),
+            effective_source=snapshot.effective_source,
+            data_stale=snapshot.data_stale,
         )
 
     def _leverage_ok(self, mid: float) -> bool:
@@ -1025,8 +932,8 @@ class DirectionalCycle:
             ws_age_ms=metrics["ws_age_ms"],
             http_age_ms=metrics["http_age_ms"],
             effective_source=metrics["effective_source"],
-            ws_fresh_ms=self._data_router.ws_fresh_ms,
-            http_fresh_ms=self._data_router.http_fresh_ms,
+            ws_fresh_ms=self._market_data.ws_fresh_ms,
+            http_fresh_ms=self._market_data.http_fresh_ms,
             data_stale=metrics["data_stale"],
         )
 
@@ -1039,9 +946,9 @@ class DirectionalCycle:
             "INFO",
             "INFO",
             "DATA health",
-            ws_connected=self._data_router.ws_connected,
+            ws_connected=self._market_data.is_ws_connected(),
             ws_age_ms=metrics["ws_age_ms"],
-            http_enabled=self._data_router.mode != MarketDataMode.WS_ONLY,
+            http_enabled=self._market_data.mode != MarketDataMode.WS_ONLY,
             http_age_ms=metrics["http_age_ms"],
             effective_source=metrics["effective_source"],
         )
