@@ -1,6 +1,13 @@
-# Directional Hedge Scalper — v0.1.0 (GUI MVP)
+# Directional Hedge Scalper — v0.2.0 (Read-Only SIM)
 
-This repository contains the v0.1.0 GUI-only scaffold for the Directional Hedge Scalper. **No real trading or order execution is implemented in this version.**
+This repository contains the v0.2.0 GUI for the Directional Hedge Scalper. **No real trading or order execution is implemented in this version.**
+
+## What’s new in v0.2.0
+
+- Read-only account checks for Spot/Margin and Futures (GET-only endpoints).
+- USDT balance display with periodic refresh.
+- Settings tab with local key storage (config/settings.json) and test connection.
+- Read-only orderbook simulation for single-side cycles (no hedge, no orders).
 
 ## Requirements
 
@@ -32,5 +39,6 @@ python -m src.app.main
 
 ## Notes
 
-- v0.1.0 provides a GUI, websocket market data feed, and state/parameter scaffolding only.
+- v0.2.0 is read-only: GET endpoints only, no order placement, no live positions.
+- The simulation uses orderbook-based fills for a single-side cycle (BUY or SELL).
 - Real order execution will be added in later versions.

@@ -17,7 +17,7 @@ class ConnectionSettings:
     api_secret: str = ""
     mode: ConnectionMode = ConnectionMode.MARGIN
     leverage: int = 1
-    save_to_env: bool = False
+    save_local: bool = True
 
 
 @dataclass
@@ -33,7 +33,8 @@ class MarketTick:
 @dataclass
 class StrategyParams:
     order_mode: str = "market"
-    usd_per_leg: float = 20.0
+    sim_side: str = "BUY"
+    usd_notional: float = 20.0
     max_loss_bps: int = 5
     fee_total_bps: float = 7.0
     target_net_bps: int = 10
@@ -41,6 +42,7 @@ class StrategyParams:
     cooldown_s: int = 3
     direction_detect_window_ticks: int = 2
     burst_volume_threshold: float = 0.0
+    auto_loop: bool = False
 
 
 @dataclass

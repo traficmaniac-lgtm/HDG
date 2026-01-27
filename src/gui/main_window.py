@@ -15,12 +15,10 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QHBoxLayout,
     QLabel,
-    QLineEdit,
     QMainWindow,
     QMessageBox,
     QPushButton,
     QPlainTextEdit,
-    QRadioButton,
     QSpinBox,
     QDoubleSpinBox,
     QTabWidget,
@@ -31,11 +29,15 @@ from PySide6.QtWidgets import (
     QCheckBox,
 )
 
+from src.core.config_store import SettingsStore
 from src.core.logger import QtLogEmitter, setup_logger
 from src.core.models import ConnectionMode, ConnectionSettings, MarketTick, StrategyParams
 from src.core.state_machine import BotState, BotStateMachine
+from src.gui.settings_tab import SettingsTab
 from src.gui.widgets import make_card
+from src.services.binance_rest import BinanceRestClient
 from src.services.http_fallback import HttpFallback
+from src.services.orderbook import OrderBook
 from src.services.ws_market import MarketDataThread
 
 DEBUG = os.getenv("DEBUG", "false").lower() == "true"
@@ -44,10 +46,12 @@ DEBUG = os.getenv("DEBUG", "false").lower() == "true"
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Directional Hedge Scalper — BTCUSDT")
+        self.version = "0.2.0"
+        self.setWindowTitle(f"Directional Hedge Scalper v{self.version} — BTCUSDT")
         self.setMinimumSize(1200, 720)
 
-        self.connection_settings = ConnectionSettings()
+        self.settings_store = SettingsStore()
+        self.connection_settings = self.settings_store.load()
         self.strategy_params = StrategyParams()
         self.state_machine = BotStateMachine()
         self.market_tick = MarketTick()
@@ -55,27 +59,47 @@ class MainWindow(QMainWindow):
         self.data_source = "WS"
         self.ws_status = "DISCONNECTED"
         self.cycle_start_time: Optional[datetime] = None
-        self.entry_price_long: Optional[float] = None
-        self.entry_price_short: Optional[float] = None
+
+        self.sim_entry_price: Optional[float] = None
+        self.sim_entry_qty: Optional[float] = None
+        self.sim_exit_price: Optional[float] = None
+        self.sim_raw_bps: Optional[float] = None
+        self.sim_net_bps: Optional[float] = None
+        self.sim_condition: str = "—"
 
         self.log_emitter = QtLogEmitter()
         self.logger = setup_logger(Path("logs"), self.log_emitter)
+        self.logger.info("[APP] version=0.2.0")
 
         self.ws_thread = MarketDataThread("btcusdt")
         self.ws_thread.price_update.connect(self.on_price_update)
+        self.ws_thread.depth_update.connect(self.on_depth_update)
         self.ws_thread.status_update.connect(self.on_ws_status)
 
         self.http_client = HttpFallback()
+        self.rest_client = BinanceRestClient()
+
         self.http_timer = QTimer(self)
         self.http_timer.setInterval(1000)
         self.http_timer.timeout.connect(self.fetch_http_fallback)
+
+        self.balance_timer = QTimer(self)
+        self.balance_timer.setInterval(7000)
+        self.balance_timer.timeout.connect(self.refresh_balance)
 
         self.cooldown_timer = QTimer(self)
         self.cooldown_timer.setSingleShot(True)
         self.cooldown_timer.timeout.connect(self.on_cooldown_complete)
 
+        self.orderbook = OrderBook()
+        self.orderbook_ready = False
+        self.last_balance_update: Optional[datetime] = None
+        self.account_permissions = "—"
+
         self._build_ui()
         self._wire_signals()
+        self._initialize_defaults()
+        self._load_settings_into_form()
         self._update_ui_state()
 
         self.log_emitter.message.connect(self.append_log)
@@ -84,6 +108,7 @@ class MainWindow(QMainWindow):
         self.logger.info("Shutting down GUI")
         self.stop_ws_thread()
         self.http_client.close()
+        self.rest_client.close()
         event.accept()
 
     def _build_ui(self) -> None:
@@ -127,72 +152,27 @@ class MainWindow(QMainWindow):
 
     def _build_left_panel(self) -> QWidget:
         wrapper = QWidget()
-        wrapper.setFixedWidth(330)
+        wrapper.setFixedWidth(340)
         layout = QVBoxLayout(wrapper)
         layout.setSpacing(12)
 
-        layout.addWidget(make_card("Binance Access", self._build_access_card()))
-        layout.addWidget(make_card("Symbol", self._build_symbol_card()))
+        layout.addWidget(make_card("Market", self._build_market_card()))
+        layout.addWidget(make_card("Account", self._build_account_card()))
         layout.addWidget(make_card("Controls", self._build_controls_card()))
         layout.addStretch(1)
         return wrapper
 
-    def _build_access_card(self) -> QWidget:
-        widget = QWidget()
-        layout = QVBoxLayout(widget)
-        layout.setSpacing(6)
-
-        mode_layout = QHBoxLayout()
-        self.mode_margin = QRadioButton("Spot Margin")
-        self.mode_futures = QRadioButton("Futures")
-        self.mode_margin.setChecked(True)
-        mode_layout.addWidget(self.mode_margin)
-        mode_layout.addWidget(self.mode_futures)
-        layout.addLayout(mode_layout)
-
-        leverage_layout = QHBoxLayout()
-        self.leverage_label = QLabel("Leverage:")
-        self.leverage_combo = QComboBox()
-        self.leverage_combo.addItems(["1x", "2x", "3x"])
-        self.leverage_combo.setEnabled(False)
-        leverage_layout.addWidget(self.leverage_label)
-        leverage_layout.addWidget(self.leverage_combo)
-        layout.addLayout(leverage_layout)
-
-        self.api_key_input = QLineEdit()
-        self.api_key_input.setPlaceholderText("API Key")
-        self.api_secret_input = QLineEdit()
-        self.api_secret_input.setPlaceholderText("API Secret")
-        self.api_secret_input.setEchoMode(QLineEdit.Password)
-        layout.addWidget(self.api_key_input)
-        layout.addWidget(self.api_secret_input)
-
-        self.save_env_checkbox = QCheckBox("Save to .env.local")
-        layout.addWidget(self.save_env_checkbox)
-
-        btn_layout = QHBoxLayout()
-        self.connect_button = QPushButton("CONNECT")
-        self.disconnect_button = QPushButton("DISCONNECT")
-        btn_layout.addWidget(self.connect_button)
-        btn_layout.addWidget(self.disconnect_button)
-        layout.addLayout(btn_layout)
-
-        self.keys_note = QLabel("Keys are used only locally.")
-        self.keys_note.setStyleSheet("color: #8c8c8c;")
-        layout.addWidget(self.keys_note)
-        return widget
-
-    def _build_symbol_card(self) -> QWidget:
+    def _build_market_card(self) -> QWidget:
         widget = QWidget()
         layout = QVBoxLayout(widget)
         layout.setSpacing(6)
 
         self.symbol_combo = QComboBox()
         self.symbol_combo.addItems(["BTCUSDT"])
-        layout.addWidget(QLabel("Symbol:"))
+        layout.addWidget(QLabel("Symbol"))
         layout.addWidget(self.symbol_combo)
 
-        self.price_source_label = QLabel("Price source: Auto (WS→HTTP)")
+        self.price_source_label = QLabel("Source: Auto (WS→HTTP)")
         layout.addWidget(self.price_source_label)
 
         self.mid_label = QLabel("—")
@@ -203,9 +183,30 @@ class MainWindow(QMainWindow):
         self.bid_label = QLabel("Bid: —")
         self.ask_label = QLabel("Ask: —")
         self.spread_label = QLabel("Spread: — bps")
+        self.card_tick_age_label = QLabel("Tick age: — ms")
         layout.addWidget(self.bid_label)
         layout.addWidget(self.ask_label)
         layout.addWidget(self.spread_label)
+        layout.addWidget(self.card_tick_age_label)
+        return widget
+
+    def _build_account_card(self) -> QWidget:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setSpacing(6)
+
+        self.account_connection_label = QLabel("Connection: DISCONNECTED")
+        self.account_data_label = QLabel("Data: —")
+        self.balance_label = QLabel("USDT Balance: —")
+        self.permissions_label = QLabel("Permissions: —")
+        self.balance_updated_label = QLabel("Updated: —")
+        self.balance_updated_label.setStyleSheet("color: #8c8c8c;")
+
+        layout.addWidget(self.account_connection_label)
+        layout.addWidget(self.account_data_label)
+        layout.addWidget(self.balance_label)
+        layout.addWidget(self.permissions_label)
+        layout.addWidget(self.balance_updated_label)
         return widget
 
     def _build_controls_card(self) -> QWidget:
@@ -213,20 +214,29 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(widget)
         layout.setSpacing(6)
 
+        arm_layout = QHBoxLayout()
         self.arm_button = QPushButton("ARM")
         self.disarm_button = QPushButton("DISARM")
+        arm_layout.addWidget(self.arm_button)
+        arm_layout.addWidget(self.disarm_button)
+        layout.addLayout(arm_layout)
+
+        cycle_layout = QHBoxLayout()
         self.start_cycle_button = QPushButton("START CYCLE")
         self.stop_button = QPushButton("STOP")
+        cycle_layout.addWidget(self.start_cycle_button)
+        cycle_layout.addWidget(self.stop_button)
+        layout.addLayout(cycle_layout)
+
         self.emergency_button = QPushButton("EMERGENCY FLATTEN")
+        layout.addWidget(self.emergency_button)
+
+        self.entry_allowed_label = QLabel("entry allowed: —")
+        layout.addWidget(self.entry_allowed_label)
+
         self.dev_end_cycle_button = QPushButton("End cycle (dev)")
         if not DEBUG:
             self.dev_end_cycle_button.hide()
-
-        layout.addWidget(self.arm_button)
-        layout.addWidget(self.disarm_button)
-        layout.addWidget(self.start_cycle_button)
-        layout.addWidget(self.stop_button)
-        layout.addWidget(self.emergency_button)
         layout.addWidget(self.dev_end_cycle_button)
         return widget
 
@@ -237,6 +247,8 @@ class MainWindow(QMainWindow):
         tabs.addTab(self._build_trades_tab(), "Trades")
         tabs.addTab(self._build_logs_tab(), "Logs")
         tabs.addTab(self._build_stats_tab(), "Statistics")
+        self.settings_tab = SettingsTab()
+        tabs.addTab(self.settings_tab, "Settings")
         return tabs
 
     def _build_trading_tab(self) -> QWidget:
@@ -254,32 +266,26 @@ class MainWindow(QMainWindow):
         self.cycle_id_label = QLabel("cycle_id: 0")
         self.cycle_start_label = QLabel("start_time: —")
         self.cycle_elapsed_label = QLabel("elapsed_s: —")
-        self.winner_label = QLabel("winner_side: —")
-        self.loser_label = QLabel("loser_side: —")
 
         state_layout.addWidget(self.state_label, 0, 0)
         state_layout.addWidget(self.active_cycle_label, 0, 1)
         state_layout.addWidget(self.cycle_id_label, 0, 2)
         state_layout.addWidget(self.cycle_start_label, 1, 0)
         state_layout.addWidget(self.cycle_elapsed_label, 1, 1)
-        state_layout.addWidget(self.winner_label, 1, 2)
-        state_layout.addWidget(self.loser_label, 2, 0)
 
         self.bps_panel = QFrame()
         self.bps_panel.setFrameShape(QFrame.StyledPanel)
         bps_layout = QGridLayout(self.bps_panel)
         bps_layout.setContentsMargins(10, 10, 10, 10)
 
-        self.raw_long_label = QLabel("raw_bps_long: —")
-        self.raw_short_label = QLabel("raw_bps_short: —")
+        self.raw_bps_label = QLabel("raw_bps: —")
         self.net_bps_label = QLabel("net_bps: —")
         self.fee_label = QLabel("fee_total_bps: —")
         self.target_label = QLabel("target_net_bps: —")
         self.max_loss_label = QLabel("max_loss_bps: —")
 
-        bps_layout.addWidget(self.raw_long_label, 0, 0)
-        bps_layout.addWidget(self.raw_short_label, 0, 1)
-        bps_layout.addWidget(self.net_bps_label, 0, 2)
+        bps_layout.addWidget(self.raw_bps_label, 0, 0)
+        bps_layout.addWidget(self.net_bps_label, 0, 1)
         bps_layout.addWidget(self.fee_label, 1, 0)
         bps_layout.addWidget(self.target_label, 1, 1)
         bps_layout.addWidget(self.max_loss_label, 1, 2)
@@ -292,16 +298,36 @@ class MainWindow(QMainWindow):
         self.max_spread_label = QLabel("max_spread_bps: —")
         self.min_volume_label = QLabel("min_volume_threshold: —")
         self.cooldown_label = QLabel("cooldown_s: —")
-        self.entry_allowed_label = QLabel("entry allowed: —")
 
         filters_layout.addWidget(self.max_spread_label, 0, 0)
         filters_layout.addWidget(self.min_volume_label, 0, 1)
         filters_layout.addWidget(self.cooldown_label, 0, 2)
-        filters_layout.addWidget(self.entry_allowed_label, 1, 0)
+
+        self.sim_panel = QFrame()
+        self.sim_panel.setFrameShape(QFrame.StyledPanel)
+        sim_layout = QGridLayout(self.sim_panel)
+        sim_layout.setContentsMargins(10, 10, 10, 10)
+
+        self.sim_side_label = QLabel("sim_side: —")
+        self.sim_notional_label = QLabel("usd_notional: —")
+        self.sim_entry_label = QLabel("entry_price: —")
+        self.sim_exit_label = QLabel("exit_mark_price: —")
+        self.sim_raw_label = QLabel("raw_bps: —")
+        self.sim_net_label = QLabel("net_bps: —")
+        self.sim_condition_label = QLabel("condition: —")
+
+        sim_layout.addWidget(self.sim_side_label, 0, 0)
+        sim_layout.addWidget(self.sim_notional_label, 0, 1)
+        sim_layout.addWidget(self.sim_entry_label, 1, 0)
+        sim_layout.addWidget(self.sim_exit_label, 1, 1)
+        sim_layout.addWidget(self.sim_raw_label, 2, 0)
+        sim_layout.addWidget(self.sim_net_label, 2, 1)
+        sim_layout.addWidget(self.sim_condition_label, 2, 2)
 
         layout.addWidget(self.state_panel)
         layout.addWidget(self.bps_panel)
         layout.addWidget(self.filters_panel)
+        layout.addWidget(self.sim_panel)
         layout.addStretch(1)
         return widget
 
@@ -314,9 +340,12 @@ class MainWindow(QMainWindow):
         self.order_mode_combo = QComboBox()
         self.order_mode_combo.addItems(["market", "aggressive_limit"])
 
-        self.usd_per_leg_spin = QDoubleSpinBox()
-        self.usd_per_leg_spin.setRange(1.0, 1000.0)
-        self.usd_per_leg_spin.setDecimals(2)
+        self.sim_side_combo = QComboBox()
+        self.sim_side_combo.addItems(["BUY", "SELL"])
+
+        self.usd_notional_spin = QDoubleSpinBox()
+        self.usd_notional_spin.setRange(1.0, 1000.0)
+        self.usd_notional_spin.setDecimals(2)
 
         self.max_loss_spin = QSpinBox()
         self.max_loss_spin.setRange(3, 6)
@@ -342,8 +371,11 @@ class MainWindow(QMainWindow):
         self.burst_volume_spin.setRange(0.0, 1_000_000.0)
         self.burst_volume_spin.setDecimals(2)
 
+        self.auto_loop_checkbox = QCheckBox("auto_loop")
+
         form.addRow("order_mode", self.order_mode_combo)
-        form.addRow("usd_per_leg", self.usd_per_leg_spin)
+        form.addRow("sim_side", self.sim_side_combo)
+        form.addRow("usd_notional", self.usd_notional_spin)
         form.addRow("max_loss_bps", self.max_loss_spin)
         form.addRow("fee_total_bps", self.fee_spin)
         form.addRow("target_net_bps", self.target_net_spin)
@@ -351,6 +383,7 @@ class MainWindow(QMainWindow):
         form.addRow("cooldown_s", self.cooldown_spin)
         form.addRow("direction_detect_window_ticks", self.direction_window_combo)
         form.addRow("burst_volume_threshold", self.burst_volume_spin)
+        form.addRow("", self.auto_loop_checkbox)
 
         layout.addLayout(form)
 
@@ -417,9 +450,13 @@ class MainWindow(QMainWindow):
         return widget
 
     def _wire_signals(self) -> None:
-        self.mode_futures.toggled.connect(self.on_mode_changed)
-        self.connect_button.clicked.connect(self.connect_to_binance)
-        self.disconnect_button.clicked.connect(self.disconnect_from_binance)
+        self.settings_tab.mode_futures.toggled.connect(self.on_mode_changed)
+        self.settings_tab.connect_button.clicked.connect(self.connect_to_binance)
+        self.settings_tab.disconnect_button.clicked.connect(self.disconnect_from_binance)
+        self.settings_tab.save_button.clicked.connect(self.save_settings)
+        self.settings_tab.test_button.clicked.connect(self.test_connection)
+        self.settings_tab.clear_button.clicked.connect(self.clear_settings_fields)
+
         self.arm_button.clicked.connect(self.on_arm)
         self.disarm_button.clicked.connect(self.on_disarm)
         self.start_cycle_button.clicked.connect(self.on_start_cycle)
@@ -433,36 +470,76 @@ class MainWindow(QMainWindow):
         self.open_logs_button.clicked.connect(self.open_logs_folder)
 
     def on_mode_changed(self) -> None:
-        self.leverage_combo.setEnabled(self.mode_futures.isChecked())
+        self.settings_tab.leverage_combo.setEnabled(self.settings_tab.mode_futures.isChecked())
 
     def connect_to_binance(self) -> None:
-        self.connection_settings.api_key = self.api_key_input.text().strip()
-        self.connection_settings.api_secret = self.api_secret_input.text().strip()
-        self.connection_settings.mode = (
-            ConnectionMode.FUTURES if self.mode_futures.isChecked() else ConnectionMode.MARGIN
-        )
-        self.connection_settings.leverage = int(self.leverage_combo.currentText()[0])
-        self.connection_settings.save_to_env = self.save_env_checkbox.isChecked()
-
+        self._sync_settings_from_form()
         if not self.connection_settings.api_key or not self.connection_settings.api_secret:
             QMessageBox.warning(self, "Missing Keys", "Please enter API key and secret.")
             return
 
-        if self.connection_settings.save_to_env:
-            self.save_env_file()
+        if self.connection_settings.save_local:
+            self.settings_store.save(self.connection_settings)
+            self.logger.info("Settings saved to config/settings.json")
+
+        self.rest_client.close()
+        self.rest_client = BinanceRestClient(
+            api_key=self.connection_settings.api_key,
+            api_secret=self.connection_settings.api_secret,
+        )
+
+        if not self._validate_account_access():
+            self.connected = False
+            self._update_ui_state()
+            return
 
         self.connected = True
         self.state_machine.connect_ok()
+        self.load_orderbook_snapshot()
         self.start_ws_thread()
-        self.logger.info("Connected (stub) to Binance")
+        self.balance_timer.start()
+        self.logger.info("Connected (read-only) to Binance")
         self._update_ui_state()
 
     def disconnect_from_binance(self) -> None:
         self.connected = False
         self.state_machine.disconnect()
         self.stop_ws_thread()
+        self.balance_timer.stop()
+        self.orderbook = OrderBook()
+        self.orderbook_ready = False
         self.logger.info("Disconnected from Binance")
         self._update_ui_state()
+
+    def test_connection(self) -> None:
+        self._sync_settings_from_form()
+        if not self.connection_settings.api_key or not self.connection_settings.api_secret:
+            QMessageBox.warning(self, "Missing Keys", "Please enter API key and secret.")
+            return
+        self.rest_client.close()
+        self.rest_client = BinanceRestClient(
+            api_key=self.connection_settings.api_key,
+            api_secret=self.connection_settings.api_secret,
+        )
+        ok = self._validate_account_access(test_only=True)
+        if ok:
+            QMessageBox.information(self, "Connection", "Read-only access confirmed.")
+        else:
+            QMessageBox.warning(self, "Connection", "Failed to validate account access.")
+
+    def save_settings(self) -> None:
+        self._sync_settings_from_form()
+        if self.connection_settings.save_local:
+            self.settings_store.save(self.connection_settings)
+            QMessageBox.information(self, "Settings", "Saved locally to config/settings.json")
+            self.logger.info("Settings saved to config/settings.json")
+        else:
+            QMessageBox.information(self, "Settings", "Local save disabled.")
+
+    def clear_settings_fields(self) -> None:
+        self.settings_tab.api_key_input.clear()
+        self.settings_tab.api_secret_input.clear()
+        self.logger.info("Settings cleared")
 
     def on_arm(self) -> None:
         self.state_machine.arm(self.connected)
@@ -475,19 +552,25 @@ class MainWindow(QMainWindow):
         self._update_ui_state()
 
     def on_start_cycle(self) -> None:
-        if self.market_tick.mid <= 0:
-            QMessageBox.warning(self, "No Price", "Waiting for market price.")
-            return
-        if self.market_tick.spread_bps > self.strategy_params.max_spread_bps:
-            QMessageBox.warning(self, "Spread Too High", "Spread guard blocked entry.")
+        if not self._entry_allowed():
+            QMessageBox.warning(self, "Guard", "Entry guards blocked the cycle start.")
             return
         started = self.state_machine.start_cycle()
         if not started:
             return
-        self.logger.info("Cycle started (simulation)")
+        entry = self.orderbook.vwap_for_notional(
+            self.strategy_params.sim_side, self.strategy_params.usd_notional
+        )
+        if not entry:
+            QMessageBox.warning(self, "Orderbook", "Insufficient depth for simulation.")
+            self.state_machine.stop()
+            return
+        self.sim_entry_price, self.sim_entry_qty = entry
+        self.sim_exit_price = None
+        self.sim_condition = "SIM ENTRY"
         self.cycle_start_time = datetime.now(timezone.utc)
-        self.entry_price_long = self.market_tick.mid
-        self.entry_price_short = self.market_tick.mid
+        self.logger.info("Cycle started (read-only simulation)")
+        self._update_sim_labels()
         self._update_ui_state()
 
     def on_stop(self) -> None:
@@ -501,30 +584,18 @@ class MainWindow(QMainWindow):
     def on_end_cycle(self) -> None:
         if self.state_machine.state != BotState.RUNNING:
             return
-        self.state_machine.finish_cycle()
-        self.logger.info("Cycle finished (dev)")
-        self.add_trade_row(
-            side="SIM",
-            entry_price=self.entry_price_long or self.market_tick.mid,
-            exit_price=self.market_tick.mid,
-            raw_bps=self._compute_raw_bps(self.entry_price_long, self.market_tick.mid),
-            fees_bps=self.strategy_params.fee_total_bps,
-            net_bps=self._compute_raw_bps(self.entry_price_long, self.market_tick.mid)
-            - self.strategy_params.fee_total_bps,
-            net_usd=0.0,
-            duration_s=self._elapsed_seconds(),
-            note="dev",
-        )
-        self.cooldown_timer.start(self.strategy_params.cooldown_s * 1000)
-        self._update_ui_state()
+        self._finish_sim_cycle(note="dev")
 
     def on_cooldown_complete(self) -> None:
         self.state_machine.end_cooldown()
         self._update_ui_state()
+        if self.strategy_params.auto_loop and self._entry_allowed():
+            self.on_start_cycle()
 
     def apply_params(self) -> None:
         self.strategy_params.order_mode = self.order_mode_combo.currentText()
-        self.strategy_params.usd_per_leg = self.usd_per_leg_spin.value()
+        self.strategy_params.sim_side = self.sim_side_combo.currentText()
+        self.strategy_params.usd_notional = self.usd_notional_spin.value()
         self.strategy_params.max_loss_bps = self.max_loss_spin.value()
         self.strategy_params.fee_total_bps = self.fee_spin.value()
         self.strategy_params.target_net_bps = self.target_net_spin.value()
@@ -534,6 +605,7 @@ class MainWindow(QMainWindow):
             self.direction_window_combo.currentText()
         )
         self.strategy_params.burst_volume_threshold = self.burst_volume_spin.value()
+        self.strategy_params.auto_loop = self.auto_loop_checkbox.isChecked()
         self.logger.info("Parameters applied")
         self._update_ui_state()
 
@@ -544,7 +616,8 @@ class MainWindow(QMainWindow):
 
     def _sync_params_to_form(self) -> None:
         self.order_mode_combo.setCurrentText(self.strategy_params.order_mode)
-        self.usd_per_leg_spin.setValue(self.strategy_params.usd_per_leg)
+        self.sim_side_combo.setCurrentText(self.strategy_params.sim_side)
+        self.usd_notional_spin.setValue(self.strategy_params.usd_notional)
         self.max_loss_spin.setValue(self.strategy_params.max_loss_bps)
         self.fee_spin.setValue(self.strategy_params.fee_total_bps)
         self.target_net_spin.setValue(self.strategy_params.target_net_bps)
@@ -554,6 +627,7 @@ class MainWindow(QMainWindow):
             str(self.strategy_params.direction_detect_window_ticks)
         )
         self.burst_volume_spin.setValue(self.strategy_params.burst_volume_threshold)
+        self.auto_loop_checkbox.setChecked(self.strategy_params.auto_loop)
 
     def on_price_update(self, payload: dict) -> None:
         self.market_tick.bid = payload["bid"]
@@ -563,7 +637,13 @@ class MainWindow(QMainWindow):
         self.market_tick.event_time = payload["event_time"]
         self.market_tick.rx_time = payload["rx_time"]
         self._update_market_labels()
-        self._update_cycle_metrics()
+        self._update_ui_state()
+
+    def on_depth_update(self, payload: dict) -> None:
+        self.orderbook.apply_snapshot(payload["bids"], payload["asks"])
+        self.orderbook_ready = self.orderbook.is_ready()
+        if self.state_machine.state == BotState.RUNNING:
+            self._update_simulation_metrics()
         self._update_ui_state()
 
     def on_ws_status(self, status: str) -> None:
@@ -588,6 +668,14 @@ class MainWindow(QMainWindow):
             return
         self.on_price_update(data)
 
+    def load_orderbook_snapshot(self) -> None:
+        depth = self.rest_client.get_depth("BTCUSDT", limit=20)
+        if not depth:
+            self.logger.warning("Failed to load orderbook snapshot")
+            return
+        self.orderbook.apply_snapshot(depth.get("bids", []), depth.get("asks", []))
+        self.orderbook_ready = self.orderbook.is_ready()
+
     def start_ws_thread(self) -> None:
         if self.ws_thread.isRunning():
             return
@@ -598,6 +686,39 @@ class MainWindow(QMainWindow):
             self.ws_thread.stop()
             self.ws_thread.wait(2000)
 
+    def refresh_balance(self) -> None:
+        if not self.connected:
+            return
+        if self.connection_settings.mode == ConnectionMode.FUTURES:
+            balance = self.rest_client.get_futures_balance()
+            if not balance:
+                self.logger.warning("Failed to refresh futures balance")
+                return
+            usdt = next((item for item in balance if item.get("asset") == "USDT"), None)
+            if usdt:
+                available = float(usdt.get("availableBalance", 0.0))
+                total = float(usdt.get("balance", 0.0))
+                self.balance_label.setText(
+                    f"USDT Balance: {available:,.2f} free / {total:,.2f} total"
+                )
+        else:
+            account = self.rest_client.get_spot_account()
+            if not account:
+                self.logger.warning("Failed to refresh spot account")
+                return
+            self._update_balance_from_spot_account(account)
+        self.last_balance_update = datetime.now(timezone.utc)
+        self._update_ui_state()
+
+    def _update_balance_from_spot_account(self, account: dict) -> None:
+        balances = account.get("balances", [])
+        usdt = next((item for item in balances if item.get("asset") == "USDT"), None)
+        if usdt:
+            free = float(usdt.get("free", 0.0))
+            locked = float(usdt.get("locked", 0.0))
+            total = free + locked
+            self.balance_label.setText(f"USDT Balance: {free:,.2f} free / {total:,.2f} total")
+
     def _update_market_labels(self) -> None:
         self.mid_label.setText(f"{self.market_tick.mid:,.2f}")
         self.bid_label.setText(f"Bid: {self.market_tick.bid:,.2f}")
@@ -606,19 +727,73 @@ class MainWindow(QMainWindow):
         now = datetime.now(timezone.utc)
         age_ms = (now - self.market_tick.rx_time).total_seconds() * 1000
         self.tick_age_label.setText(f"Tick age: {age_ms:.0f} ms")
+        self.card_tick_age_label.setText(f"Tick age: {age_ms:.0f} ms")
         self.last_update_label.setText(
             f"Last update: {self.market_tick.rx_time.strftime('%H:%M:%S.%f')[:-3]}"
         )
 
-    def _update_cycle_metrics(self) -> None:
-        if self.state_machine.state == BotState.RUNNING:
-            raw_long = self._compute_raw_bps(self.entry_price_long, self.market_tick.mid)
-            raw_short = self._compute_raw_bps(self.entry_price_short, self.market_tick.mid)
-            self.raw_long_label.setText(f"raw_bps_long: {raw_long:.2f}")
-            self.raw_short_label.setText(f"raw_bps_short: {raw_short:.2f}")
-            net = max(raw_long, raw_short) - self.strategy_params.fee_total_bps
-            self.net_bps_label.setText(f"net_bps: {net:.2f}")
-        self._update_state_labels()
+    def _update_simulation_metrics(self) -> None:
+        if not self.sim_entry_price or not self.sim_entry_qty:
+            return
+        exit_side = "SELL" if self.strategy_params.sim_side == "BUY" else "BUY"
+        exit_price = self.orderbook.vwap_for_qty(exit_side, self.sim_entry_qty)
+        if not exit_price:
+            return
+        self.sim_exit_price = exit_price
+        if self.strategy_params.sim_side == "BUY":
+            raw_bps = (exit_price / self.sim_entry_price - 1) * 10_000
+        else:
+            raw_bps = (self.sim_entry_price / exit_price - 1) * 10_000
+        net_bps = raw_bps - self.strategy_params.fee_total_bps
+        self.sim_raw_bps = raw_bps
+        self.sim_net_bps = net_bps
+        if net_bps >= self.strategy_params.target_net_bps:
+            self._finish_sim_cycle(note="SIM TARGET")
+            return
+        if raw_bps <= -self.strategy_params.max_loss_bps:
+            self._finish_sim_cycle(note="SIM STOP")
+            return
+        self.sim_condition = "SIM RUNNING"
+        self._update_sim_labels()
+
+    def _finish_sim_cycle(self, note: str) -> None:
+        if self.state_machine.state != BotState.RUNNING:
+            return
+        self.state_machine.finish_cycle()
+        entry = self.sim_entry_price or self.market_tick.mid
+        exit_price = self.sim_exit_price or self.market_tick.mid
+        raw_bps = self.sim_raw_bps or 0.0
+        net_bps = self.sim_net_bps or raw_bps - self.strategy_params.fee_total_bps
+        net_usd = (net_bps / 10_000) * self.strategy_params.usd_notional
+        self.add_trade_row(
+            side=self.strategy_params.sim_side,
+            entry_price=entry,
+            exit_price=exit_price,
+            raw_bps=raw_bps,
+            fees_bps=self.strategy_params.fee_total_bps,
+            net_bps=net_bps,
+            net_usd=net_usd,
+            duration_s=self._elapsed_seconds(),
+            note=note,
+        )
+        self.sim_condition = note
+        self.cooldown_timer.start(self.strategy_params.cooldown_s * 1000)
+        self.logger.info(f"Cycle finished ({note})")
+        self._update_sim_labels()
+        self._update_ui_state()
+
+    def _update_sim_labels(self) -> None:
+        self.sim_side_label.setText(f"sim_side: {self.strategy_params.sim_side}")
+        self.sim_notional_label.setText(f"usd_notional: {self.strategy_params.usd_notional:.2f}")
+        entry = "—" if not self.sim_entry_price else f"{self.sim_entry_price:,.2f}"
+        exit_mark = "—" if not self.sim_exit_price else f"{self.sim_exit_price:,.2f}"
+        self.sim_entry_label.setText(f"entry_price: {entry}")
+        self.sim_exit_label.setText(f"exit_mark_price: {exit_mark}")
+        raw = "—" if self.sim_raw_bps is None else f"{self.sim_raw_bps:.2f}"
+        net = "—" if self.sim_net_bps is None else f"{self.sim_net_bps:.2f}"
+        self.sim_raw_label.setText(f"raw_bps: {raw}")
+        self.sim_net_label.setText(f"net_bps: {net}")
+        self.sim_condition_label.setText(f"condition: {self.sim_condition}")
 
     def _update_state_labels(self) -> None:
         self.state_label.setText(f"State: {self.state_machine.state.value}")
@@ -633,38 +808,40 @@ class MainWindow(QMainWindow):
         else:
             self.cycle_start_label.setText("start_time: —")
             self.cycle_elapsed_label.setText("elapsed_s: —")
-        self.winner_label.setText("winner_side: —")
-        self.loser_label.setText("loser_side: —")
 
     def _update_ui_state(self) -> None:
         connection_text = "CONNECTED" if self.connected else "DISCONNECTED"
         self.connection_label.setText(f"Connection: {connection_text}")
+        self.account_connection_label.setText(f"Connection: {connection_text}")
         if self.connected:
             self.connection_label.setStyleSheet("color: #27ae60;")
+            self.account_connection_label.setStyleSheet("color: #27ae60;")
         else:
             self.connection_label.setStyleSheet("color: #e74c3c;")
+            self.account_connection_label.setStyleSheet("color: #e74c3c;")
 
         if self.ws_status == "CONNECTED":
             data_status = "WS OK"
-            self.data_label.setStyleSheet("color: #27ae60;")
+            color = "color: #27ae60;"
         elif self.ws_status == "DEGRADED":
             data_status = "WS DEGRADED"
-            self.data_label.setStyleSheet("color: #f1c40f;")
+            color = "color: #f1c40f;"
         else:
             data_status = "HTTP"
-            self.data_label.setStyleSheet("color: #f1c40f;")
+            color = "color: #f1c40f;"
         self.data_label.setText(f"Data: {data_status}")
+        self.data_label.setStyleSheet(color)
+        self.account_data_label.setText(f"Data: {data_status}")
+        self.account_data_label.setStyleSheet(color)
 
-        self.connect_button.setEnabled(not self.connected)
-        self.disconnect_button.setEnabled(self.connected)
+        self.settings_tab.connect_button.setEnabled(not self.connected)
+        self.settings_tab.disconnect_button.setEnabled(self.connected)
         self.arm_button.setEnabled(self.connected)
         self.disarm_button.setEnabled(self.connected)
-        self.start_cycle_button.setEnabled(
-            self.state_machine.state == BotState.READY and self.connected
-        )
+        self.start_cycle_button.setEnabled(self._entry_allowed())
         self.stop_button.setEnabled(self.state_machine.state in {BotState.RUNNING, BotState.COOLDOWN})
 
-        self.price_source_label.setText("Price source: Auto (WS→HTTP)")
+        self.price_source_label.setText("Source: Auto (WS→HTTP)")
         self.fee_label.setText(f"fee_total_bps: {self.strategy_params.fee_total_bps:.2f}")
         self.target_label.setText(f"target_net_bps: {self.strategy_params.target_net_bps}")
         self.max_loss_label.setText(f"max_loss_bps: {self.strategy_params.max_loss_bps}")
@@ -673,18 +850,19 @@ class MainWindow(QMainWindow):
             f"min_volume_threshold: {self.strategy_params.burst_volume_threshold:.2f}"
         )
         self.cooldown_label.setText(f"cooldown_s: {self.strategy_params.cooldown_s}")
+        self.permissions_label.setText(f"Permissions: {self.account_permissions}")
+        if self.last_balance_update:
+            self.balance_updated_label.setText(
+                f"Updated: {self.last_balance_update.strftime('%H:%M:%S')}"
+            )
 
-        entry_allowed = (
-            self.state_machine.state == BotState.READY
-            and self.market_tick.spread_bps <= self.strategy_params.max_spread_bps
-        )
-        self.entry_allowed_label.setText(
-            f"entry allowed: {str(entry_allowed).lower()}"
-        )
+        entry_allowed = self._entry_allowed()
+        self.entry_allowed_label.setText(f"entry allowed: {str(entry_allowed).lower()}")
         self.entry_allowed_label.setStyleSheet(
             "color: #27ae60;" if entry_allowed else "color: #e74c3c;"
         )
         self._update_state_labels()
+        self._update_sim_labels()
 
     def append_log(self, message: str) -> None:
         filter_level = self.log_filter_combo.currentText()
@@ -696,23 +874,6 @@ class MainWindow(QMainWindow):
     def open_logs_folder(self) -> None:
         logs_path = Path("logs").resolve()
         QMessageBox.information(self, "Logs", f"Logs folder: {logs_path}")
-
-    def save_env_file(self) -> None:
-        env_path = Path(".env.local")
-        mode = self.connection_settings.mode.value
-        env_path.write_text(
-            "\n".join(
-                [
-                    f"BINANCE_API_KEY={self.connection_settings.api_key}",
-                    f"BINANCE_API_SECRET={self.connection_settings.api_secret}",
-                    f"BINANCE_MODE={mode}",
-                    f"BINANCE_LEVERAGE={self.connection_settings.leverage}",
-                ]
-            )
-            + "\n",
-            encoding="utf-8",
-        )
-        self.logger.info("Saved keys to .env.local")
 
     def add_trade_row(
         self,
@@ -757,11 +918,6 @@ class MainWindow(QMainWindow):
             note="debug",
         )
 
-    def _compute_raw_bps(self, entry: Optional[float], mid: float) -> float:
-        if not entry or entry <= 0:
-            return 0.0
-        return (mid / entry - 1) * 10_000
-
     def _elapsed_seconds(self) -> float:
         if not self.cycle_start_time:
             return 0.0
@@ -770,8 +926,74 @@ class MainWindow(QMainWindow):
     def _initialize_defaults(self) -> None:
         self._sync_params_to_form()
         self.cycle_start_time = None
-        self.entry_price_long = None
-        self.entry_price_short = None
+        self.sim_entry_price = None
+        self.sim_entry_qty = None
+        self.sim_exit_price = None
+        self.sim_raw_bps = None
+        self.sim_net_bps = None
+
+    def _sync_settings_from_form(self) -> None:
+        self.connection_settings.api_key = self.settings_tab.api_key_input.text().strip()
+        self.connection_settings.api_secret = self.settings_tab.api_secret_input.text().strip()
+        self.connection_settings.mode = (
+            ConnectionMode.FUTURES
+            if self.settings_tab.mode_futures.isChecked()
+            else ConnectionMode.MARGIN
+        )
+        self.connection_settings.leverage = int(self.settings_tab.leverage_combo.currentText()[0])
+        self.connection_settings.save_local = self.settings_tab.save_checkbox.isChecked()
+
+    def _load_settings_into_form(self) -> None:
+        self.settings_tab.api_key_input.setText(self.connection_settings.api_key)
+        self.settings_tab.api_secret_input.setText(self.connection_settings.api_secret)
+        if self.connection_settings.mode == ConnectionMode.FUTURES:
+            self.settings_tab.mode_futures.setChecked(True)
+        else:
+            self.settings_tab.mode_margin.setChecked(True)
+        self.settings_tab.leverage_combo.setCurrentText(f"{self.connection_settings.leverage}x")
+        self.settings_tab.save_checkbox.setChecked(self.connection_settings.save_local)
+        self.on_mode_changed()
+
+    def _validate_account_access(self, test_only: bool = False) -> bool:
+        if self.connection_settings.mode == ConnectionMode.FUTURES:
+            account = self.rest_client.get_futures_account()
+            if not account:
+                self._handle_connection_error("Futures account access denied")
+                return False
+            balance = self.rest_client.get_futures_balance()
+            if not balance:
+                self._handle_connection_error("Futures balance unavailable")
+                return False
+            self.account_permissions = "FUTURES OK"
+            if not test_only:
+                self.refresh_balance()
+            return True
+
+        account = self.rest_client.get_spot_account()
+        if not account:
+            self._handle_connection_error("Spot account access denied")
+            return False
+        can_trade = account.get("canTrade")
+        if can_trade is False:
+            self.account_permissions = "READ-ONLY"
+        else:
+            self.account_permissions = "SPOT OK"
+        if not test_only:
+            self._update_balance_from_spot_account(account)
+        return True
+
+    def _handle_connection_error(self, message: str) -> None:
+        self.logger.error(message)
+        self.state_machine.set_error(message)
+        QMessageBox.warning(self, "Connection Error", message)
+
+    def _entry_allowed(self) -> bool:
+        return (
+            self.connected
+            and self.state_machine.state == BotState.READY
+            and self.orderbook_ready
+            and self.market_tick.spread_bps <= self.strategy_params.max_spread_bps
+        )
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
