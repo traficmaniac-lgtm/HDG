@@ -62,6 +62,7 @@ class BotStateMachine:
             BotState.CUTTING,
             BotState.RIDING,
             BotState.EXITING,
+            BotState.ERROR,
         }:
             self.state = BotState.COOLDOWN
             self.active_cycle = False

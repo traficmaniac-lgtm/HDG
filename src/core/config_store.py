@@ -5,7 +5,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
-from src.core.models import ConnectionMode, ConnectionSettings
+from src.core.models import ConnectionMode, ConnectionSettings, StrategyParams
 
 
 class SettingsStore:
@@ -61,3 +61,24 @@ class SettingsStore:
             save_local=bool(payload.get("save_local", True)),
             live_enabled=bool(payload.get("live_enabled", False)),
         )
+
+
+class StrategyParamsStore:
+    def __init__(self, path: Path | None = None) -> None:
+        self.path = path or Path("config/strategy_params.json")
+
+    def load_strategy_params(self) -> tuple[StrategyParams, str]:
+        if not self.path.exists():
+            return StrategyParams(), "BTCUSDT"
+        data = json.loads(self.path.read_text(encoding="utf-8"))
+        params = StrategyParams(**data.get("strategy_params", {}))
+        symbol = str(data.get("symbol", "BTCUSDT"))
+        return params, symbol
+
+    def save_strategy_params(self, params: StrategyParams, symbol: str) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "strategy_params": asdict(params),
+            "symbol": symbol,
+        }
+        self.path.write_text(json.dumps(payload, indent=2), encoding="utf-8")

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Deque, Optional
 
@@ -29,6 +29,70 @@ class CycleSnapshot:
     loser_net_bps: Optional[float] = None
     reason: Optional[str] = None
     ws_age_ms: Optional[float] = None
+    http_age_ms: Optional[float] = None
+    effective_source: Optional[str] = None
+
+
+@dataclass
+class DataRouter:
+    ws_fresh_ms: int = 500
+    http_fresh_ms: int = 1200
+    allow_http_fallback: bool = True
+    last_ws_tick: Optional[dict[str, Any]] = None
+    last_http_tick: Optional[dict[str, Any]] = None
+    last_effective_tick: Optional[dict[str, Any]] = None
+    last_effective_source: str = "NONE"
+    last_source_change_ts: float = field(default_factory=time.monotonic)
+
+    def update_tick(self, payload: dict[str, Any]) -> None:
+        source = str(payload.get("source", "WS"))
+        rx_time_ms = payload.get("rx_time_ms")
+        if rx_time_ms is None:
+            rx_time_ms = time.monotonic() * 1000
+            payload["rx_time_ms"] = rx_time_ms
+        if source == "WS":
+            self.last_ws_tick = payload
+        elif source == "HTTP":
+            self.last_http_tick = payload
+        self._update_effective_tick()
+
+    def ws_age_ms(self) -> float:
+        if not self.last_ws_tick:
+            return 9999.0
+        rx_time_ms = self.last_ws_tick.get("rx_time_ms")
+        if isinstance(rx_time_ms, (int, float)):
+            return max(0.0, time.monotonic() * 1000 - rx_time_ms)
+        return 9999.0
+
+    def http_age_ms(self) -> float:
+        if not self.last_http_tick:
+            return 9999.0
+        rx_time_ms = self.last_http_tick.get("rx_time_ms")
+        if isinstance(rx_time_ms, (int, float)):
+            return max(0.0, time.monotonic() * 1000 - rx_time_ms)
+        return 9999.0
+
+    def effective_source(self) -> str:
+        ws_age = self.ws_age_ms()
+        if self.last_ws_tick and ws_age <= self.ws_fresh_ms:
+            return "WS"
+        http_age = self.http_age_ms()
+        if self.allow_http_fallback and self.last_http_tick and http_age <= self.http_fresh_ms:
+            return "HTTP"
+        return "NONE"
+
+    def effective_tick(self) -> Optional[dict[str, Any]]:
+        source = self.effective_source()
+        if source == "WS":
+            return self.last_ws_tick
+        if source == "HTTP":
+            return self.last_http_tick
+        return None
+
+    def _update_effective_tick(self) -> None:
+        source = self.effective_source()
+        self.last_effective_source = source
+        self.last_effective_tick = self.effective_tick()
 
 
 class DirectionalCycle:
@@ -50,10 +114,8 @@ class DirectionalCycle:
         self._emit_trade_row = emit_trade_row
         self._emit_exposure = emit_exposure
 
+        self._data_router = DataRouter()
         self._last_tick: Optional[dict[str, Any]] = None
-        self._last_ws_tick: Optional[dict[str, Any]] = None
-        self._last_http_tick: Optional[dict[str, Any]] = None
-        self._last_tick_source: Optional[str] = None
         self._tick_history: Deque[tuple[float, float]] = deque(maxlen=500)
         self._prev_ws_mid: Optional[float] = None
         self._last_ws_mid: Optional[float] = None
@@ -75,11 +137,14 @@ class DirectionalCycle:
         self._loser_net_bps: Optional[float] = None
         self._last_reason: Optional[str] = None
         self._ws_age_ms: Optional[float] = None
+        self._http_age_ms: Optional[float] = None
+        self._effective_source: Optional[str] = None
         self._last_skip_log_ts = 0.0
         self._last_skip_reason: Optional[str] = None
         self._last_ride_log_ts = 0.0
         self._exposure_open = False
         self._last_data_log_source: Optional[str] = None
+        self._last_data_log_ts = 0.0
 
     @property
     def cycle_start(self) -> Optional[datetime]:
@@ -101,6 +166,8 @@ class DirectionalCycle:
             loser_net_bps=self._loser_net_bps,
             reason=self._last_reason,
             ws_age_ms=self._ws_age_ms,
+            http_age_ms=self._http_age_ms,
+            effective_source=self._effective_source,
         )
 
     @property
@@ -115,28 +182,23 @@ class DirectionalCycle:
 
     def update_tick(self, payload: dict[str, Any]) -> None:
         source = str(payload.get("source", "WS"))
-        rx_time_ms = payload.get("rx_time_ms")
-        if rx_time_ms is None:
-            rx_time_ms = time.monotonic() * 1000
-            payload["rx_time_ms"] = rx_time_ms
+        self._data_router.update_tick(payload)
         if source == "WS":
-            self._last_ws_tick = payload
-            self._last_tick = payload
             now = time.monotonic()
             mid = float(payload.get("mid", 0.0))
             if mid > 0:
                 self._prev_ws_mid = self._last_ws_mid if self._last_ws_mid is not None else mid
                 self._last_ws_mid = mid
                 self._tick_history.append((now, mid))
-            if self._state_machine.state == BotState.DETECTING:
-                self._evaluate_detecting()
-            elif self._state_machine.state == BotState.RIDING:
-                self._evaluate_riding()
-        else:
-            self._last_http_tick = payload
-        self._ws_age_ms = self._data_stale_ms()
-        self._last_tick_source = self._current_data_source()
+        self._last_tick = self._data_router.last_effective_tick
+        self._ws_age_ms = self._data_router.ws_age_ms()
+        self._http_age_ms = self._data_router.http_age_ms()
+        self._effective_source = self._data_router.last_effective_source
         self._maybe_log_data_source()
+        if self._state_machine.state == BotState.DETECTING:
+            self._evaluate_detecting()
+        elif self._state_machine.state == BotState.RIDING:
+            self._evaluate_riding()
 
     def attempt_entry(self) -> None:
         self._check_timeouts()
@@ -145,7 +207,7 @@ class DirectionalCycle:
             return
         if self._state_machine.state != BotState.ARMED:
             return
-        if not self._last_ws_tick and not self._last_http_tick:
+        if not self._data_router.last_ws_tick and not self._data_router.last_http_tick:
             self._log_skip("no_tick")
             return
         if not self._filters.step_size or not self._filters.min_qty:
@@ -180,7 +242,7 @@ class DirectionalCycle:
     def _start_cycle(self) -> None:
         if not self._state_machine.start_cycle():
             return
-        tick = self._last_ws_tick or self._last_tick or {}
+        tick = self._data_router.last_ws_tick or self._last_tick or {}
         self._cycle_start = datetime.now(timezone.utc)
         self._entry_mid = float(tick.get("mid", 0.0))
         self._entry_qty = None
@@ -199,14 +261,15 @@ class DirectionalCycle:
         self._entry_tick_count = len(self._tick_history)
         self._last_reason = None
         self._emit_log("TRADE", "INFO", "ENTER cycle", cycle_id=self._state_machine.cycle_id)
+        self._emit_log("STATE", "INFO", "ENTER_START", cycle_id=self._state_machine.cycle_id)
         if not self._enter_hedge():
             return
         self._state_machine.state = BotState.DETECTING
         self._detect_start_ts = time.monotonic()
-        self._emit_log("TRADE", "INFO", "DETECT start", cycle_id=self._state_machine.cycle_id)
+        self._emit_log("STATE", "INFO", "DETECT_START", cycle_id=self._state_machine.cycle_id)
 
     def _enter_hedge(self) -> bool:
-        tick = self._last_ws_tick or {}
+        tick = self._data_router.last_ws_tick or {}
         mid = float(tick.get("mid", 0.0))
         bid = float(tick.get("bid", 0.0))
         ask = float(tick.get("ask", 0.0))
@@ -237,7 +300,6 @@ class DirectionalCycle:
             )
             if not sell_order:
                 self._log_partial("partial_hedge_entry", qty)
-                self._set_error("partial_hedge_entry")
                 return False
             buy_order = self._place_order("BUY", qty, buy_mode, price=buy_price)
         except Exception as exc:
@@ -248,7 +310,6 @@ class DirectionalCycle:
                 error=str(exc),
             )
             self._emergency_flatten(reason="enter_exception")
-            self._set_error("partial_hedge_entry")
             return False
         buy_id = buy_order.get("orderId") if buy_order else None
         sell_id = sell_order.get("orderId") if sell_order else None
@@ -290,6 +351,7 @@ class DirectionalCycle:
             sell_price=self._entry_short_price,
             qty=qty,
         )
+        self._emit_log("STATE", "INFO", "ENTER_RESULT", cycle_id=self._state_machine.cycle_id)
         return True
 
     def _evaluate_detecting(self) -> None:
@@ -327,6 +389,13 @@ class DirectionalCycle:
             winner=self._winner_side,
             loser=self._loser_side,
             detect_mid=f"{mid_now:.2f}",
+        )
+        self._emit_log(
+            "STATE",
+            "INFO",
+            "DETECT_WINNER",
+            cycle_id=self._state_machine.cycle_id,
+            winner=self._winner_side,
         )
         self._state_machine.state = BotState.CUTTING
         self._cut_loser()
@@ -378,6 +447,7 @@ class DirectionalCycle:
             loser_side=self._loser_side,
             exit_price=self._loser_exit_price,
         )
+        self._emit_log("STATE", "INFO", "CUT_DONE", cycle_id=self._state_machine.cycle_id)
         self._state_machine.state = BotState.RIDING
         self._evaluate_riding()
 
@@ -386,6 +456,9 @@ class DirectionalCycle:
             return
         if not self._last_tick or not self._entry_mid or not self._winner_side:
             return
+        effective_age_ms = self._data_router.ws_age_ms() if self._effective_source == "WS" else (
+            self._data_router.http_age_ms() if self._effective_source == "HTTP" else 9999.0
+        )
         tick = self._last_tick
         mid_now = float(tick.get("mid", 0.0))
         winner_raw_bps = self._calc_raw_bps(self._winner_side, self._entry_mid, mid_now)
@@ -402,7 +475,18 @@ class DirectionalCycle:
                 raw_bps=f"{winner_raw_bps:.2f}",
                 net_bps=f"{winner_net_bps:.2f}",
             )
+            self._emit_log(
+                "STATE",
+                "INFO",
+                "RIDE_UPDATE",
+                cycle_id=self._state_machine.cycle_id,
+                raw_bps=f"{winner_raw_bps:.2f}",
+                net_bps=f"{winner_net_bps:.2f}",
+            )
             self._last_ride_log_ts = now
+        if effective_age_ms > 1500:
+            self._exit_winner("data_stale")
+            return
         if winner_raw_bps <= -self._strategy.emergency_stop_bps:
             self._exit_winner("emergency_stop")
             return
@@ -461,17 +545,21 @@ class DirectionalCycle:
             exit_price=self._winner_exit_price,
             note=note,
         )
+        self._emit_log("STATE", "INFO", "EXIT_DONE", cycle_id=self._state_machine.cycle_id)
         self._emit_trade_summary(note=note)
         self._exposure_open = False
         self._emit_exposure(False)
         self._settle_borrow()
         self._state_machine.finish_cycle()
+        self._emit_log("STATE", "INFO", "CYCLE_DONE", cycle_id=self._state_machine.cycle_id)
 
     def _no_winner_exit(self, reason: str) -> None:
         self._emit_log("TRADE", "INFO", "DETECT no winner", reason=reason)
+        self._emit_log("STATE", "INFO", "DETECT_NO_WINNER", cycle_id=self._state_machine.cycle_id)
         self._emergency_flatten(reason=reason)
         self._last_reason = reason
         self._state_machine.finish_cycle()
+        self._emit_log("STATE", "INFO", "CYCLE_DONE", cycle_id=self._state_machine.cycle_id)
 
     def _log_partial(self, reason: str, qty: float) -> None:
         self._emit_log(
@@ -485,7 +573,8 @@ class DirectionalCycle:
         )
         self._last_reason = reason
         self._emergency_flatten(reason=reason)
-        self._set_error(reason)
+        self._state_machine.set_error(reason)
+        self._state_machine.finish_cycle()
 
     def _log_deal(self, order: dict[str, Any], tag: str) -> None:
         if not order:
@@ -560,7 +649,7 @@ class DirectionalCycle:
         return None
 
     def _compute_entry_metrics(self) -> dict[str, float | bool]:
-        tick = self._last_ws_tick or self._last_http_tick or {}
+        tick = self._data_router.last_ws_tick or self._data_router.last_http_tick or {}
         bid = float(tick.get("bid", 0.0))
         ask = float(tick.get("ask", 0.0))
         mid = float(tick.get("mid", 0.0))
@@ -572,9 +661,10 @@ class DirectionalCycle:
         impulse_bps = 0.0
         if self._prev_ws_mid and self._last_ws_mid and self._prev_ws_mid > 0:
             impulse_bps = abs(self._last_ws_mid - self._prev_ws_mid) / self._prev_ws_mid * 10_000
-        ws_age_ms = self._data_stale_ms()
-        data_source = self._current_data_source()
-        data_stale = ws_age_ms > 500 or data_source != "WS"
+        ws_age_ms = self._data_router.ws_age_ms()
+        http_age_ms = self._data_router.http_age_ms()
+        effective_source = self._data_router.effective_source()
+        data_stale = effective_source != "WS" or ws_age_ms > self._data_router.ws_fresh_ms
         return {
             "spread_bps": spread,
             "tick_rate": tick_rate,
@@ -583,15 +673,10 @@ class DirectionalCycle:
             "bid": bid,
             "ask": ask,
             "ws_age_ms": ws_age_ms,
+            "http_age_ms": http_age_ms,
+            "effective_source": effective_source,
             "data_stale": data_stale,
         }
-
-    def _data_stale_ms(self) -> float:
-        tick = self._last_ws_tick or {}
-        rx_time_ms = tick.get("rx_time_ms")
-        if isinstance(rx_time_ms, (int, float)):
-            return max(0.0, time.monotonic() * 1000 - rx_time_ms)
-        return 9999.0
 
     def _round_step(self, qty: float) -> float:
         step = self._filters.step_size
@@ -673,30 +758,30 @@ class DirectionalCycle:
         return self._execution.wait_for_fill(market_order.get("orderId"), timeout_s=3.0)
 
     def _current_data_source(self) -> str:
-        ws_age_ms = self._data_stale_ms()
-        if self._last_ws_tick and ws_age_ms <= 500:
-            return "WS"
-        if self._last_http_tick:
-            return "HTTP"
-        return "NONE"
+        return self._data_router.effective_source()
 
     def _maybe_log_data_source(self) -> None:
         source = self._current_data_source()
-        if self._last_data_log_source == source:
+        now = time.monotonic()
+        if self._last_data_log_source == source and now - self._last_data_log_ts < 5.0:
             return
         self._last_data_log_source = source
+        self._last_data_log_ts = now
         last_ws_time = None
         last_http_time = None
-        if self._last_ws_tick:
-            last_ws_time = self._last_ws_tick.get("rx_time")
-        if self._last_http_tick:
-            last_http_time = self._last_http_tick.get("rx_time")
+        if self._data_router.last_ws_tick:
+            last_ws_time = self._data_router.last_ws_tick.get("rx_time")
+        if self._data_router.last_http_tick:
+            last_http_time = self._data_router.last_http_tick.get("rx_time")
         self._emit_log(
             "INFO",
             "INFO",
-            "DATA source update",
+            "DATA effective_source",
             source=source,
-            ws_age_ms=self._data_stale_ms(),
+            ws_age_ms=self._data_router.ws_age_ms(),
+            http_age_ms=self._data_router.http_age_ms(),
+            ws_fresh_ms=self._data_router.ws_fresh_ms,
+            http_fresh_ms=self._data_router.http_fresh_ms,
             last_ws_tick_time=last_ws_time,
             last_http_tick_time=last_http_time,
         )
@@ -784,6 +869,7 @@ class DirectionalCycle:
             error=self._execution.last_error,
             error_code=self._execution.last_error_code,
         )
+        self._emit_log("STATE", "INFO", "EMERGENCY_FLATTEN", cycle_id=self._state_machine.cycle_id)
         self._exposure_open = False
         self._emit_exposure(False)
 
@@ -828,5 +914,9 @@ class DirectionalCycle:
             bid=f"{metrics['bid']:.2f}",
             ask=f"{metrics['ask']:.2f}",
             ws_age_ms=metrics["ws_age_ms"],
+            http_age_ms=metrics["http_age_ms"],
+            effective_source=metrics["effective_source"],
+            ws_fresh_ms=self._data_router.ws_fresh_ms,
+            http_fresh_ms=self._data_router.http_fresh_ms,
             data_stale=metrics["data_stale"],
         )

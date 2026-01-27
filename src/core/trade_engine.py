@@ -49,6 +49,8 @@ class TradeEngine(QObject):
             emit_exposure=self._emit_exposure_status,
         )
         self._watchdog_stop = threading.Event()
+        self._auto_loop = False
+        self._stop_requested = False
         self._heartbeat_lock = threading.Lock()
         self._ui_heartbeat = time.monotonic()
         self._watchdog_thread = threading.Thread(
@@ -197,16 +199,22 @@ class TradeEngine(QObject):
     def attempt_entry(self) -> None:
         if not self._connected or not self._margin_permission_ok:
             return
+        if not self._auto_loop or self._stop_requested:
+            return
         self._cycle.attempt_entry()
         self._emit_cycle_state()
 
     @Slot()
     def start_trading(self) -> None:
+        self._auto_loop = True
+        self._stop_requested = False
         self._cycle.arm()
         self._emit_cycle_state()
 
     @Slot()
     def stop(self) -> None:
+        self._auto_loop = False
+        self._stop_requested = True
         self._cycle.stop()
         self._emit_cycle_state()
 

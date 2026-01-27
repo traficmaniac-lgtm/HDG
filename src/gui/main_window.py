@@ -31,7 +31,7 @@ from PySide6.QtWidgets import (
 )
 
 from src.core.version import VERSION
-from src.core.config_store import SettingsStore
+from src.core.config_store import SettingsStore, StrategyParamsStore
 from src.core.logger import LogBus, setup_logger
 from src.core.models import ConnectionMode, ConnectionSettings, MarketTick, StrategyParams
 from src.core.state_machine import BotState, BotStateMachine
@@ -69,6 +69,7 @@ class MainWindow(QMainWindow):
 
         self.settings_store = SettingsStore()
         self.connection_settings = self.settings_store.load()
+        self.strategy_store = StrategyParamsStore()
         self.strategy_params = StrategyParams()
         self.state_machine = BotStateMachine()
         self.market_tick = MarketTick()
@@ -609,13 +610,25 @@ class MainWindow(QMainWindow):
             self.parameters_tab.burst_volume_spin.value()
         )
         self.strategy_params.auto_loop = self.parameters_tab.auto_loop_checkbox.isChecked()
+        self.strategy_store.save_strategy_params(
+            self.strategy_params, self.symbol_combo.currentText()
+        )
         self.log_bus.log("INFO", "INFO", "PARAMS applied")
+        self.log_bus.log(
+            "INFO",
+            "INFO",
+            "PARAMS saved",
+            path="config/strategy_params.json",
+        )
         self.request_set_strategy.emit(self.strategy_params.__dict__)
         self._update_ui_state()
 
     def reset_params(self) -> None:
         self.strategy_params = StrategyParams()
         self._sync_params_to_form()
+        self.strategy_store.save_strategy_params(
+            self.strategy_params, self.symbol_combo.currentText()
+        )
         self.request_set_strategy.emit(self.strategy_params.__dict__)
         self._update_ui_state()
 
@@ -1084,6 +1097,7 @@ class MainWindow(QMainWindow):
         return (datetime.now(timezone.utc) - self.cycle_start_time).total_seconds()
 
     def _initialize_defaults(self) -> None:
+        self._load_strategy_params()
         self._sync_params_to_form()
         self.cycle_start_time = None
         self.sim_entry_price = None
@@ -1091,6 +1105,15 @@ class MainWindow(QMainWindow):
         self.sim_exit_price = None
         self.sim_raw_bps = None
         self.sim_net_bps = None
+
+    def _load_strategy_params(self) -> None:
+        params, symbol = self.strategy_store.load_strategy_params()
+        self.strategy_params = params
+        if symbol:
+            index = self.symbol_combo.findText(symbol)
+            if index >= 0:
+                self.symbol_combo.setCurrentIndex(index)
+        self.log_bus.log("INFO", "INFO", "PARAMS loaded", path="config/strategy_params.json")
 
     def _sync_settings_from_form(self) -> None:
         self.connection_settings.api_key = self.settings_tab.api_key_input.text().strip()
