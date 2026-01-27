@@ -49,6 +49,7 @@ class DirectionalCycle:
         emit_log: Callable[..., None],
         emit_trade_row: TradeRowFn,
         emit_exposure: Callable[[bool], None],
+        on_not_authorized: Callable[[str], None],
     ) -> None:
         self._execution = execution
         self._state_machine = state_machine
@@ -57,6 +58,7 @@ class DirectionalCycle:
         self._emit_log = emit_log
         self._emit_trade_row = emit_trade_row
         self._emit_exposure = emit_exposure
+        self._on_not_authorized = on_not_authorized
 
         self._market_data = market_data
         self._last_tick: Optional[dict[str, Any]] = None
@@ -220,6 +222,20 @@ class DirectionalCycle:
 
     def emergency_flatten(self, reason: str) -> None:
         self._emergency_flatten(reason=reason)
+
+    def emergency_test(self) -> None:
+        self._execution.cancel_open_orders()
+        if self._abort_if_not_authorized("emergency_test_cancel"):
+            return
+        account = self._execution.get_margin_account()
+        if self._abort_if_not_authorized("emergency_test_account"):
+            return
+        self._emit_log(
+            "INFO",
+            "INFO",
+            "[EMERGENCY_TEST] ok",
+            account_loaded=bool(account),
+        )
 
     def _start_cycle(self) -> None:
         if not self._state_machine.start_cycle():
@@ -791,6 +807,32 @@ class DirectionalCycle:
             return qty
         return float(int(qty / step) * step)
 
+    def _normalize_qty(self, qty: float) -> float:
+        return max(self._round_step(qty), 0.0)
+
+    def _qty_ok(self, qty: float, mid: float) -> bool:
+        if qty <= 0:
+            return False
+        if self._filters.min_qty and qty < self._filters.min_qty:
+            return False
+        if self._filters.min_notional and mid > 0:
+            return qty * mid >= self._filters.min_notional
+        return True
+
+    def _abort_if_not_authorized(self, context: str) -> bool:
+        if self._execution.last_error_code != -1002:
+            return False
+        self._emit_log(
+            "ERROR",
+            "ERROR",
+            "API not authorized for margin request",
+            context=context,
+            error=self._execution.last_error,
+            error_code=self._execution.last_error_code,
+        )
+        self._on_not_authorized(context)
+        return True
+
     def _calc_raw_bps(self, side: str, from_mid: float, to_mid: float) -> float:
         if from_mid <= 0 or to_mid <= 0:
             return 0.0
@@ -829,7 +871,7 @@ class DirectionalCycle:
         side_effect_type: Optional[str] = None,
     ) -> Optional[dict[str, Any]]:
         time_in_force = "GTC" if order_mode == "aggressive_limit" else None
-        return self._execution.place_order(
+        order = self._execution.place_order(
             side,
             qty,
             order_mode,
@@ -837,6 +879,8 @@ class DirectionalCycle:
             side_effect_type=side_effect_type,
             time_in_force=time_in_force,
         )
+        self._abort_if_not_authorized("place_order")
+        return order
 
     def _wait_for_fill_with_fallback(
         self,
@@ -854,12 +898,16 @@ class DirectionalCycle:
             return fill
         if order_id:
             self._execution.cancel_order(int(order_id))
+            if self._abort_if_not_authorized("cancel_order"):
+                return None
         market_order = self._execution.place_order(
             side,
             qty,
             "market",
             side_effect_type=side_effect_type,
         )
+        if self._abort_if_not_authorized("place_order_fallback"):
+            return None
         if not market_order:
             return None
         return self._execution.wait_for_fill(market_order.get("orderId"), timeout_s=3.0)
@@ -941,9 +989,13 @@ class DirectionalCycle:
 
     def _has_open_exposure(self) -> bool:
         open_orders = self._execution.get_open_orders()
+        if self._abort_if_not_authorized("check_open_orders"):
+            return True
         if open_orders:
             return True
         margin_account = self._execution.get_margin_account()
+        if self._abort_if_not_authorized("check_margin_account"):
+            return True
         if not margin_account:
             return False
         assets = margin_account.get("userAssets", [])
@@ -963,40 +1015,87 @@ class DirectionalCycle:
 
     def _emergency_flatten(self, reason: str) -> None:
         self._last_reason = reason
-        self._execution.cancel_open_orders()
+        if self._abort_if_not_authorized("emergency_start"):
+            return
+        open_orders = self._execution.get_open_orders()
+        if self._abort_if_not_authorized("emergency_open_orders"):
+            return
+        for order in open_orders:
+            order_id = order.get("orderId")
+            if order_id:
+                self._execution.cancel_order(int(order_id))
+                if self._abort_if_not_authorized("emergency_cancel_order"):
+                    return
         margin_account = self._execution.get_margin_account() or {}
+        if self._abort_if_not_authorized("emergency_account_snapshot"):
+            return
         assets = margin_account.get("userAssets", [])
         btc = next((item for item in assets if item.get("asset") == "BTC"), None)
         usdt = next((item for item in assets if item.get("asset") == "USDT"), None)
-        if btc:
-            btc_free = float(btc.get("free", 0.0))
-            if btc_free > 0:
-                self._execution.place_order(
-                    "SELL",
-                    btc_free,
-                    "market",
-                )
-            btc_borrowed = float(btc.get("borrowed", 0.0))
-            if btc_borrowed > 0:
+        btc_free = float(btc.get("free", 0.0)) if btc else 0.0
+        btc_borrowed = float(btc.get("borrowed", 0.0)) if btc else 0.0
+        btc_net = float(btc.get("netAsset", 0.0)) if btc else 0.0
+        usdt_borrowed = float(usdt.get("borrowed", 0.0)) if usdt else 0.0
+        net_short_btc = max(btc_borrowed, -btc_net)
+        mid = float((self._market_data.get_last_effective_tick() or {}).get("mid", 0.0))
+        if btc_free > 0:
+            sell_qty = self._normalize_qty(btc_free)
+            if self._qty_ok(sell_qty, mid):
+                self._execution.place_order("SELL", sell_qty, "market")
+                if self._abort_if_not_authorized("emergency_sell"):
+                    return
+        if net_short_btc > 0:
+            buy_qty = self._normalize_qty(net_short_btc)
+            if self._qty_ok(buy_qty, mid):
                 self._execution.place_order(
                     "BUY",
-                    btc_borrowed,
+                    buy_qty,
                     "market",
                     side_effect_type="AUTO_REPAY",
                 )
-                self._execution.repay_asset("BTC", btc_borrowed)
-        if usdt:
-            usdt_borrowed = float(usdt.get("borrowed", 0.0))
-            if usdt_borrowed > 0:
-                self._execution.repay_asset("USDT", usdt_borrowed)
+                if self._abort_if_not_authorized("emergency_buy"):
+                    return
+        repay_snapshot = self._execution.get_margin_account() or {}
+        if self._abort_if_not_authorized("emergency_repay_snapshot"):
+            return
+        repay_assets = repay_snapshot.get("userAssets", [])
+        repay_btc = next((item for item in repay_assets if item.get("asset") == "BTC"), None)
+        repay_usdt = next((item for item in repay_assets if item.get("asset") == "USDT"), None)
+        repay_btc_borrowed = float(repay_btc.get("borrowed", 0.0)) if repay_btc else 0.0
+        repay_btc_free = float(repay_btc.get("free", 0.0)) if repay_btc else 0.0
+        repay_usdt_borrowed = float(repay_usdt.get("borrowed", 0.0)) if repay_usdt else 0.0
+        repay_usdt_free = float(repay_usdt.get("free", 0.0)) if repay_usdt else 0.0
+        if repay_btc_borrowed > 0 and repay_btc_free > 0:
+            repay_amount = min(repay_btc_borrowed, repay_btc_free)
+            self._execution.repay_asset("BTC", repay_amount)
+            if self._abort_if_not_authorized("emergency_repay_btc"):
+                return
+        if repay_usdt_borrowed > 0 and repay_usdt_free > 0:
+            repay_amount = min(repay_usdt_borrowed, repay_usdt_free)
+            self._execution.repay_asset("USDT", repay_amount)
+            if self._abort_if_not_authorized("emergency_repay_usdt"):
+                return
+        final_snapshot = self._execution.get_margin_account() or {}
+        if self._abort_if_not_authorized("emergency_final_snapshot"):
+            return
+        final_open_orders = self._execution.get_open_orders()
+        if self._abort_if_not_authorized("emergency_final_open_orders"):
+            return
+        final_assets = final_snapshot.get("userAssets", [])
+        final_btc = next((item for item in final_assets if item.get("asset") == "BTC"), None)
+        final_usdt = next((item for item in final_assets if item.get("asset") == "USDT"), None)
+        final_btc_borrowed = float(final_btc.get("borrowed", 0.0)) if final_btc else 0.0
+        final_btc_net = float(final_btc.get("netAsset", 0.0)) if final_btc else 0.0
+        final_usdt_borrowed = float(final_usdt.get("borrowed", 0.0)) if final_usdt else 0.0
         self._emit_log(
             "ERROR",
             "ERROR",
             "EMERGENCY FLATTEN",
             reason=reason,
-            btc_free=float(btc.get("free", 0.0)) if btc else 0.0,
-            btc_borrowed=float(btc.get("borrowed", 0.0)) if btc else 0.0,
-            usdt_borrowed=float(usdt.get("borrowed", 0.0)) if usdt else 0.0,
+            exposure_btc=final_btc_net,
+            borrowed_btc=final_btc_borrowed,
+            borrowed_usdt=final_usdt_borrowed,
+            open_orders_count=len(final_open_orders),
             error=self._execution.last_error,
             error_code=self._execution.last_error_code,
         )
@@ -1006,6 +1105,8 @@ class DirectionalCycle:
 
     def _settle_borrow(self) -> None:
         margin_account = self._execution.get_margin_account() or {}
+        if self._abort_if_not_authorized("settle_snapshot"):
+            return
         assets = margin_account.get("userAssets", [])
         btc = next((item for item in assets if item.get("asset") == "BTC"), None)
         usdt = next((item for item in assets if item.get("asset") == "USDT"), None)
@@ -1013,10 +1114,14 @@ class DirectionalCycle:
             btc_borrowed = float(btc.get("borrowed", 0.0))
             if btc_borrowed > 0:
                 self._execution.repay_asset("BTC", btc_borrowed)
+                if self._abort_if_not_authorized("settle_repay_btc"):
+                    return
         if usdt:
             usdt_borrowed = float(usdt.get("borrowed", 0.0))
             if usdt_borrowed > 0:
                 self._execution.repay_asset("USDT", usdt_borrowed)
+                if self._abort_if_not_authorized("settle_repay_usdt"):
+                    return
 
     def _check_timeouts(self) -> None:
         if self._state_machine.state == BotState.DETECTING:

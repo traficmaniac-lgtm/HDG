@@ -63,6 +63,7 @@ class MainWindow(QMainWindow):
     request_stop_cycle = Signal()
     request_start_trading = Signal()
     request_emergency_flatten = Signal()
+    request_emergency_test = Signal()
     request_set_strategy = Signal(dict)
     request_set_connection = Signal(dict)
     request_end_cooldown = Signal(bool)
@@ -323,6 +324,8 @@ class MainWindow(QMainWindow):
 
         self.emergency_button = QPushButton("ЗАКРЫТЬ ВСЁ")
         layout.addWidget(self.emergency_button)
+        self.emergency_test_button = QPushButton("Emergency Test")
+        layout.addWidget(self.emergency_test_button)
 
         self.exposure_label = QLabel("позиция: нет")
         self.exposure_label.setStyleSheet("color: #8c8c8c;")
@@ -513,6 +516,7 @@ class MainWindow(QMainWindow):
         self.start_cycle_button.clicked.connect(self.on_start_cycle)
         self.stop_button.clicked.connect(self.on_stop)
         self.emergency_button.clicked.connect(self.on_emergency_flatten)
+        self.emergency_test_button.clicked.connect(self.on_emergency_test)
         self.dev_end_cycle_button.clicked.connect(self.on_end_cycle)
         self.parameters_tab.apply_params_button.clicked.connect(self.apply_params)
         self.parameters_tab.reset_params_button.clicked.connect(self.reset_params)
@@ -534,6 +538,7 @@ class MainWindow(QMainWindow):
         self.request_stop_cycle.connect(self.trade_engine.stop)
         self.request_start_trading.connect(self.trade_engine.start_trading)
         self.request_emergency_flatten.connect(self.trade_engine.emergency_flatten)
+        self.request_emergency_test.connect(self.trade_engine.emergency_test)
         self.request_set_strategy.connect(self.trade_engine.set_strategy)
         self.request_set_connection.connect(self.trade_engine.set_connection)
         self.request_end_cooldown.connect(self.trade_engine.end_cooldown)
@@ -614,6 +619,9 @@ class MainWindow(QMainWindow):
 
     def on_emergency_flatten(self) -> None:
         self.request_emergency_flatten.emit()
+
+    def on_emergency_test(self) -> None:
+        self.request_emergency_test.emit()
 
     def on_end_cycle(self) -> None:
         if not self.state_machine.active_cycle:

@@ -29,6 +29,14 @@ class BinanceMarginExecution:
     def last_error_code(self) -> Optional[int]:
         return self._client.last_error_code
 
+    @property
+    def last_error_path(self) -> Optional[str]:
+        return self._client.last_error_path
+
+    @property
+    def last_error_params(self) -> Optional[dict[str, Any]]:
+        return self._client.last_error_params
+
     def get_margin_account(self) -> Optional[dict[str, Any]]:
         return self._client.get_margin_account()
 
