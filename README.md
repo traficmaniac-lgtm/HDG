@@ -1,14 +1,13 @@
-# Directional Hedge Scalper — v0.3.5 (Cross Margin + Hedge Scalping)
+# Directional Hedge Scalper — v0.3.9 (Cross Margin + Hedge Scalping)
 
-This repository contains the v0.3.5 GUI for the Directional Hedge Scalper. The bot runs a full hedge scalping cycle on Cross Margin when **LIVE ENABLED** is turned on.
+This repository contains the v0.3.9 GUI for the Directional Hedge Scalper. The bot runs a full hedge scalping cycle on Cross Margin when **LIVE ENABLED** is turned on.
 
-## What’s new in v0.3.5
+## What’s new in v0.3.9
 
-- Full directional hedge scalping cycle: BUY + SELL market entry, cut the loser fast, hold the winner to target.
-- Raw WS impulse calculation (no early rounding) with tick-rate gating to avoid false zeroes.
-- Impulse filter can degrade after grace to prevent endless waiting.
-- Auto-loop cycle support with cooldown timers and max cycles.
-- GUI localized to Russian.
+- Strict single-flight cycle enforcement (no duplicate entries while a cycle is active).
+- Cycle-level client order IDs with deterministic DHS-{symbol}-{cycle_id}-{leg}-{phase} tags.
+- Guarded cooldown/flatten transitions with flat-position checks before re-arming.
+- Trading tab status fields for inflight flags, open orders, and margin position snapshot.
 
 ## Requirements
 
@@ -25,7 +24,7 @@ pip install -r requirements.txt
 python -m src.app.main
 ```
 
-## 10 cycles smoke test (v0.3.5)
+## 10 cycles smoke test (v0.3.9)
 
 1. Open the GUI and set **Max cycles** to `10` (next to **СТАРТ**).
 2. In **Параметры**, enable **Авто-цикл** and apply settings.

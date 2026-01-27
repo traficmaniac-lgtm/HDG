@@ -101,6 +101,12 @@ class CycleTelemetry:
     cycle_id: int = 0
     state: str = "IDLE"
     active_cycle: bool = False
+    inflight_entry: bool = False
+    inflight_exit: bool = False
+    open_orders_count: int = 0
+    pos_long_qty: float = 0.0
+    pos_short_qty: float = 0.0
+    last_action: Optional[str] = None
     started_at: Optional[datetime] = None
     duration_s: Optional[float] = None
     nominal_usd: float = 0.0
@@ -142,6 +148,12 @@ class CycleViewModel:
     state: str
     cycle_id: int
     active_cycle: bool
+    inflight_entry: bool
+    inflight_exit: bool
+    open_orders_count: int
+    pos_long_qty: float
+    pos_short_qty: float
+    last_action: Optional[str]
     start_ts: Optional[datetime]
     duration_s: Optional[float]
     entry_mid: Optional[float]

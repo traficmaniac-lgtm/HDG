@@ -118,6 +118,12 @@ class MainWindow(QMainWindow):
         self.http_age_ms: Optional[float] = None
         self.data_stale = True
         self.waiting_for_data = False
+        self.inflight_entry = False
+        self.inflight_exit = False
+        self.open_orders_count = 0
+        self.pos_long_qty = 0.0
+        self.pos_short_qty = 0.0
+        self.last_action: Optional[str] = None
 
         self.logger = setup_logger(Path("logs"))
         self.log_bus = LogBus(self.logger)
@@ -371,12 +377,24 @@ class MainWindow(QMainWindow):
         self.cycle_id_label = QLabel("цикл_id: 0")
         self.cycle_start_label = QLabel("старт: —")
         self.cycle_elapsed_label = QLabel("длительность_с: —")
+        self.inflight_entry_label = QLabel("inflight_entry: false")
+        self.inflight_exit_label = QLabel("inflight_exit: false")
+        self.open_orders_label = QLabel("open_orders: 0")
+        self.pos_long_label = QLabel("pos_long_qty: 0.0")
+        self.pos_short_label = QLabel("pos_short_qty: 0.0")
+        self.last_action_label = QLabel("last_action: —")
 
         state_layout.addWidget(self.state_label, 0, 0)
         state_layout.addWidget(self.active_cycle_label, 0, 1)
         state_layout.addWidget(self.cycle_id_label, 0, 2)
         state_layout.addWidget(self.cycle_start_label, 1, 0)
         state_layout.addWidget(self.cycle_elapsed_label, 1, 1)
+        state_layout.addWidget(self.inflight_entry_label, 2, 0)
+        state_layout.addWidget(self.inflight_exit_label, 2, 1)
+        state_layout.addWidget(self.open_orders_label, 2, 2)
+        state_layout.addWidget(self.pos_long_label, 3, 0)
+        state_layout.addWidget(self.pos_short_label, 3, 1)
+        state_layout.addWidget(self.last_action_label, 3, 2)
 
         self.bps_panel = QFrame()
         self.bps_panel.setFrameShape(QFrame.StyledPanel)
@@ -948,6 +966,12 @@ class MainWindow(QMainWindow):
         self.effective_age_ms = view_model.effective_age_ms
         self.data_stale = bool(view_model.data_stale)
         self.waiting_for_data = bool(view_model.waiting_for_data)
+        self.inflight_entry = bool(view_model.inflight_entry)
+        self.inflight_exit = bool(view_model.inflight_exit)
+        self.open_orders_count = int(view_model.open_orders_count)
+        self.pos_long_qty = float(view_model.pos_long_qty)
+        self.pos_short_qty = float(view_model.pos_short_qty)
+        self.last_action = view_model.last_action
         if self.waiting_for_data:
             self.sim_reason = "WAIT_DATA"
         self._update_ui_state()
@@ -1134,6 +1158,16 @@ class MainWindow(QMainWindow):
         else:
             self.cycle_start_label.setText("старт: —")
             self.cycle_elapsed_label.setText("длительность_с: —")
+        self.inflight_entry_label.setText(
+            f"inflight_entry: {str(self.inflight_entry).lower()}"
+        )
+        self.inflight_exit_label.setText(
+            f"inflight_exit: {str(self.inflight_exit).lower()}"
+        )
+        self.open_orders_label.setText(f"open_orders: {self.open_orders_count}")
+        self.pos_long_label.setText(f"pos_long_qty: {self.pos_long_qty:.6f}")
+        self.pos_short_label.setText(f"pos_short_qty: {self.pos_short_qty:.6f}")
+        self.last_action_label.setText(f"last_action: {self.last_action or '—'}")
 
     def _update_ui_state(self) -> None:
         connection_text = "ПОДКЛЮЧЕНО" if self.connected else "ОТКЛЮЧЕНО"
