@@ -5,10 +5,10 @@ import json
 import threading
 import time
 from datetime import datetime, timezone
-from typing import Optional
-
 import websockets
 from PySide6.QtCore import QThread, Signal
+
+from src.services.market_data import MarketDataService
 
 
 class MarketDataThread(QThread):
@@ -16,11 +16,12 @@ class MarketDataThread(QThread):
     depth_update = Signal(dict)
     status_update = Signal(str)
 
-    def __init__(self, symbol: str = "btcusdt") -> None:
+    def __init__(self, symbol: str = "btcusdt", market_data: MarketDataService | None = None) -> None:
         super().__init__()
         self.symbol = symbol.lower()
         self._stop_event = threading.Event()
         self._status = "DISCONNECTED"
+        self._market_data = market_data
 
     def run(self) -> None:
         asyncio.run(self._runner())
@@ -85,6 +86,19 @@ class MarketDataThread(QThread):
                 "source": "WS",
             }
         )
+        if self._market_data:
+            self._market_data.update_tick(
+                {
+                    "bid": bid,
+                    "ask": ask,
+                    "mid": mid,
+                    "spread_bps": spread_bps,
+                    "event_time": event_time,
+                    "rx_time": now,
+                    "rx_time_ms": rx_time_ms,
+                    "source": "WS",
+                }
+            )
 
     def _handle_depth_update(self, data: dict) -> None:
         bids = data.get("b") or data.get("bids") or []

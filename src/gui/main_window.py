@@ -46,6 +46,7 @@ from src.gui.parameters_tab import ParametersTab
 from src.gui.settings_tab import SettingsTab
 from src.gui.widgets import make_card
 from src.services.orderbook import OrderBook
+from src.services.market_data import MarketDataService
 from src.services.ws_market import MarketDataThread
 
 DEBUG = os.getenv("DEBUG", "false").lower() == "true"
@@ -113,14 +114,15 @@ class MainWindow(QMainWindow):
         self.log_bus.entry.connect(self.on_log_entry)
         self.log_bus.log("INFO", "INFO", "APP start", version=self.version)
 
-        self.ws_thread = MarketDataThread("btcusdt")
+        self.market_data = MarketDataService()
+        self.ws_thread = MarketDataThread("btcusdt", market_data=self.market_data)
         self.ws_thread.price_update.connect(self.on_price_update)
         self.ws_thread.price_update.connect(self.request_on_tick)
         self.ws_thread.depth_update.connect(self.on_depth_update)
         self.ws_thread.status_update.connect(self.on_ws_status)
 
         self.engine_thread = QThread(self)
-        self.trade_engine = TradeEngine()
+        self.trade_engine = TradeEngine(market_data=self.market_data)
         self.trade_engine.moveToThread(self.engine_thread)
         self.engine_thread.start()
 
