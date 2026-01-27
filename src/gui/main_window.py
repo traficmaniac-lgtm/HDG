@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
     QFrame,
+    QFormLayout,
     QGridLayout,
     QHBoxLayout,
     QLabel,
