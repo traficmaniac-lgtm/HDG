@@ -96,7 +96,8 @@ class DirectionalCycle:
         self._last_non_impulse_skip_ts = 0.0
         self._last_impulse_block_warn_ts = 0.0
         self._last_impulse_degrade_log_ts = 0.0
-        self._ws_rx_times: Deque[float] = deque()
+        self._last_tick_rate_block_log_ts = 0.0
+        self._last_tickrate_force_log_ts = 0.0
         self._market_data.set_detect_window_ticks(self._strategy.detect_window_ticks)
 
     @property
@@ -146,13 +147,6 @@ class DirectionalCycle:
     def update_tick(self, payload: dict[str, Any]) -> None:
         source = str(payload.get("source", "WS"))
         if source == "WS":
-            rx_time_ms = payload.get("rx_time_ms")
-            if rx_time_ms is None:
-                rx_time_ms = time.monotonic() * 1000
-            self._ws_rx_times.append(float(rx_time_ms))
-            cutoff_ms = float(rx_time_ms) - 1000.0
-            while self._ws_rx_times and self._ws_rx_times[0] < cutoff_ms:
-                self._ws_rx_times.popleft()
             now = time.monotonic()
             mid = float(payload.get("mid", 0.0))
             if mid > 0:
@@ -733,10 +727,8 @@ class DirectionalCycle:
         mid = float(tick.get("mid", 0.0))
         spread = float(tick.get("spread_bps", 0.0))
         now_ms = time.monotonic() * 1000
-        cutoff_ms = now_ms - 1000.0
-        while self._ws_rx_times and self._ws_rx_times[0] < cutoff_ms:
-            self._ws_rx_times.popleft()
-        tick_rate = int(len(self._ws_rx_times))
+        rx_count_1s = self._market_data.get_ws_rx_count_1s(now_ms=now_ms)
+        tick_rate = rx_count_1s
         impulse_bps = 0.0
         ref_mid = 0.0
         delta_mid = 0.0
@@ -758,9 +750,27 @@ class DirectionalCycle:
         http_age_ms = snapshot.http_age_ms
         effective_source = snapshot.effective_source
         data_stale = snapshot.data_stale
+        ws_connected = self._market_data.is_ws_connected()
+        if (
+            ws_connected
+            and ws_age_ms is not None
+            and ws_age_ms < 500
+            and tick_rate == 0
+        ):
+            tick_rate = 1
+            now = time.monotonic()
+            if now - self._last_tickrate_force_log_ts >= 1.0:
+                self._last_tickrate_force_log_ts = now
+                self._emit_log(
+                    "INFO",
+                    "INFO",
+                    "[TICKRATE] forced_alive",
+                    ws_age_ms=ws_age_ms,
+                )
         return {
             "spread_bps": spread,
             "tick_rate": tick_rate,
+            "rx_count_1s": rx_count_1s,
             "impulse_bps": impulse_bps,
             "impulse_ready": impulse_ready,
             "ref_mid": ref_mid,
@@ -772,6 +782,7 @@ class DirectionalCycle:
             "http_age_ms": http_age_ms,
             "effective_source": effective_source,
             "data_stale": data_stale,
+            "ws_connected": ws_connected,
         }
 
     def _round_step(self, qty: float) -> float:
@@ -1013,10 +1024,14 @@ class DirectionalCycle:
 
     def _log_skip(self, reason: str) -> None:
         now = time.monotonic()
+        if reason == "tick_rate" and now - self._last_tick_rate_block_log_ts < 1.0:
+            return
         if reason == self._last_skip_reason and now - self._last_skip_log_ts < 0.5:
             return
         self._last_skip_log_ts = now
         self._last_skip_reason = reason
+        if reason == "tick_rate":
+            self._last_tick_rate_block_log_ts = now
         self._last_reason = reason
         self._waiting_for_data = reason == "data_stale"
         if reason not in {"impulse", "wait_ticks"}:
@@ -1066,6 +1081,8 @@ class DirectionalCycle:
             bid=f"{metrics['bid']:.2f}",
             ask=f"{metrics['ask']:.2f}",
             ws_age_ms=metrics["ws_age_ms"],
+            ws_connected=metrics["ws_connected"],
+            rx_count_1s=metrics["rx_count_1s"],
             http_age_ms=metrics["http_age_ms"],
             effective_source=metrics["effective_source"],
             ws_fresh_ms=self._market_data.ws_fresh_ms,
