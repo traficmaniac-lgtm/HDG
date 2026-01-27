@@ -58,10 +58,16 @@ class ParametersTab(QWidget):
         self.detect_timeout_spin.setRange(100, 5000)
         self.detect_timeout_spin.setSingleStep(50)
 
+        self.use_impulse_checkbox = QCheckBox("Использовать импульс-фильтр")
+
         self.impulse_min_spin = QDoubleSpinBox()
         self.impulse_min_spin.setRange(0.0, 50.0)
         self.impulse_min_spin.setDecimals(1)
         self.impulse_min_spin.setSingleStep(0.1)
+
+        self.impulse_grace_spin = QSpinBox()
+        self.impulse_grace_spin.setRange(0, 10_000)
+        self.impulse_grace_spin.setSingleStep(100)
 
         self.winner_threshold_spin = QDoubleSpinBox()
         self.winner_threshold_spin.setRange(0.0, 50.0)
@@ -93,7 +99,9 @@ class ParametersTab(QWidget):
         form.addRow("Макс. спред (bps)", self.max_spread_spin)
         form.addRow("Мин. тик-рейт (в сек)", self.min_tick_rate_spin)
         form.addRow("Таймаут детекта (мс)", self.detect_timeout_spin)
+        form.addRow("", self.use_impulse_checkbox)
         form.addRow("Импульс min (bps)", self.impulse_min_spin)
+        form.addRow("Импульс grace (мс)", self.impulse_grace_spin)
         form.addRow("Порог победителя (bps)", self.winner_threshold_spin)
         form.addRow("Аварийный стоп (bps)", self.emergency_stop_spin)
         form.addRow("Cooldown (сек)", self.cooldown_spin)

@@ -5,6 +5,7 @@ import json
 import threading
 import time
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 import websockets
 from PySide6.QtCore import QThread, Signal
 
@@ -62,12 +63,21 @@ class MarketDataThread(QThread):
         self._emit_status("DISCONNECTED")
 
     def _handle_book_ticker(self, data: dict) -> None:
-        bid = float(data.get("b", 0.0))
-        ask = float(data.get("a", 0.0))
-        if bid <= 0 or ask <= 0:
+        try:
+            bid_raw = Decimal(str(data.get("b", "0")))
+            ask_raw = Decimal(str(data.get("a", "0")))
+        except (InvalidOperation, TypeError):
             return
-        mid = (bid + ask) / 2
-        spread_bps = (ask - bid) / mid * 10_000
+        if bid_raw <= 0 or ask_raw <= 0:
+            return
+        mid_raw = (bid_raw + ask_raw) / Decimal("2")
+        if mid_raw <= 0:
+            return
+        spread_bps_raw = (ask_raw - bid_raw) / mid_raw * Decimal("10000")
+        bid = float(bid_raw)
+        ask = float(ask_raw)
+        mid = float(mid_raw)
+        spread_bps = float(spread_bps_raw)
         now = datetime.now(timezone.utc)
         rx_time_ms = time.monotonic() * 1000
         event_ts = data.get("E")
@@ -80,6 +90,10 @@ class MarketDataThread(QThread):
                 "ask": ask,
                 "mid": mid,
                 "spread_bps": spread_bps,
+                "bid_raw": bid_raw,
+                "ask_raw": ask_raw,
+                "mid_raw": mid_raw,
+                "spread_bps_raw": spread_bps_raw,
                 "event_time": event_time,
                 "rx_time": now,
                 "rx_time_ms": rx_time_ms,
@@ -93,6 +107,10 @@ class MarketDataThread(QThread):
                     "ask": ask,
                     "mid": mid,
                     "spread_bps": spread_bps,
+                    "bid_raw": bid_raw,
+                    "ask_raw": ask_raw,
+                    "mid_raw": mid_raw,
+                    "spread_bps_raw": spread_bps_raw,
                     "event_time": event_time,
                     "rx_time": now,
                     "rx_time_ms": rx_time_ms,

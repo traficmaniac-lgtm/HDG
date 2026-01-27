@@ -50,7 +50,7 @@ class TradeEngine(QObject):
             symbol_filters=self._symbol_filters,
             market_data=self._market_data,
             emit_log=self._emit_log,
-            emit_trade_row=self.trade_row.emit,
+            emit_trade_row=self._handle_trade_row,
             emit_exposure=self._emit_exposure_status,
         )
         self._cycle.update_data_mode(self._data_mode)
@@ -58,6 +58,8 @@ class TradeEngine(QObject):
         self._watchdog_stop = threading.Event()
         self._auto_loop = False
         self._stop_requested = False
+        self._cycles_done = 0
+        self._max_cycles = self._strategy.max_cycles
         self._heartbeat_lock = threading.Lock()
         self._ui_heartbeat = time.monotonic()
         self._watchdog_thread = threading.Thread(
@@ -85,6 +87,7 @@ class TradeEngine(QObject):
     def set_strategy(self, payload: dict) -> None:
         self._strategy = StrategyParams(**payload)
         self._cycle.update_strategy(self._strategy)
+        self._max_cycles = self._strategy.max_cycles
         self._emit_cycle_state()
 
     @Slot(dict)
@@ -101,7 +104,7 @@ class TradeEngine(QObject):
             symbol_filters=self._symbol_filters,
             market_data=self._market_data,
             emit_log=self._emit_log,
-            emit_trade_row=self.trade_row.emit,
+            emit_trade_row=self._handle_trade_row,
             emit_exposure=self._emit_exposure_status,
         )
         self._cycle.update_data_mode(self._data_mode)
@@ -233,6 +236,7 @@ class TradeEngine(QObject):
     def start_trading(self) -> None:
         self._auto_loop = True
         self._stop_requested = False
+        self._cycles_done = 0
         self._cycle.arm()
         self._emit_cycle_state()
 
@@ -285,6 +289,21 @@ class TradeEngine(QObject):
     def _emit_exposure_status(self, exposure_open: bool) -> None:
         exposure = exposure_open or self._margin_btc_free > 0 or self._margin_btc_borrowed > 0
         self.exposure_update.emit({"open_exposure": exposure})
+
+    def _handle_trade_row(self, payload: dict) -> None:
+        self.trade_row.emit(payload)
+        if payload.get("phase") != "cycle_summary":
+            return
+        self._cycles_done += 1
+        if self._max_cycles > 0 and self._cycles_done >= self._max_cycles:
+            self._emit_log(
+                "INFO",
+                "INFO",
+                "[ENGINE] max_cycles reached -> stop",
+                cycles_done=self._cycles_done,
+                max_cycles=self._max_cycles,
+            )
+            self.stop()
 
     def _watchdog_loop(self) -> None:
         while not self._watchdog_stop.is_set():

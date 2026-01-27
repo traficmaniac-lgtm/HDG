@@ -4,6 +4,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import replace
+from decimal import Decimal
 from typing import Any, Deque, Optional
 
 from src.core.models import MarketDataMode, MarketSnapshot
@@ -32,7 +33,9 @@ class MarketDataService:
         self._ws_fresh_streak = 0
         self._http_hold_until_ms = 0.0
         self._ws_connected = False
-        self._ws_mid_buffer: Deque[float] = deque(maxlen=5)
+        self._ws_mid_buffer: Deque[Decimal] = deque(maxlen=5)
+        self._prev_ws_mid_raw: Optional[Decimal] = None
+        self._last_ws_mid_raw: Optional[Decimal] = None
 
     def update_tick(self, payload: dict[str, Any]) -> None:
         source = str(payload.get("source", "WS"))
@@ -45,9 +48,13 @@ class MarketDataService:
             if source == "WS":
                 self._last_ws_tick = dict(payload)
                 self._snapshot.last_ws_tick_ms = float(rx_time_ms)
-                mid = float(payload.get("mid") or 0.0)
-                if mid > 0:
-                    self._ws_mid_buffer.append(mid)
+                mid_raw = payload.get("mid_raw")
+                if mid_raw is None:
+                    mid_raw = Decimal(str(payload.get("mid") or "0"))
+                if mid_raw > 0 and (not self._ws_mid_buffer or mid_raw != self._ws_mid_buffer[-1]):
+                    self._ws_mid_buffer.append(mid_raw)
+                    self._prev_ws_mid_raw = self._last_ws_mid_raw
+                    self._last_ws_mid_raw = mid_raw
             elif source == "HTTP":
                 self._last_http_tick = dict(payload)
                 self._snapshot.last_http_tick_ms = float(rx_time_ms)
@@ -72,7 +79,7 @@ class MarketDataService:
         with self._lock:
             return dict(self._last_ws_tick) if self._last_ws_tick else None
 
-    def get_ws_mid_buffer(self) -> list[float]:
+    def get_ws_mid_buffer(self) -> list[Decimal]:
         with self._lock:
             return list(self._ws_mid_buffer)
 
@@ -82,6 +89,10 @@ class MarketDataService:
             if self._ws_mid_buffer.maxlen == maxlen:
                 return
             self._ws_mid_buffer = deque(list(self._ws_mid_buffer)[-maxlen:], maxlen=maxlen)
+
+    def get_ws_mid_raws(self) -> tuple[Optional[Decimal], Optional[Decimal]]:
+        with self._lock:
+            return self._prev_ws_mid_raw, self._last_ws_mid_raw
 
     def get_last_http_tick(self) -> Optional[dict[str, Any]]:
         with self._lock:

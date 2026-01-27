@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QSpinBox,
     QSizePolicy,
     QTabWidget,
     QTableWidget,
@@ -313,6 +314,11 @@ class MainWindow(QMainWindow):
         self.stop_button = QPushButton("СТОП")
         cycle_layout.addWidget(self.start_cycle_button)
         cycle_layout.addWidget(self.stop_button)
+        self.max_cycles_spin = QSpinBox()
+        self.max_cycles_spin.setRange(0, 1000)
+        self.max_cycles_spin.setFixedWidth(80)
+        cycle_layout.addWidget(QLabel("Max cycles"))
+        cycle_layout.addWidget(self.max_cycles_spin)
         layout.addLayout(cycle_layout)
 
         self.emergency_button = QPushButton("ЗАКРЫТЬ ВСЁ")
@@ -583,6 +589,8 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Защита", "Нет доступа для старта авто-торговли.")
             return
         self.run_mode = True
+        self.strategy_params.max_cycles = self.max_cycles_spin.value()
+        self.request_set_strategy.emit(self.strategy_params.__dict__)
         self.strategy_store.save_strategy_params(
             self.strategy_params, self.symbol_combo.currentText()
         )
@@ -635,7 +643,11 @@ class MainWindow(QMainWindow):
         self.strategy_params.max_spread_bps = self.parameters_tab.max_spread_spin.value()
         self.strategy_params.min_tick_rate = self.parameters_tab.min_tick_rate_spin.value()
         self.strategy_params.detect_timeout_ms = self.parameters_tab.detect_timeout_spin.value()
+        self.strategy_params.use_impulse_filter = (
+            self.parameters_tab.use_impulse_checkbox.isChecked()
+        )
         self.strategy_params.impulse_min_bps = self.parameters_tab.impulse_min_spin.value()
+        self.strategy_params.impulse_grace_ms = self.parameters_tab.impulse_grace_spin.value()
         self.strategy_params.winner_threshold_bps = (
             self.parameters_tab.winner_threshold_spin.value()
         )
@@ -650,6 +662,7 @@ class MainWindow(QMainWindow):
             self.parameters_tab.burst_volume_spin.value()
         )
         self.strategy_params.auto_loop = self.parameters_tab.auto_loop_checkbox.isChecked()
+        self.strategy_params.max_cycles = self.max_cycles_spin.value()
         self.strategy_store.save_strategy_params(
             self.strategy_params, self.symbol_combo.currentText()
         )
@@ -685,7 +698,11 @@ class MainWindow(QMainWindow):
         self.parameters_tab.max_spread_spin.setValue(self.strategy_params.max_spread_bps)
         self.parameters_tab.min_tick_rate_spin.setValue(self.strategy_params.min_tick_rate)
         self.parameters_tab.detect_timeout_spin.setValue(self.strategy_params.detect_timeout_ms)
+        self.parameters_tab.use_impulse_checkbox.setChecked(
+            self.strategy_params.use_impulse_filter
+        )
         self.parameters_tab.impulse_min_spin.setValue(self.strategy_params.impulse_min_bps)
+        self.parameters_tab.impulse_grace_spin.setValue(self.strategy_params.impulse_grace_ms)
         self.parameters_tab.winner_threshold_spin.setValue(
             self.strategy_params.winner_threshold_bps
         )
@@ -698,12 +715,19 @@ class MainWindow(QMainWindow):
             self.strategy_params.burst_volume_threshold
         )
         self.parameters_tab.auto_loop_checkbox.setChecked(self.strategy_params.auto_loop)
+        self.max_cycles_spin.setValue(self.strategy_params.max_cycles)
 
     def on_price_update(self, payload: dict) -> None:
         self.market_tick.bid = payload["bid"]
         self.market_tick.ask = payload["ask"]
         self.market_tick.mid = payload["mid"]
         self.market_tick.spread_bps = payload["spread_bps"]
+        if "bid_raw" in payload:
+            self.market_tick.bid_raw = payload["bid_raw"]
+        if "ask_raw" in payload:
+            self.market_tick.ask_raw = payload["ask_raw"]
+        if "mid_raw" in payload:
+            self.market_tick.mid_raw = payload["mid_raw"]
         self.market_tick.event_time = payload["event_time"]
         self.market_tick.rx_time = payload["rx_time"]
         self._update_market_labels()
