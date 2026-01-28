@@ -20,7 +20,7 @@ from src.core.models import Settings
 
 class TradeSettingsDialog(QDialog):
     saved = Signal(
-        float, int, int, int, int, str, int, int, int, str, bool, str, bool, bool, float, float, float
+        float, int, int, int, int, str, int, int, int, str, bool, str, bool, float, float
     )
 
     def __init__(
@@ -35,51 +35,63 @@ class TradeSettingsDialog(QDialog):
         layout = QVBoxLayout(self)
         form = QFormLayout()
 
-        self.notional_input = QDoubleSpinBox()
-        self.notional_input.setRange(0.0, 1000000.0)
-        self.notional_input.setDecimals(2)
-        self.notional_input.setSingleStep(1.0)
-        self.notional_input.setValue(
-            float(getattr(settings, "nominal_usd", 10.0) or 0.0)
-            if settings
-            else 10.0
-        )
-        form.addRow("Номинал (USD)", self.notional_input)
+        order_header = QLabel("ОРДЕР")
+        order_header.setStyleSheet("font-weight: bold;")
+        form.addRow(order_header)
 
-        self.budget_mode_input = QCheckBox("Budget Mode")
-        self.budget_mode_input.setChecked(
-            bool(getattr(settings, "budget_mode_enabled", False)) if settings else False
+        self.order_quote_input = QDoubleSpinBox()
+        self.order_quote_input.setRange(0.0, 1_000_000_000.0)
+        self.order_quote_input.setDecimals(2)
+        self.order_quote_input.setSingleStep(1.0)
+        self.order_quote_input.setValue(
+            float(getattr(settings, "order_quote", 50.0) or 0.0) if settings else 50.0
         )
-        form.addRow("Budget Mode", self.budget_mode_input)
+        form.addRow("Размер ордера (USDT)", self.order_quote_input)
 
-        self.budget_quote_input = QDoubleSpinBox()
-        self.budget_quote_input.setRange(0.0, 1_000_000_000.0)
-        self.budget_quote_input.setDecimals(2)
-        self.budget_quote_input.setSingleStep(10.0)
-        self.budget_quote_input.setValue(
-            float(getattr(settings, "budget_quote", 1000.0) or 0.0)
-            if settings
-            else 1000.0
+        self.buy_ttl_input = QSpinBox()
+        self.buy_ttl_input.setRange(500, 20000)
+        self.buy_ttl_input.setSingleStep(100)
+        self.buy_ttl_input.setValue(
+            int(getattr(settings, "buy_ttl_ms", 2500) or 2500) if settings else 2500
         )
-        form.addRow("Budget (USDT)", self.budget_quote_input)
+        form.addRow("TTL входа BUY (мс)", self.buy_ttl_input)
 
-        self.usage_pct_input = QDoubleSpinBox()
-        self.usage_pct_input.setRange(0.50, 0.99)
-        self.usage_pct_input.setDecimals(2)
-        self.usage_pct_input.setSingleStep(0.01)
-        self.usage_pct_input.setValue(
-            float(getattr(settings, "usage_pct", 0.98) or 0.0) if settings else 0.98
+        self.buy_retry_input = QSpinBox()
+        self.buy_retry_input.setRange(0, 10)
+        self.buy_retry_input.setValue(
+            int(getattr(settings, "max_buy_retries", 3) or 0) if settings else 3
         )
-        form.addRow("Usage %", self.usage_pct_input)
+        form.addRow("Повторы входа BUY", self.buy_retry_input)
 
-        self.reserve_input = QDoubleSpinBox()
-        self.reserve_input.setRange(0.0, 1_000_000_000.0)
-        self.reserve_input.setDecimals(2)
-        self.reserve_input.setSingleStep(1.0)
-        self.reserve_input.setValue(
-            float(getattr(settings, "min_quote_reserve", 5.0) or 0.0) if settings else 5.0
+        self.order_type_input = QComboBox()
+        self.order_type_input.addItems(["LIMIT", "MARKET"])
+        current_order_type = str(getattr(settings, "order_type", "LIMIT") or "LIMIT").upper()
+        index = self.order_type_input.findText(current_order_type)
+        if index >= 0:
+            self.order_type_input.setCurrentIndex(index)
+        form.addRow("Тип ордера", self.order_type_input)
+
+        capital_header = QLabel("КАПИТАЛ")
+        capital_header.setStyleSheet("font-weight: bold;")
+        form.addRow(capital_header)
+
+        self.max_budget_input = QDoubleSpinBox()
+        self.max_budget_input.setRange(0.0, 1_000_000_000.0)
+        self.max_budget_input.setDecimals(2)
+        self.max_budget_input.setSingleStep(10.0)
+        self.max_budget_input.setValue(
+            float(getattr(settings, "max_budget", 1000.0) or 0.0) if settings else 1000.0
         )
-        form.addRow("Reserve (USDT)", self.reserve_input)
+        form.addRow("Максимальный бюджет (USDT)", self.max_budget_input)
+
+        self.budget_reserve_input = QDoubleSpinBox()
+        self.budget_reserve_input.setRange(0.0, 1_000_000_000.0)
+        self.budget_reserve_input.setDecimals(2)
+        self.budget_reserve_input.setSingleStep(1.0)
+        self.budget_reserve_input.setValue(
+            float(getattr(settings, "budget_reserve", 20.0) or 0.0) if settings else 20.0
+        )
+        form.addRow("Резерв (USDT)", self.budget_reserve_input)
 
         self.tick_offset_input = QSpinBox()
         self.tick_offset_input.setRange(0, 1000)
@@ -108,29 +120,6 @@ class TradeSettingsDialog(QDialog):
             int(getattr(settings, "cycle_count", 1) or 1) if settings else 1
         )
         form.addRow("Количество циклов", self.cycle_count_input)
-
-        self.order_type_input = QComboBox()
-        self.order_type_input.addItems(["LIMIT", "MARKET"])
-        current_order_type = str(getattr(settings, "order_type", "LIMIT") or "LIMIT").upper()
-        index = self.order_type_input.findText(current_order_type)
-        if index >= 0:
-            self.order_type_input.setCurrentIndex(index)
-        form.addRow("Тип ордера", self.order_type_input)
-
-        self.buy_ttl_input = QSpinBox()
-        self.buy_ttl_input.setRange(500, 20000)
-        self.buy_ttl_input.setSingleStep(100)
-        self.buy_ttl_input.setValue(
-            int(getattr(settings, "buy_ttl_ms", 2500) or 2500) if settings else 2500
-        )
-        form.addRow("TTL входа BUY (мс)", self.buy_ttl_input)
-
-        self.buy_retry_input = QSpinBox()
-        self.buy_retry_input.setRange(0, 10)
-        self.buy_retry_input.setValue(
-            int(getattr(settings, "max_buy_retries", 3) or 0) if settings else 3
-        )
-        form.addRow("Повторы входа (BUY)", self.buy_retry_input)
 
         self.exit_order_type_input = QComboBox()
         self.exit_order_type_input.addItems(["LIMIT", "MARKET"])
@@ -199,11 +188,14 @@ class TradeSettingsDialog(QDialog):
 
     def _on_save(self) -> None:
         payload = self._store.load_settings()
-        payload["nominal_usd"] = float(self.notional_input.value())
-        payload["budget_mode_enabled"] = bool(self.budget_mode_input.isChecked())
-        payload["budget_quote"] = float(self.budget_quote_input.value())
-        payload["usage_pct"] = float(self.usage_pct_input.value())
-        payload["min_quote_reserve"] = float(self.reserve_input.value())
+        payload.pop("nominal_usd", None)
+        payload.pop("budget_mode_enabled", None)
+        payload.pop("budget_quote", None)
+        payload.pop("usage_pct", None)
+        payload.pop("min_quote_reserve", None)
+        payload["order_quote"] = float(self.order_quote_input.value())
+        payload["max_budget"] = float(self.max_budget_input.value())
+        payload["budget_reserve"] = float(self.budget_reserve_input.value())
         payload["offset_ticks"] = int(self.tick_offset_input.value())
         payload["take_profit_ticks"] = int(self.take_profit_input.value())
         payload["stop_loss_ticks"] = int(self.stop_loss_input.value())
@@ -218,7 +210,7 @@ class TradeSettingsDialog(QDialog):
         payload["auto_exit_enabled"] = bool(self.auto_exit_input.isChecked())
         self._store.save_settings(payload)
         self.saved.emit(
-            float(self.notional_input.value()),
+            float(self.order_quote_input.value()),
             int(self.tick_offset_input.value()),
             int(self.take_profit_input.value()),
             int(self.stop_loss_input.value()),
@@ -231,9 +223,7 @@ class TradeSettingsDialog(QDialog):
             bool(self.allow_borrow_input.isChecked()),
             str(self.side_effect_input.currentText()).upper(),
             bool(self.auto_exit_input.isChecked()),
-            bool(self.budget_mode_input.isChecked()),
-            float(self.budget_quote_input.value()),
-            float(self.usage_pct_input.value()),
-            float(self.reserve_input.value()),
+            float(self.max_budget_input.value()),
+            float(self.budget_reserve_input.value()),
         )
         self.accept()

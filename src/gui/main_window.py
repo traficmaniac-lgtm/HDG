@@ -693,12 +693,12 @@ class MainWindow(QMainWindow):
 
     def _load_settings(self) -> Settings:
         payload = self._config_store.load_settings()
-        budget_quote = self._bounded_float(payload.get("budget_quote", 1000.0), 0.0, 1e9, 1000.0)
-        if budget_quote < 10.0:
-            budget_quote = 10.0
-        usage_pct = self._bounded_float(payload.get("usage_pct", 0.98), 0.50, 0.99, 0.98)
-        min_quote_reserve = self._bounded_float(
-            payload.get("min_quote_reserve", 5.0), 0.0, budget_quote * 0.2, 5.0
+        order_quote = self._bounded_float(payload.get("order_quote", 50.0), 0.0, 1e9, 50.0)
+        max_budget = self._bounded_float(payload.get("max_budget", 1000.0), 0.0, 1e9, 1000.0)
+        if max_budget < order_quote:
+            max_budget = order_quote
+        budget_reserve = self._bounded_float(
+            payload.get("budget_reserve", 20.0), 0.0, max_budget, 20.0
         )
         return Settings(
             symbol=payload.get("symbol", "EURIUSDT"),
@@ -721,7 +721,6 @@ class MainWindow(QMainWindow):
             leverage_hint=int(
                 payload.get("leverage_hint", payload.get("max_leverage_hint", 3))
             ),
-            nominal_usd=float(payload.get("nominal_usd", payload.get("test_notional_usd", 10.0))),
             offset_ticks=int(payload.get("offset_ticks", payload.get("test_tick_offset", 1))),
             entry_offset_ticks=int(payload.get("entry_offset_ticks", payload.get("offset_ticks", 0))),
             take_profit_ticks=int(payload.get("take_profit_ticks", 1)),
@@ -743,10 +742,9 @@ class MainWindow(QMainWindow):
             max_sell_retries=int(payload.get("max_sell_retries", 3)),
             force_close_on_ttl=bool(payload.get("force_close_on_ttl", True)),
             cycle_count=self._bounded_int(payload.get("cycle_count", 1), 1, 1000, 1),
-            budget_mode_enabled=bool(payload.get("budget_mode_enabled", False)),
-            budget_quote=budget_quote,
-            usage_pct=usage_pct,
-            min_quote_reserve=min_quote_reserve,
+            order_quote=order_quote,
+            max_budget=max_budget,
+            budget_reserve=budget_reserve,
         )
 
     def _log_data_blind_state(self, price_state: PriceState, state_label: str) -> None:
@@ -837,7 +835,7 @@ class MainWindow(QMainWindow):
 
     def _on_trade_settings_saved(
         self,
-        notional: float,
+        order_quote: float,
         tick_offset: int,
         take_profit_ticks: int,
         stop_loss_ticks: int,
@@ -850,13 +848,11 @@ class MainWindow(QMainWindow):
         allow_borrow: bool,
         side_effect_type: str,
         auto_exit_enabled: bool,
-        budget_mode_enabled: bool,
-        budget_quote: float,
-        usage_pct: float,
-        min_quote_reserve: float,
+        max_budget: float,
+        budget_reserve: float,
     ) -> None:
         if self._settings:
-            self._settings.nominal_usd = notional
+            self._settings.order_quote = order_quote
             self._settings.offset_ticks = tick_offset
             self._settings.take_profit_ticks = take_profit_ticks
             self._settings.stop_loss_ticks = stop_loss_ticks
@@ -869,10 +865,8 @@ class MainWindow(QMainWindow):
             self._settings.allow_borrow = allow_borrow
             self._settings.side_effect_type = side_effect_type
             self._settings.auto_exit_enabled = auto_exit_enabled
-            self._settings.budget_mode_enabled = budget_mode_enabled
-            self._settings.budget_quote = budget_quote
-            self._settings.usage_pct = usage_pct
-            self._settings.min_quote_reserve = min_quote_reserve
+            self._settings.max_budget = max_budget
+            self._settings.budget_reserve = budget_reserve
         self._append_log("[SETTINGS] saved")
 
     def _on_api_saved(self, key: str, secret: str) -> None:

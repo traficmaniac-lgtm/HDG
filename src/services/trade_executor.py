@@ -141,23 +141,41 @@ class TradeExecutor:
             tick_offset = max(0, int(self._settings.entry_offset_ticks))
             buy_price = bid + tick_offset * self._profile.tick_size
             buy_price = self._round_to_step(buy_price, self._profile.tick_size)
-            if self._settings.budget_mode_enabled:
+            order_quote = float(self._settings.order_quote)
+            max_budget = float(self._settings.max_budget)
+            budget_reserve = float(self._settings.budget_reserve)
+            free_quote = float(quote_state["free"])
+            self._logger(f"[ORDER_UNIT] quote={order_quote:.8f}")
+            self._logger(
+                f"[BUDGET_CHECK] free={free_quote:.8f} max={max_budget:.8f} "
+                f"reserve={budget_reserve:.8f}"
+            )
+            allowed_budget = max(0.0, max_budget - budget_reserve)
+            min_notional = self._profile.min_notional or 0.0
+            min_order_quote = min_notional * 1.2 if min_notional > 0 else 0.0
+            if min_order_quote > 0 and order_quote < min_order_quote:
                 self._logger(
-                    "[BUDGET] enabled=1 "
-                    f"budget={self._settings.budget_quote:.8f} "
-                    f"usage_pct={self._settings.usage_pct:.2f} "
-                    f"reserve={self._settings.min_quote_reserve:.8f}"
+                    "[ORDER_UNIT_INVALID] "
+                    f"quote={order_quote:.8f} min_required={min_order_quote:.8f}"
                 )
-                qty = self._compute_budget_buy_qty(
-                    price_ref=buy_price, quote_free=quote_state["free"]
+                self.last_action = "order_unit_invalid"
+                self.orders_count = 0
+                return 0
+            if order_quote > allowed_budget:
+                self._logger(
+                    f"[BUDGET_BLOCKED] free={free_quote:.8f} required={order_quote:.8f}"
                 )
-                if qty <= 0:
-                    self.abort_cycle_with_reason(reason="ABORT")
-                    return 0
-            else:
-                qty = self._round_down(
-                    self._settings.nominal_usd / mid, self._profile.step_size
+                self.last_action = "budget_blocked"
+                self.orders_count = 0
+                return 0
+            if free_quote < order_quote:
+                self._logger(
+                    f"[BUDGET_BLOCKED] free={free_quote:.8f} required={order_quote:.8f}"
                 )
+                self.last_action = "budget_blocked"
+                self.orders_count = 0
+                return 0
+            qty = self._round_down(order_quote / buy_price, self._profile.step_size)
 
             if qty <= 0:
                 self._logger(f"[TRADE] place_test_orders | qty <= 0 tag={self.TAG}")
@@ -169,7 +187,7 @@ class TradeExecutor:
                 )
                 return 0
 
-            notional = qty * mid
+            notional = qty * buy_price
             if self._profile.min_notional is None:
                 self._logger("[TRADE] place_test_orders | minNotional unknown")
             elif notional < self._profile.min_notional:
@@ -317,8 +335,9 @@ class TradeExecutor:
         if not self.run_active:
             return
         self.cycles_done += 1
+        pnl_label = "—" if self.pnl_cycle is None else f"{self.pnl_cycle:.8f}"
         self._logger(
-            f"[CYCLE_DONE] done={self.cycles_done} target={self.cycles_target} reason={reason}"
+            f"[CYCLE_DONE] idx={self.cycles_done} pnl={pnl_label} reason={reason}"
         )
         if critical:
             self.run_active = False
@@ -701,31 +720,13 @@ class TradeExecutor:
         tick_offset = max(0, int(self._settings.entry_offset_ticks))
         buy_price = bid + tick_offset * self._profile.tick_size
         buy_price = self._round_to_step(buy_price, self._profile.tick_size)
-        if self._settings.budget_mode_enabled:
-            base_asset, quote_asset = self._split_symbol(self._settings.symbol)
-            quote_state = self._get_margin_asset(quote_asset)
-            if quote_state is None:
-                self._logger(
-                    f"[PRECHECK] margin asset info unavailable symbol={self._settings.symbol}"
-                )
-                self._logger("[BUY_ABORT retries_exceeded]")
-                self.abort_cycle()
-                return
-            qty = self._compute_budget_buy_qty(
-                price_ref=buy_price, quote_free=quote_state["free"]
-            )
-            if qty <= 0:
-                self.abort_cycle_with_reason(reason="ABORT")
-                return
-        else:
-            qty = self._round_down(
-                self._settings.nominal_usd / mid, self._profile.step_size
-            )
+        order_quote = float(self._settings.order_quote)
+        qty = self._round_down(order_quote / buy_price, self._profile.step_size)
         if qty <= 0 or qty < self._profile.min_qty:
             self._logger("[BUY_ABORT retries_exceeded]")
             self.abort_cycle()
             return
-        if self._profile.min_notional is not None and qty * mid < self._profile.min_notional:
+        if self._profile.min_notional is not None and qty * buy_price < self._profile.min_notional:
             self._logger("[BUY_ABORT retries_exceeded]")
             self.abort_cycle()
             return
@@ -1338,44 +1339,6 @@ class TradeExecutor:
         if upper in {"AUTO_BORROW_REPAY", "MARGIN_BUY"}:
             return upper
         return "AUTO_BORROW_REPAY"
-
-    def _compute_budget_buy_qty(self, price_ref: float, quote_free: float) -> float:
-        if price_ref <= 0 or not self._profile.step_size:
-            return 0.0
-        min_notional = self._profile.min_notional or 0.0
-        min_budget = 10.0
-        if self._profile.min_notional:
-            min_budget = max(min_budget, self._profile.min_notional * 2)
-        budget_quote = max(0.0, float(self._settings.budget_quote))
-        if budget_quote < min_budget:
-            self._logger(
-                "[BUDGET_SKIP] reason=budget_too_small "
-                f"budget={budget_quote:.8f} min_required={min_budget:.8f}"
-            )
-            return 0.0
-        usage_pct = float(self._settings.usage_pct)
-        reserve = float(self._settings.min_quote_reserve)
-        free_quote = min(quote_free, budget_quote)
-        usable_quote = max(0.0, free_quote * usage_pct - reserve)
-        raw_qty = usable_quote / price_ref
-        qty = self._round_down(raw_qty, self._profile.step_size)
-        self._logger(
-            f"[BUDGET_QTY] free_quote={free_quote:.8f} usable_quote={usable_quote:.8f} "
-            f"price_ref={price_ref:.8f} qty={qty:.8f}"
-        )
-        if usable_quote < min_notional:
-            self._logger(f"[BUDGET_SKIP] reason=too_small usable_quote={usable_quote:.8f}")
-            return 0.0
-        if qty <= 0:
-            self._logger(f"[BUDGET_SKIP] reason=too_small usable_quote={usable_quote:.8f}")
-            return 0.0
-        if self._profile.min_qty and qty < self._profile.min_qty:
-            self._logger(f"[BUDGET_SKIP] reason=too_small usable_quote={usable_quote:.8f}")
-            return 0.0
-        if self._profile.min_notional and qty * price_ref < self._profile.min_notional:
-            self._logger(f"[BUDGET_SKIP] reason=too_small usable_quote={usable_quote:.8f}")
-            return 0.0
-        return qty
 
     def _get_margin_asset(self, asset: str) -> Optional[dict]:
         try:

@@ -20,7 +20,6 @@ class Settings:
     position_guard_http: bool
     account_mode: str
     leverage_hint: int
-    nominal_usd: float
     offset_ticks: int
     entry_offset_ticks: int
     take_profit_ticks: int
@@ -38,10 +37,9 @@ class Settings:
     max_sell_retries: int
     force_close_on_ttl: bool
     cycle_count: int
-    budget_mode_enabled: bool
-    budget_quote: float
-    usage_pct: float
-    min_quote_reserve: float
+    order_quote: float
+    max_budget: float
+    budget_reserve: float
 
 
 @dataclass
