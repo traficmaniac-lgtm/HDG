@@ -59,6 +59,9 @@ class TradeExecutor:
         self._buy_retry_count = 0
         self._entry_attempt_started_ts: Optional[float] = None
         self._entry_reprice_last_ts = 0.0
+        self._entry_consecutive_fresh_reads = 0
+        self._entry_last_seen_bid: Optional[float] = None
+        self._entry_last_ws_bad_ts: Optional[float] = None
         self._sell_wait_started_ts: Optional[float] = None
         self._sell_retry_count = 0
         self.sell_active_order_id: Optional[int] = None
@@ -537,6 +540,68 @@ class TradeExecutor:
         if elapsed_ms is None or elapsed_ms <= max_entry_total_ms:
             return False
         self._logger(f"[ENTRY_ABORT_TIMEOUT] waited_ms={elapsed_ms}")
+        buy_order = self._find_order("BUY")
+        order_id = buy_order.get("orderId") if buy_order else None
+        if order_id:
+            live_order = self._get_margin_order_snapshot(order_id)
+            if live_order:
+                status = str(live_order.get("status") or "").upper()
+                executed_qty = float(
+                    live_order.get("executedQty", 0.0)
+                    or live_order.get("executedQuantity", 0.0)
+                    or 0.0
+                )
+                cum_quote = float(
+                    live_order.get("cummulativeQuoteQty", 0.0) or 0.0
+                )
+                avg_price = 0.0
+                if executed_qty > 0 and cum_quote > 0:
+                    avg_price = cum_quote / executed_qty
+                else:
+                    avg_price = float(
+                        live_order.get("avgPrice", 0.0)
+                        or live_order.get("price", 0.0)
+                        or 0.0
+                    )
+                if status == "FILLED" and executed_qty > 0:
+                    if buy_order is not None:
+                        buy_order["status"] = "FILLED"
+                        buy_order["price"] = avg_price if avg_price > 0 else buy_order.get("price")
+                        buy_order["qty"] = executed_qty
+                        buy_order["updated_ts"] = int(time.time() * 1000)
+                    self._apply_order_filled(
+                        {
+                            "side": "BUY",
+                            "price": avg_price if avg_price > 0 else buy_order.get("price"),
+                            "qty": executed_qty,
+                            "updated_ts": int(time.time() * 1000),
+                        }
+                    )
+                    return True
+                if status == "PARTIALLY_FILLED" and executed_qty > 0:
+                    min_qty = self._profile.min_qty or 0.0
+                    if executed_qty >= min_qty:
+                        self._apply_entry_partial_fill(
+                            executed_qty,
+                            avg_price if avg_price > 0 else buy_order.get("price") if buy_order else None,
+                        )
+                        is_isolated = "TRUE" if self._settings.margin_isolated else "FALSE"
+                        self._cancel_margin_order(
+                            symbol=self._settings.symbol,
+                            order_id=order_id,
+                            is_isolated=is_isolated,
+                            tag=buy_order.get("tag", self.TAG) if buy_order else self.TAG,
+                        )
+                        if buy_order is not None:
+                            buy_order["status"] = "CANCELED"
+                            buy_order["updated_ts"] = int(time.time() * 1000)
+                        self.active_test_orders = [
+                            entry
+                            for entry in self.active_test_orders
+                            if entry.get("orderId") != order_id
+                        ]
+                        self.orders_count = len(self.active_test_orders)
+                        return True
         self.abort_cycle_with_reason(reason="ENTRY_TIMEOUT")
         return True
 
@@ -831,6 +896,9 @@ class TradeExecutor:
         self._buy_wait_started_ts = None
         self._buy_retry_count = 0
         self._clear_price_wait("ENTRY")
+        self._entry_consecutive_fresh_reads = 0
+        self._entry_last_seen_bid = None
+        self._entry_last_ws_bad_ts = None
 
     def _start_buy_wait(self) -> None:
         self._buy_wait_started_ts = time.monotonic()
@@ -838,6 +906,9 @@ class TradeExecutor:
     def _start_entry_attempt(self) -> None:
         if self._entry_attempt_started_ts is None:
             self._entry_attempt_started_ts = time.monotonic()
+        self._entry_consecutive_fresh_reads = 0
+        self._entry_last_seen_bid = None
+        self._entry_last_ws_bad_ts = None
 
     def _clear_entry_attempt(self) -> None:
         self._entry_attempt_started_ts = None
@@ -872,14 +943,16 @@ class TradeExecutor:
         Optional[int],
         str,
         str,
+        bool,
     ]:
         price_state, health_state = self._router.build_price_state()
-        if self._entry_ws_bad(health_state.ws_connected):
+        ws_bad = self._entry_ws_bad(health_state.ws_connected)
+        if ws_bad:
             self._log_entry_degraded(health_state.ws_connected)
             ok, bid, ask, mid, age_ms, status = self._router.get_http_snapshot(
                 int(self._settings.http_fresh_ms)
             )
-            return ok, bid, ask, mid, age_ms, "HTTP", status
+            return ok, bid, ask, mid, age_ms, "HTTP", status, ws_bad
 
         ok, mid, age_ms, source, status = self._router.get_mid_snapshot(
             int(self._settings.mid_fresh_ms)
@@ -889,13 +962,13 @@ class TradeExecutor:
             ask = price_state.ask
             mid_val = mid if mid is not None else price_state.mid
             if bid is None or ask is None or mid_val is None:
-                return False, bid, ask, mid_val, age_ms, source, "no_quote"
-            return True, bid, ask, mid_val, age_ms, source, status
+                return False, bid, ask, mid_val, age_ms, source, "no_quote", ws_bad
+            return True, bid, ask, mid_val, age_ms, source, status, ws_bad
 
         ok, bid, ask, mid, age_ms, status = self._router.get_http_snapshot(
             int(self._settings.http_fresh_ms)
         )
-        return ok, bid, ask, mid, age_ms, "HTTP", status
+        return ok, bid, ask, mid, age_ms, "HTTP", status, ws_bad
 
     def _calculate_entry_price(self, bid: float) -> Optional[float]:
         if not self._profile.tick_size:
@@ -922,11 +995,35 @@ class TradeExecutor:
             return
         if self._buy_wait_started_ts is None:
             self._start_buy_wait()
-        ok, bid, ask, mid, age_ms, source, status = self._resolve_entry_snapshot()
+        ok, bid, ask, mid, age_ms, source, status, ws_bad = self._resolve_entry_snapshot()
+        now = time.monotonic()
+        if ws_bad:
+            self._entry_last_ws_bad_ts = now
         if not ok or bid is None or mid is None:
-            self._start_price_wait("ENTRY")
-            self._log_price_wait("ENTRY", age_ms, source)
-            self._maybe_abort_entry_wait()
+            self._entry_consecutive_fresh_reads = 0
+            if ws_bad:
+                if not self._should_dedup_log("entry_hold_wsbad", 2.0):
+                    ws_no_first_tick, ws_stale_ticks = self._router.get_ws_issue_counts()
+                    self._logger(
+                        "[ENTRY_HOLD_WSBAD] "
+                        f"no_first_tick={ws_no_first_tick} stale_ticks={ws_stale_ticks}"
+                    )
+                if not self._should_dedup_log("entry_skip_wsbad", 2.0):
+                    age_label = age_ms if age_ms is not None else "?"
+                    self._logger(
+                        f"[ENTRY_REPRICE_SKIP] reason=ws_bad age_ms={age_label}"
+                    )
+            else:
+                if not self._should_dedup_log("entry_hold_stale", 2.0):
+                    age_label = age_ms if age_ms is not None else "?"
+                    self._logger(
+                        f"[ENTRY_HOLD_STALE] age_ms={age_label} source={source}"
+                    )
+                if not self._should_dedup_log("entry_skip_stale", 2.0):
+                    age_label = age_ms if age_ms is not None else "?"
+                    self._logger(
+                        f"[ENTRY_REPRICE_SKIP] reason=stale age_ms={age_label}"
+                    )
             return
         self._clear_price_wait("ENTRY")
         elapsed_ms = self._entry_attempt_elapsed_ms()
@@ -940,18 +1037,81 @@ class TradeExecutor:
         min_ticks = max(1, int(getattr(self._settings, "entry_reprice_min_ticks", 1)))
         tick_size = self._profile.tick_size
         bid_diff = (bid - current_price) / tick_size
+        last_seen_bid = self._entry_last_seen_bid
+        if last_seen_bid is None:
+            bid_move_ticks = 0.0
+        else:
+            bid_move_ticks = abs(bid - last_seen_bid) / tick_size
         cooldown_ms = max(
-            0, int(getattr(self._settings, "entry_reprice_cooldown_ms", 800))
+            0, int(getattr(self._settings, "entry_reprice_cooldown_ms", 1200))
         )
-        now = time.monotonic()
+        require_stable = bool(
+            getattr(self._settings, "entry_reprice_require_stable_source", True)
+        )
+        stable_grace_ms = max(
+            0, int(getattr(self._settings, "entry_reprice_stable_source_grace_ms", 3000))
+        )
+        min_fresh_reads = max(
+            1,
+            int(
+                getattr(
+                    self._settings, "entry_reprice_min_consecutive_fresh_reads", 2
+                )
+            ),
+        )
+        stable_ok = True
+        if require_stable and self._entry_last_ws_bad_ts is not None:
+            stable_ok = (now - self._entry_last_ws_bad_ts) * 1000.0 >= stable_grace_ms
+        if ws_bad:
+            self._entry_consecutive_fresh_reads = 0
+            if not self._should_dedup_log("entry_skip_wsbad_live", 2.0):
+                age_label = age_ms if age_ms is not None else "?"
+                self._logger(f"[ENTRY_REPRICE_SKIP] reason=ws_bad age_ms={age_label}")
+            return
+        self._entry_consecutive_fresh_reads += 1
+        if not stable_ok:
+            if not self._should_dedup_log("entry_skip_not_stable", 2.0):
+                age_label = age_ms if age_ms is not None else "?"
+                self._logger(f"[ENTRY_REPRICE_SKIP] reason=not_stable age_ms={age_label}")
+            return
+        if self._entry_consecutive_fresh_reads < min_fresh_reads:
+            if not self._should_dedup_log("entry_skip_fresh_reads", 2.0):
+                age_label = age_ms if age_ms is not None else "?"
+                self._logger(
+                    f"[ENTRY_REPRICE_SKIP] reason=stale age_ms={age_label}"
+                )
+            self._entry_last_seen_bid = bid
+            return
+        if bid_move_ticks < min_ticks:
+            if not self._should_dedup_log("entry_skip_no_move", 2.0):
+                age_label = age_ms if age_ms is not None else "?"
+                self._logger(
+                    f"[ENTRY_REPRICE_SKIP] reason=no_move age_ms={age_label}"
+                )
+            self._entry_last_seen_bid = bid
+            return
         if bid_diff < min_ticks:
+            if not self._should_dedup_log("entry_skip_bid_diff", 2.0):
+                age_label = age_ms if age_ms is not None else "?"
+                self._logger(
+                    f"[ENTRY_REPRICE_SKIP] reason=no_move age_ms={age_label}"
+                )
+            self._entry_last_seen_bid = bid
             return
         if (now - self._entry_reprice_last_ts) * 1000.0 < cooldown_ms:
+            if not self._should_dedup_log("entry_skip_cooldown", 2.0):
+                age_label = age_ms if age_ms is not None else "?"
+                self._logger(
+                    f"[ENTRY_REPRICE_SKIP] reason=cooldown age_ms={age_label}"
+                )
+            self._entry_last_seen_bid = bid
             return
         new_price = self._calculate_entry_price(bid)
         if new_price is None:
+            self._entry_last_seen_bid = bid
             return
         if new_price <= current_price:
+            self._entry_last_seen_bid = bid
             return
         order_id = buy_order.get("orderId")
         if order_id and order_id in open_orders:
@@ -998,6 +1158,7 @@ class TradeExecutor:
         if not buy_order:
             return
         self._entry_reprice_last_ts = now
+        self._entry_last_seen_bid = bid
         now_ms = int(time.time() * 1000)
         self.active_test_orders = [
             {
@@ -1533,6 +1694,25 @@ class TradeExecutor:
             self.active_test_orders = []
             self.orders_count = 0
             self._transition_state(TradeState.STATE_IDLE)
+
+    def _apply_entry_partial_fill(self, qty: float, price: Optional[float]) -> None:
+        if qty <= 0:
+            return
+        price_label = "?" if price is None else f"{price:.8f}"
+        self._logger(f"[ORDER] BUY partial timeout qty={qty:.8f} price={price_label}")
+        self._reset_buy_retry()
+        self._clear_entry_attempt()
+        if self.position is None:
+            self.position = {
+                "buy_price": price,
+                "qty": qty,
+                "opened_ts": int(time.time() * 1000),
+                "partial": True,
+                "initial_qty": qty,
+            }
+            self._set_position_qty_base(qty)
+            self._reset_exit_intent()
+        self._transition_state(TradeState.STATE_POSITION_OPEN)
 
     def get_orders_snapshot(self) -> list[dict]:
         return [dict(order) for order in self.active_test_orders]

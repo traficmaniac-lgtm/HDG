@@ -743,10 +743,31 @@ class MainWindow(QMainWindow):
             offset_ticks=int(payload.get("offset_ticks", payload.get("test_tick_offset", 1))),
             entry_offset_ticks=int(payload.get("entry_offset_ticks", payload.get("offset_ticks", 1))),
             entry_reprice_min_ticks=self._bounded_int(
-                payload.get("entry_reprice_min_ticks", 1), 1, 10, 1
+                payload.get(
+                    "reprice_min_tick_moves",
+                    payload.get("entry_reprice_min_ticks", 1),
+                ),
+                1,
+                10,
+                1,
             ),
             entry_reprice_cooldown_ms=self._bounded_int(
-                payload.get("entry_reprice_cooldown_ms", 800), 100, 5000, 800
+                payload.get(
+                    "reprice_cooldown_ms",
+                    payload.get("entry_reprice_cooldown_ms", 1200),
+                ),
+                100,
+                5000,
+                1200,
+            ),
+            entry_reprice_require_stable_source=bool(
+                payload.get("require_stable_source_for_reprice", True)
+            ),
+            entry_reprice_stable_source_grace_ms=self._bounded_int(
+                payload.get("stable_source_grace_ms", 3000), 0, 20000, 3000
+            ),
+            entry_reprice_min_consecutive_fresh_reads=self._bounded_int(
+                payload.get("min_consecutive_fresh_reads", 2), 1, 10, 2
             ),
             take_profit_ticks=int(payload.get("take_profit_ticks", 1)),
             stop_loss_ticks=int(payload.get("stop_loss_ticks", 2)),

@@ -30,6 +30,9 @@ class Settings:
     entry_offset_ticks: int
     entry_reprice_min_ticks: int
     entry_reprice_cooldown_ms: int
+    entry_reprice_require_stable_source: bool
+    entry_reprice_stable_source_grace_ms: int
+    entry_reprice_min_consecutive_fresh_reads: int
     take_profit_ticks: int
     stop_loss_ticks: int
     order_type: str
