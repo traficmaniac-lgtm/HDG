@@ -15,6 +15,7 @@ class WsPriceWorker(QObject):
     tick = Signal(float, float)
     status = Signal(bool)
     log = Signal(str)
+    issue = Signal(str)
     finished = Signal()
 
     def __init__(self, symbol: str, reconnect_dedup_ms: int = 10000) -> None:
@@ -75,6 +76,8 @@ class WsPriceWorker(QObject):
                 self._set_connected(False)
                 now = time.monotonic()
                 reason = str(exc) or "unknown"
+                if reason in {"no first tick", "stale ticks"}:
+                    self.issue.emit(reason)
                 last_log_ts = self._reconnect_log_ts.get(reason, 0.0)
                 if now - last_log_ts >= self._reconnect_dedup_s:
                     self._reconnect_log_ts[reason] = now

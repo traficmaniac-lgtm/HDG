@@ -28,6 +28,9 @@ class TradeSettingsDialog(QDialog):
         str,
         int,
         int,
+        str,
+        int,
+        int,
         int,
         str,
         bool,
@@ -79,6 +82,21 @@ class TradeSettingsDialog(QDialog):
         )
         form.addRow("Повторы входа BUY", self.buy_retry_input)
 
+        self.entry_mode_input = QComboBox()
+        self.entry_mode_input.addItems(["NORMAL", "AGGRESSIVE"])
+        current_entry_mode = str(getattr(settings, "entry_mode", "NORMAL") or "NORMAL").upper()
+        index = self.entry_mode_input.findText(current_entry_mode)
+        if index >= 0:
+            self.entry_mode_input.setCurrentIndex(index)
+        form.addRow("Entry mode", self.entry_mode_input)
+
+        self.aggressive_offset_input = QSpinBox()
+        self.aggressive_offset_input.setRange(0, 2)
+        self.aggressive_offset_input.setValue(
+            int(getattr(settings, "aggressive_offset_ticks", 0) or 0) if settings else 0
+        )
+        form.addRow("Aggressive offset (тики)", self.aggressive_offset_input)
+
         advanced_header = QLabel("ADVANCED")
         advanced_header.setStyleSheet("font-weight: bold;")
         form.addRow(advanced_header)
@@ -100,6 +118,16 @@ class TradeSettingsDialog(QDialog):
             else 5000
         )
         form.addRow("Max wait price (ms)", self.max_wait_price_input)
+
+        self.max_entry_total_input = QSpinBox()
+        self.max_entry_total_input.setRange(1000, 120000)
+        self.max_entry_total_input.setSingleStep(1000)
+        self.max_entry_total_input.setValue(
+            int(getattr(settings, "max_entry_total_ms", 30000) or 30000)
+            if settings
+            else 30000
+        )
+        form.addRow("Max entry total (ms)", self.max_entry_total_input)
 
         self.order_type_input = QComboBox()
         self.order_type_input.addItems(["LIMIT", "MARKET"])
@@ -241,8 +269,11 @@ class TradeSettingsDialog(QDialog):
         payload["order_type"] = str(self.order_type_input.currentText()).upper()
         payload["buy_ttl_ms"] = int(self.buy_ttl_input.value())
         payload["max_buy_retries"] = int(self.buy_retry_input.value())
+        payload["entry_mode"] = str(self.entry_mode_input.currentText()).upper()
+        payload["aggressive_offset_ticks"] = int(self.aggressive_offset_input.value())
         payload["mid_fresh_ms"] = int(self.mid_fresh_input.value())
         payload["max_wait_price_ms"] = int(self.max_wait_price_input.value())
+        payload["max_entry_total_ms"] = int(self.max_entry_total_input.value())
         payload["exit_order_type"] = str(self.exit_order_type_input.currentText()).upper()
         payload["exit_offset_ticks"] = int(self.exit_offset_input.value())
         payload["allow_borrow"] = bool(self.allow_borrow_input.isChecked())
@@ -258,6 +289,9 @@ class TradeSettingsDialog(QDialog):
             str(self.order_type_input.currentText()).upper(),
             int(self.buy_ttl_input.value()),
             int(self.buy_retry_input.value()),
+            str(self.entry_mode_input.currentText()).upper(),
+            int(self.aggressive_offset_input.value()),
+            int(self.max_entry_total_input.value()),
             int(self.exit_offset_input.value()),
             str(self.exit_order_type_input.currentText()).upper(),
             bool(self.allow_borrow_input.isChecked()),

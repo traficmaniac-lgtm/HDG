@@ -438,6 +438,7 @@ class MainWindow(QMainWindow):
         self._ws_thread.finished.connect(self._ws_thread.deleteLater)
         self._ws_worker.tick.connect(self._on_ws_tick)
         self._ws_worker.status.connect(self._on_ws_status)
+        self._ws_worker.issue.connect(self._on_ws_issue)
         self._ws_worker.log.connect(self._append_log)
         self._ws_thread.start()
 
@@ -451,6 +452,8 @@ class MainWindow(QMainWindow):
         if status == self._ws_connected:
             return
         self._ws_connected = status
+        if self._router:
+            self._router.set_ws_connected(status)
         now = time.monotonic()
         throttle_s = (
             self._settings.ws_log_throttle_ms / 1000.0 if self._settings else 5.0
@@ -458,6 +461,11 @@ class MainWindow(QMainWindow):
         if now - self._last_ws_status_log_ts >= throttle_s:
             self._last_ws_status_log_ts = now
             self._append_log(f"WS connected: {status}")
+
+    @Slot(str)
+    def _on_ws_issue(self, reason: str) -> None:
+        if self._router:
+            self._router.record_ws_issue(reason)
 
     @Slot(int, str, float, float, "qint64")
     def _on_order_filled(
@@ -517,7 +525,6 @@ class MainWindow(QMainWindow):
         if not self._router:
             return
         price_state, health_state = self._router.build_price_state()
-        health_state.ws_connected = self._ws_connected
         self._last_mid = price_state.mid
         for log_message in self._router.consume_logs():
             self._append_log(log_message)
@@ -722,6 +729,13 @@ class MainWindow(QMainWindow):
                 payload.get("price_wait_log_every_ms", 1000), 250, 10000, 1000
             ),
             position_guard_http=bool(payload.get("position_guard_http", True)),
+            entry_mode=str(payload.get("entry_mode", "NORMAL")).upper(),
+            aggressive_offset_ticks=self._bounded_int(
+                payload.get("aggressive_offset_ticks", 0), 0, 2, 0
+            ),
+            max_entry_total_ms=self._bounded_int(
+                payload.get("max_entry_total_ms", 30000), 1000, 120000, 30000
+            ),
             account_mode=str(payload.get("account_mode", "CROSS_MARGIN")),
             leverage_hint=int(
                 payload.get("leverage_hint", payload.get("max_leverage_hint", 3))
@@ -848,6 +862,9 @@ class MainWindow(QMainWindow):
         order_type: str,
         buy_ttl_ms: int,
         max_buy_retries: int,
+        entry_mode: str,
+        aggressive_offset_ticks: int,
+        max_entry_total_ms: int,
         exit_offset_ticks: int,
         exit_order_type: str,
         allow_borrow: bool,
@@ -867,6 +884,13 @@ class MainWindow(QMainWindow):
             self._settings.order_type = order_type
             self._settings.buy_ttl_ms = buy_ttl_ms
             self._settings.max_buy_retries = max_buy_retries
+            self._settings.entry_mode = entry_mode
+            self._settings.aggressive_offset_ticks = self._bounded_int(
+                aggressive_offset_ticks, 0, 2, 0
+            )
+            self._settings.max_entry_total_ms = self._bounded_int(
+                max_entry_total_ms, 1000, 120000, 30000
+            )
             self._settings.exit_offset_ticks = exit_offset_ticks
             self._settings.exit_order_type = exit_order_type
             self._settings.allow_borrow = allow_borrow
