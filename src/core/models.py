@@ -45,6 +45,7 @@ class MarketTick:
 class MarketSnapshot:
     last_ws_tick_ms: Optional[float] = None
     last_http_tick_ms: Optional[float] = None
+    last_mid_update_ms: Optional[float] = None
     bid: float = 0.0
     ask: float = 0.0
     mid: float = 0.0
@@ -52,6 +53,7 @@ class MarketSnapshot:
     ws_age_ms: float = 9999.0
     http_age_ms: float = 9999.0
     effective_age_ms: float = 9999.0
+    mid_age_ms: float = 9999.0
     data_stale: bool = True
 
 

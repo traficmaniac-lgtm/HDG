@@ -76,6 +76,7 @@ class TradeEngine(QObject):
         self._last_active_cycle = False
         self._heartbeat_lock = threading.Lock()
         self._ui_heartbeat = time.monotonic()
+        self._profile_logged = False
         self._watchdog_thread = threading.Thread(
             target=self._watchdog_loop, name="gui-watchdog", daemon=True
         )
@@ -93,6 +94,7 @@ class TradeEngine(QObject):
 
     @Slot(dict)
     def on_tick(self, payload: dict) -> None:
+        self._maybe_init_symbol_profile(payload)
         self._cycle.update_tick(payload)
         self.tick_update.emit(payload)
         self._emit_cycle_state()
@@ -155,6 +157,7 @@ class TradeEngine(QObject):
         self._cycle.update_filters(self._symbol_filters)
         self._market_data.set_symbol(self._symbol)
         self._strategy = replace(self._base_strategy)
+        self._profile_logged = False
         self._apply_symbol_defaults()
         self._cycle.update_strategy(self._strategy)
         self._emit_cycle_state(force=True)
@@ -242,7 +245,7 @@ class TradeEngine(QObject):
                 self._symbol_filters.tick_size = float(price_filter.get("tickSize", 0.0))
             except ValueError:
                 self._symbol_filters.tick_size = 0.0
-        self._symbol_filters.bps_per_tick = self._compute_bps_per_tick()
+        self._maybe_init_symbol_profile()
         self._cycle.update_filters(self._symbol_filters)
         self.status_update.emit({"exchange_info": info})
 
@@ -254,6 +257,45 @@ class TradeEngine(QObject):
         if mid_raw is None or mid_raw <= 0:
             return 0.0
         return float((Decimal(str(tick_size)) / mid_raw) * Decimal("10000"))
+
+    def _maybe_init_symbol_profile(self, payload: Optional[dict[str, object]] = None) -> None:
+        if self._profile_logged:
+            return
+        if not self._symbol:
+            return
+        tick_size = self._symbol_filters.tick_size
+        if tick_size <= 0:
+            return
+        mid_value: Optional[Decimal] = None
+        if payload:
+            raw_mid = payload.get("mid_raw")
+            if raw_mid is not None:
+                try:
+                    mid_value = Decimal(str(raw_mid))
+                except Exception:
+                    mid_value = None
+            if mid_value is None:
+                raw_mid = payload.get("mid")
+                if raw_mid is not None:
+                    try:
+                        mid_value = Decimal(str(raw_mid))
+                    except Exception:
+                        mid_value = None
+        if mid_value is None:
+            mid_value = self._market_data.get_mid_raw()
+        if mid_value is None or mid_value <= 0:
+            return
+        bps_per_tick = float((Decimal(str(tick_size)) / mid_value) * Decimal("10000"))
+        assert bps_per_tick > 0
+        self._symbol_filters.bps_per_tick = bps_per_tick
+        self._cycle.update_filters(self._symbol_filters)
+        self._profile_logged = True
+        self._emit_log(
+            "INFO",
+            "INFO",
+            "[PROFILE] symbol=%s tickSize=%s mid=%s bps_per_tick=%s"
+            % (self._symbol, tick_size, float(mid_value), bps_per_tick),
+        )
 
     def _apply_symbol_defaults(self) -> None:
         if self._symbol != "EURIUSDT":
