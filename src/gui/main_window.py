@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+from importlib import import_module
+from importlib.util import find_spec
 from pathlib import Path
 from typing import Optional
 
@@ -16,7 +18,6 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-from dotenv import dotenv_values
 
 from src.core.models import Settings, SymbolProfile
 from src.core.version import VERSION
@@ -276,7 +277,14 @@ class MainWindow(QMainWindow):
         env_path = Path(__file__).resolve().parents[2] / "config" / ".env"
         if not env_path.exists():
             return {}
-        return {key: value or "" for key, value in dotenv_values(env_path).items()}
+        if find_spec("dotenv") is None:
+            self._append_log("python-dotenv is not installed; skipping .env load.")
+            return {}
+        dotenv = import_module("dotenv")
+        return {
+            key: value or ""
+            for key, value in dotenv.dotenv_values(env_path).items()
+        }
 
     def _parse_symbol_profile(self, exchange_info: dict) -> SymbolProfile:
         symbols = exchange_info.get("symbols", [])
