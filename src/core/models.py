@@ -12,9 +12,12 @@ class Settings:
     http_interval_ms: int
     ui_refresh_ms: int
     account_mode: str
-    max_leverage_hint: int
-    test_notional_usd: float
-    test_tick_offset: int
+    leverage_hint: int
+    nominal_usd: float
+    offset_ticks: int
+    order_type: str
+    allow_borrow: bool
+    side_effect_type: str
     margin_isolated: bool
 
 

@@ -54,6 +54,10 @@ class BinanceRestClient:
     def repay_margin_asset(self, params: dict) -> dict:
         return self.signed_sapi_request("POST", "/sapi/v1/margin/repay", params)
 
+    def probe_margin_borrow_access(self, asset: str) -> dict:
+        params = {"asset": asset, "amount": "0"}
+        return self.signed_sapi_request("POST", "/sapi/v1/margin/loan", params)
+
     def signed_sapi_request(self, method: str, path: str, params: dict) -> dict:
         if not path.startswith("/sapi/"):
             raise ValueError("SAPI path must start with /sapi/")
