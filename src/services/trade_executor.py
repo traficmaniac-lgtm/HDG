@@ -954,6 +954,16 @@ class TradeExecutor:
             self._rest.cancel_margin_order(params)
             return True
         except httpx.HTTPStatusError as exc:
+            code = None
+            try:
+                payload = exc.response.json() if exc.response else {}
+                code = payload.get("code")
+            except Exception:
+                pass
+            if code == -2011:
+                if not self._should_dedup_log("cancel_order:-2011", 10.0):
+                    self._logger("[CANCEL_IGNORED_UNKNOWN_ORDER]")
+                return True
             self._log_binance_error("cancel_order", exc, params)
         except Exception as exc:
             self._logger(f"[TRADE] cancel_order error: {exc} tag={tag}")
