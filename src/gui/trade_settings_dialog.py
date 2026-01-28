@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QDialog,
     QDoubleSpinBox,
@@ -18,7 +19,7 @@ from src.core.models import Settings
 
 
 class TradeSettingsDialog(QDialog):
-    saved = Signal(float, int)
+    saved = Signal(float, int, str, bool, str)
 
     def __init__(
         self, parent=None, store: ConfigStore | None = None, settings: Settings | None = None
@@ -37,7 +38,7 @@ class TradeSettingsDialog(QDialog):
         self.notional_input.setDecimals(2)
         self.notional_input.setSingleStep(1.0)
         self.notional_input.setValue(
-            float(getattr(settings, "test_notional_usd", 10.0) or 0.0)
+            float(getattr(settings, "nominal_usd", 10.0) or 0.0)
             if settings
             else 10.0
         )
@@ -46,13 +47,35 @@ class TradeSettingsDialog(QDialog):
         self.tick_offset_input = QSpinBox()
         self.tick_offset_input.setRange(0, 1000)
         self.tick_offset_input.setValue(
-            int(getattr(settings, "test_tick_offset", 1) or 0) if settings else 1
+            int(getattr(settings, "offset_ticks", 1) or 0) if settings else 1
         )
         form.addRow("Смещение в тиках", self.tick_offset_input)
 
+        self.order_type_input = QComboBox()
+        self.order_type_input.addItems(["LIMIT", "MARKET"])
+        current_order_type = str(getattr(settings, "order_type", "LIMIT") or "LIMIT").upper()
+        index = self.order_type_input.findText(current_order_type)
+        if index >= 0:
+            self.order_type_input.setCurrentIndex(index)
+        form.addRow("Тип ордера", self.order_type_input)
+
+        self.allow_borrow_input = QCheckBox("Разрешить заём (borrow)")
+        self.allow_borrow_input.setChecked(bool(getattr(settings, "allow_borrow", True)))
+        form.addRow("", self.allow_borrow_input)
+
+        self.side_effect_input = QComboBox()
+        self.side_effect_input.addItems(["AUTO_BORROW_REPAY", "MARGIN_BUY", "NONE"])
+        current_side_effect = str(
+            getattr(settings, "side_effect_type", "AUTO_BORROW_REPAY") or "AUTO_BORROW_REPAY"
+        ).upper()
+        index = self.side_effect_input.findText(current_side_effect)
+        if index >= 0:
+            self.side_effect_input.setCurrentIndex(index)
+        form.addRow("SideEffectType", self.side_effect_input)
+
         mode_layout = QHBoxLayout()
         mode_label = QLabel("CROSS MARGIN")
-        mode_hint = QLabel(f"x{getattr(settings, 'max_leverage_hint', 3)} (hint)")
+        mode_hint = QLabel(f"x{getattr(settings, 'leverage_hint', 3)} (hint)")
         mode_layout.addWidget(mode_label)
         mode_layout.addSpacing(6)
         mode_layout.addWidget(mode_hint)
@@ -78,11 +101,17 @@ class TradeSettingsDialog(QDialog):
 
     def _on_save(self) -> None:
         payload = self._store.load_settings()
-        payload["test_notional_usd"] = float(self.notional_input.value())
-        payload["test_tick_offset"] = int(self.tick_offset_input.value())
+        payload["nominal_usd"] = float(self.notional_input.value())
+        payload["offset_ticks"] = int(self.tick_offset_input.value())
+        payload["order_type"] = str(self.order_type_input.currentText()).upper()
+        payload["allow_borrow"] = bool(self.allow_borrow_input.isChecked())
+        payload["side_effect_type"] = str(self.side_effect_input.currentText()).upper()
         self._store.save_settings(payload)
         self.saved.emit(
             float(self.notional_input.value()),
             int(self.tick_offset_input.value()),
+            str(self.order_type_input.currentText()).upper(),
+            bool(self.allow_borrow_input.isChecked()),
+            str(self.side_effect_input.currentText()).upper(),
         )
         self.accept()

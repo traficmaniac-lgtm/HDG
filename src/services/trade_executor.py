@@ -13,7 +13,7 @@ from src.services.price_router import PriceRouter
 
 
 class TradeExecutor:
-    TAG = "TEST_V0_5_7"
+    TAG = "TEST_V0_5_8"
 
     def __init__(
         self,
@@ -34,6 +34,15 @@ class TradeExecutor:
         self.last_action = "idle"
         self.orders_count = 0
         self._inflight_trade_action = False
+        self._error_dedup: dict[str, float] = {}
+        self._last_no_price_log_ts = 0.0
+        self._borrow_allowed_by_api: Optional[bool] = None
+        self._borrow_hint_ts = 0.0
+
+    def set_margin_capabilities(
+        self, margin_api_access: bool, borrow_allowed_by_api: Optional[bool]
+    ) -> None:
+        self._borrow_allowed_by_api = borrow_allowed_by_api
 
     def place_test_orders_margin(self) -> int:
         if self._inflight_trade_action:
@@ -44,11 +53,14 @@ class TradeExecutor:
             price_state, health_state = self._router.build_price_state()
             mid = price_state.mid
             if mid is None:
-                self._logger(
-                    "[TRADE] blocked: no_price "
-                    f"(ws_age={health_state.ws_age_ms} http_age={health_state.http_age_ms})"
-                )
-                self.last_action = "no_price"
+                now = time.monotonic()
+                if now - self._last_no_price_log_ts >= 2.0:
+                    self._last_no_price_log_ts = now
+                    self._logger(
+                        "[TRADE] blocked: no_price "
+                        f"(ws_age={health_state.ws_age_ms} http_age={health_state.http_age_ms})"
+                    )
+                self.last_action = "NO_PRICE"
                 return 0
             if not self._profile.tick_size or not self._profile.step_size:
                 self._logger(
@@ -61,13 +73,13 @@ class TradeExecutor:
                 )
                 return 0
 
-            tick_offset = self._settings.test_tick_offset
+            tick_offset = self._settings.offset_ticks
             buy_price = mid - tick_offset * self._profile.tick_size
             sell_price = mid + tick_offset * self._profile.tick_size
             buy_price = self._round_to_step(buy_price, self._profile.tick_size)
             sell_price = self._round_to_step(sell_price, self._profile.tick_size)
             qty = self._round_down(
-                self._settings.test_notional_usd / mid, self._profile.step_size
+                self._settings.nominal_usd / mid, self._profile.step_size
             )
 
             if qty <= 0:
@@ -82,9 +94,7 @@ class TradeExecutor:
 
             notional = qty * mid
             if self._profile.min_notional is None:
-                self._logger(
-                    f"[TRADE] place_test_orders | minNotional not available tag={self.TAG}"
-                )
+                self._logger("[TRADE] place_test_orders | minNotional unknown")
             elif notional < self._profile.min_notional:
                 self._logger(
                     "[TRADE] place_test_orders | "
@@ -105,40 +115,51 @@ class TradeExecutor:
                 return 0
 
             buy_cost = qty * buy_price
+            can_buy = True
             if quote_state["free"] < buy_cost:
-                self._logger(
-                    f"[PRECHECK] insufficient {quote_asset} for BUY"
-                )
-                self.last_action = "precheck_failed"
-                self.orders_count = 0
-                return 0
+                self._logger(f"[PRECHECK] insufficient {quote_asset} for BUY")
+                can_buy = False
 
             borrowed_amount = 0.0
+            can_sell = True
+            borrow_failed = False
             if base_state["free"] < qty:
-                need = qty - base_state["free"]
-                borrowed_amount = self._round_up(need, self._profile.step_size)
-                if borrowed_amount <= 0:
-                    self._logger(
-                        f"[PRECHECK] insufficient {base_asset} for SELL"
-                    )
-                    self.last_action = "precheck_failed"
-                    self.orders_count = 0
-                    return 0
-                if not self._borrow_margin_asset(base_asset, borrowed_amount):
+                if not self._settings.allow_borrow:
+                    self._logger(f"[PRECHECK] insufficient {base_asset} for SELL")
+                    can_sell = False
+                elif self._borrow_allowed_by_api is False:
+                    self._log_borrow_unavailable()
                     self.last_action = "borrow_failed"
-                    self.orders_count = 0
-                    return 0
-                self.borrowed_assets[base_asset] = (
-                    self.borrowed_assets.get(base_asset, 0.0) + borrowed_amount
-                )
-                self._logger(
-                    f"[BORROW] asset={base_asset} amount={borrowed_amount:.8f} ok"
-                )
+                    borrow_failed = True
+                    can_sell = False
+                else:
+                    need = qty - base_state["free"]
+                    borrowed_amount = self._round_up(need, self._profile.step_size)
+                    if borrowed_amount <= 0:
+                        self._logger(f"[PRECHECK] insufficient {base_asset} for SELL")
+                        can_sell = False
+                    elif not self._borrow_margin_asset(base_asset, borrowed_amount):
+                        self.last_action = "borrow_failed"
+                        borrow_failed = True
+                        can_sell = False
+                        borrowed_amount = 0.0
+                    else:
+                        self.borrowed_assets[base_asset] = (
+                            self.borrowed_assets.get(base_asset, 0.0) + borrowed_amount
+                        )
+                        self._logger(
+                            f"[BORROW] asset={base_asset} amount={borrowed_amount:.8f} ok"
+                        )
+
+            if not can_buy and not can_sell:
+                self.last_action = "borrow_failed" if borrow_failed else "precheck_failed"
+                self.orders_count = 0
+                return 0
 
             self._logger(
                 "[TRADE] place_test_orders | "
                 f"mode={self._settings.account_mode} "
-                f"lev_hint={self._settings.max_leverage_hint} "
+                f"lev_hint={self._settings.leverage_hint} "
                 f"buy={buy_price:.5f} sell={sell_price:.5f} qty={qty:.5f} "
                 f"tag={self.TAG}"
             )
@@ -147,81 +168,97 @@ class TradeExecutor:
             timestamp = int(time.time() * 1000)
             buy_client_id = self._build_client_order_id("BUY", timestamp)
             sell_client_id = self._build_client_order_id("SELL", timestamp + 1)
-
-            buy_order = self._place_margin_order(
-                symbol=self._settings.symbol,
-                side="BUY",
-                quantity=qty,
-                price=buy_price,
-                is_isolated=is_isolated,
-                client_order_id=buy_client_id,
-                side_effect=None,
-            )
-            if not buy_order:
-                self._rollback_after_failure(
-                    base_asset=base_asset,
-                    borrowed_amount=borrowed_amount,
-                    reason="buy_failed",
-                )
-                self.last_action = "place_failed"
-                self.orders_count = 0
-                return 0
-            self._logger(
-                f"[ORDER] placed side=BUY qty={qty:.8f} price={buy_price:.8f} "
-                f"id={buy_order.get('orderId')}"
+            order_type = self._normalize_order_type(self._settings.order_type)
+            side_effect_type = self._normalize_side_effect_type(
+                self._settings.side_effect_type
             )
 
-            sell_order = self._place_margin_order(
-                symbol=self._settings.symbol,
-                side="SELL",
-                quantity=qty,
-                price=sell_price,
-                is_isolated=is_isolated,
-                client_order_id=sell_client_id,
-                side_effect=None,
-            )
-            if not sell_order:
-                self._cancel_margin_order(
+            buy_order = None
+            if can_buy:
+                buy_order = self._place_margin_order(
                     symbol=self._settings.symbol,
-                    order_id=buy_order.get("orderId"),
+                    side="BUY",
+                    quantity=qty,
+                    price=buy_price,
                     is_isolated=is_isolated,
-                    tag=self.TAG,
+                    client_order_id=buy_client_id,
+                    side_effect=side_effect_type,
+                    order_type=order_type,
                 )
-                self._rollback_after_failure(
-                    base_asset=base_asset,
-                    borrowed_amount=borrowed_amount,
-                    reason="sell_failed",
+                if not buy_order:
+                    self._rollback_after_failure(
+                        base_asset=base_asset,
+                        borrowed_amount=borrowed_amount,
+                        reason="buy_failed",
+                    )
+                    self.last_action = "place_failed"
+                    self.orders_count = 0
+                    return 0
+                self._logger(
+                    f"[ORDER] placed side=BUY qty={qty:.8f} price={buy_price:.8f} "
+                    f"id={buy_order.get('orderId')}"
                 )
-                self.last_action = "place_failed"
-                self.orders_count = 0
-                return 0
-            self._logger(
-                f"[ORDER] placed side=SELL qty={qty:.8f} price={sell_price:.8f} "
-                f"id={sell_order.get('orderId')}"
-            )
+
+            sell_order = None
+            if can_sell:
+                sell_order = self._place_margin_order(
+                    symbol=self._settings.symbol,
+                    side="SELL",
+                    quantity=qty,
+                    price=sell_price,
+                    is_isolated=is_isolated,
+                    client_order_id=sell_client_id,
+                    side_effect=side_effect_type,
+                    order_type=order_type,
+                )
+                if not sell_order:
+                    if buy_order:
+                        self._cancel_margin_order(
+                            symbol=self._settings.symbol,
+                            order_id=buy_order.get("orderId"),
+                            is_isolated=is_isolated,
+                            tag=self.TAG,
+                        )
+                    self._rollback_after_failure(
+                        base_asset=base_asset,
+                        borrowed_amount=borrowed_amount,
+                        reason="sell_failed",
+                    )
+                    self.last_action = "place_failed"
+                    self.orders_count = 0
+                    return 0
+                self._logger(
+                    f"[ORDER] placed side=SELL qty={qty:.8f} price={sell_price:.8f} "
+                    f"id={sell_order.get('orderId')}"
+                )
 
             now = time.time()
-            self.active_test_orders = [
-                {
-                    "orderId": buy_order.get("orderId"),
-                    "side": "BUY",
-                    "price": buy_price,
-                    "qty": qty,
-                    "created_ts": now,
-                    "tag": self.TAG,
-                },
-                {
-                    "orderId": sell_order.get("orderId"),
-                    "side": "SELL",
-                    "price": sell_price,
-                    "qty": qty,
-                    "created_ts": now,
-                    "tag": self.TAG,
-                },
-            ]
-            self.last_action = "placed_test_orders"
-            self.orders_count = 2
-            return 2
+            self.active_test_orders = []
+            if buy_order:
+                self.active_test_orders.append(
+                    {
+                        "orderId": buy_order.get("orderId"),
+                        "side": "BUY",
+                        "price": buy_price,
+                        "qty": qty,
+                        "created_ts": now,
+                        "tag": self.TAG,
+                    }
+                )
+            if sell_order:
+                self.active_test_orders.append(
+                    {
+                        "orderId": sell_order.get("orderId"),
+                        "side": "SELL",
+                        "price": sell_price,
+                        "qty": qty,
+                        "created_ts": now,
+                        "tag": self.TAG,
+                    }
+                )
+            self.last_action = "borrow_failed" if borrow_failed else "placed_test_orders"
+            self.orders_count = len(self.active_test_orders)
+            return self.orders_count
         finally:
             self._inflight_trade_action = False
 
@@ -285,16 +322,18 @@ class TradeExecutor:
         is_isolated: str,
         client_order_id: Optional[str],
         side_effect: Optional[str],
+        order_type: str,
     ) -> Optional[dict]:
         params = {
             "symbol": symbol,
             "side": side,
-            "type": "LIMIT",
-            "timeInForce": "GTC",
+            "type": order_type,
             "quantity": f"{quantity:.8f}",
-            "price": f"{price:.8f}",
             "isIsolated": is_isolated,
         }
+        if order_type == "LIMIT":
+            params["timeInForce"] = "GTC"
+            params["price"] = f"{price:.8f}"
         if side_effect:
             params["sideEffectType"] = side_effect
         if client_order_id:
@@ -330,7 +369,9 @@ class TradeExecutor:
             self._logger(f"[TRADE] cancel_order error: {exc} tag={tag}")
         return False
 
-    def _log_binance_error(self, action: str, exc: httpx.HTTPStatusError, params: dict) -> None:
+    def _log_binance_error(
+        self, action: str, exc: httpx.HTTPStatusError, params: dict
+    ) -> None:
         status = exc.response.status_code if exc.response else "?"
         code = None
         msg = None
@@ -343,6 +384,13 @@ class TradeExecutor:
             pass
         if exc.request and exc.request.url:
             path = exc.request.url.path
+        if action == "borrow" and (status == 401 or code == -1002):
+            key = f"{action}:{code or status}:{path}"
+            if self._should_dedup_log(key, 10.0):
+                return
+            self._borrow_allowed_by_api = False
+            self._log_borrow_unavailable()
+            return
         if code == -2014:
             self._logger(
                 "[AUTH] invalid api key format (-2014). "
@@ -352,6 +400,14 @@ class TradeExecutor:
         self._logger(
             f"[BINANCE_ERROR] action={action} http={status} code={code} msg={msg} path={path}"
         )
+
+    def _should_dedup_log(self, key: str, window_s: float) -> bool:
+        now = time.monotonic()
+        last = self._error_dedup.get(key, 0.0)
+        if now - last < window_s:
+            return True
+        self._error_dedup[key] = now
+        return False
 
     def _build_client_order_id(self, side: str, timestamp: int) -> str:
         raw = f"{self._client_tag}_{side}_{timestamp}"
@@ -386,6 +442,22 @@ class TradeExecutor:
             return symbol[:-4], "USDC"
         return symbol[:-3], symbol[-3:]
 
+    @staticmethod
+    def _normalize_order_type(value: str) -> str:
+        upper = value.upper()
+        if upper in {"LIMIT", "MARKET"}:
+            return upper
+        return "LIMIT"
+
+    @staticmethod
+    def _normalize_side_effect_type(value: str) -> Optional[str]:
+        upper = value.upper()
+        if upper == "NONE":
+            return None
+        if upper in {"AUTO_BORROW_REPAY", "MARGIN_BUY"}:
+            return upper
+        return "AUTO_BORROW_REPAY"
+
     def _get_margin_asset(self, asset: str) -> Optional[dict]:
         try:
             account = self._rest.get_margin_account()
@@ -416,6 +488,16 @@ class TradeExecutor:
         except Exception as exc:
             self._logger(f"[TRADE] borrow error: {exc} tag={self.TAG}")
         return False
+
+    def _log_borrow_unavailable(self) -> None:
+        now = time.monotonic()
+        if now - self._borrow_hint_ts < 10.0:
+            return
+        self._borrow_hint_ts = now
+        self._logger(
+            "BORROW недоступен для API-ключа. Проверь: включена маржинальная торговля для ключа, "
+            "разрешение Spot&Margin, нет IP-ограничений, и аккаунт имеет доступ к Cross Margin Borrow."
+        )
 
     def _repay_margin_asset(self, asset: str, amount: float) -> bool:
         params = {"asset": asset, "amount": f"{amount:.8f}"}

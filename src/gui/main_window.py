@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Optional
 
 from datetime import datetime
+import time
 
 import httpx
 from PySide6.QtCore import Qt, QTimer, Slot
@@ -59,8 +60,10 @@ class MainWindow(QMainWindow):
         self._config_store = ConfigStore()
         self._last_mid: Optional[float] = None
         self._orders_error_logged = False
-        self._margin_enabled = False
         self._margin_checked = False
+        self._margin_api_access = False
+        self._borrow_allowed_by_api: Optional[bool] = None
+        self._last_age_update_ts = 0.0
 
         self._ui_timer = QTimer(self)
         self._ui_timer.timeout.connect(self._refresh_ui)
@@ -86,7 +89,9 @@ class MainWindow(QMainWindow):
         header_layout = QHBoxLayout(header)
         header_layout.setContentsMargins(8, 6, 8, 6)
         header_layout.setSpacing(8)
-        self.summary_label = QLabel("EURIUSDT | SRC: NONE | AGE: — ms")
+        self.summary_label = QLabel(
+            "EURIUSDT | SRC: NONE | MARGIN_AUTH: — | BORROW: — | last_action: — | orders: —"
+        )
         self.summary_label.setStyleSheet("font-weight: 600;")
         self.connect_button = QPushButton("CONNECT")
         self.connect_button.clicked.connect(self._toggle_connection)
@@ -136,10 +141,12 @@ class MainWindow(QMainWindow):
         self.mid_label = QLabel("Mid: —")
         self.bid_label = QLabel("Bid: —")
         self.ask_label = QLabel("Ask: —")
+        self.age_label = QLabel("Age: — ms")
         market_column.addWidget(market_title)
         market_column.addWidget(self.mid_label)
         market_column.addWidget(self.bid_label)
         market_column.addWidget(self.ask_label)
+        market_column.addWidget(self.age_label)
 
         health_column = QVBoxLayout()
         health_title = QLabel("Health")
@@ -293,8 +300,9 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self._append_log(f"REST init error: {exc}")
 
-        self._margin_enabled = False
         self._margin_checked = False
+        self._margin_api_access = False
+        self._borrow_allowed_by_api = None
         if self._rest and self._has_valid_api_credentials(api_credentials):
             self._check_margin_permissions()
 
@@ -310,6 +318,9 @@ class MainWindow(QMainWindow):
                 settings=self._settings,
                 profile=self._symbol_profile,
                 logger=self._append_log,
+            )
+            self._trade_executor.set_margin_capabilities(
+                self._margin_api_access, self._borrow_allowed_by_api
             )
             self._update_trading_controls()
         else:
@@ -356,8 +367,9 @@ class MainWindow(QMainWindow):
 
         self._connected = False
         self._ws_connected = False
-        self._margin_enabled = False
         self._margin_checked = False
+        self._margin_api_access = False
+        self._borrow_allowed_by_api = None
         self._update_status(False)
         self._append_log("DISCONNECT: data services stopped")
 
@@ -413,18 +425,27 @@ class MainWindow(QMainWindow):
         self.mid_label.setText(f"Mid: {self._fmt_price(price_state.mid)}")
         self.bid_label.setText(f"Bid: {self._fmt_price(price_state.bid)}")
         self.ask_label.setText(f"Ask: {self._fmt_price(price_state.ask)}")
-        summary_age = self._fmt_int(price_state.mid_age_ms)
         last_action = "—"
         orders_count = "—"
         if self._trade_executor:
             last_action = self._trade_executor.last_action
             orders_count = str(self._trade_executor.orders_count)
-        margin_auth = "OK" if self._margin_enabled else "NO"
+        margin_auth = "OK" if self._margin_api_access else "FAIL"
+        borrow_status = "—"
+        if self._borrow_allowed_by_api is not None:
+            borrow_status = "OK" if self._borrow_allowed_by_api else "FAIL"
         self.summary_label.setText(
             f"{self._settings.symbol if self._settings else 'EURIUSDT'} | "
-            f"SRC: {price_state.source} | AGE: {summary_age} ms | "
-            f"MARGIN_AUTH: {margin_auth} | last_action: {last_action} | orders: {orders_count}"
+            f"SRC: {price_state.source} | "
+            f"MARGIN_AUTH: {margin_auth} | BORROW: {borrow_status} | "
+            f"last_action: {last_action} | orders: {orders_count}"
         )
+        now = time.monotonic()
+        if now - self._last_age_update_ts >= 0.25:
+            self._last_age_update_ts = now
+            self.age_label.setText(
+                f"Age: {self._fmt_int(price_state.mid_age_ms)} ms"
+            )
 
         self.ws_connected_label.setText(f"ws_connected: {health_state.ws_connected}")
         self.ws_age_label.setText(f"ws_age_ms: {self._fmt_int(health_state.ws_age_ms)}")
@@ -449,13 +470,12 @@ class MainWindow(QMainWindow):
     def _update_trading_controls(self, price_state: Optional[object] = None) -> None:
         if price_state is not None:
             self._last_mid = price_state.mid
-        mid_available = self._last_mid is not None
         can_trade = (
             self._connected
             and self._trade_executor is not None
             and self._has_valid_api_credentials(self._api_credentials)
         )
-        self.start_button.setEnabled(can_trade and self._margin_enabled and mid_available)
+        self.start_button.setEnabled(can_trade and self._margin_api_access)
         self.stop_button.setEnabled(can_trade)
 
     def _check_margin_permissions(self) -> None:
@@ -463,9 +483,12 @@ class MainWindow(QMainWindow):
             return
         try:
             self._rest.get_margin_account()
-            self._margin_enabled = True
+            self._margin_api_access = True
             self._margin_checked = True
-            self._append_log("[MARGIN_CHECK] ok")
+            borrow_allowed = self._probe_borrow_access()
+            self._borrow_allowed_by_api = borrow_allowed
+            borrow_status = "ok" if borrow_allowed else "fail"
+            self._append_log(f"[MARGIN_CHECK] ok borrow={borrow_status}")
         except httpx.HTTPStatusError as exc:
             status = exc.response.status_code if exc.response else "?"
             code = None
@@ -479,21 +502,27 @@ class MainWindow(QMainWindow):
                 pass
             if exc.request and exc.request.url:
                 path = exc.request.url.path
-            self._margin_enabled = False
+            self._margin_api_access = False
             self._margin_checked = True
+            self._borrow_allowed_by_api = None
             self._append_log(
                 f"[MARGIN_CHECK] fail http={status} code={code} msg={msg} path={path}"
             )
         except Exception as exc:
-            self._margin_enabled = False
+            self._margin_api_access = False
             self._margin_checked = True
+            self._borrow_allowed_by_api = None
             self._append_log(f"[MARGIN_CHECK] error: {exc}")
+        if self._trade_executor:
+            self._trade_executor.set_margin_capabilities(
+                self._margin_api_access, self._borrow_allowed_by_api
+            )
 
     @Slot()
     def _start_trading(self) -> None:
         if not self._trade_executor:
             return
-        if not self._margin_enabled:
+        if not self._margin_api_access:
             self._append_log("[TRADE] blocked: margin_not_authorized")
             self._trade_executor.last_action = "margin_not_authorized"
             return
@@ -557,9 +586,14 @@ class MainWindow(QMainWindow):
             http_interval_ms=int(payload.get("http_interval_ms", 1000)),
             ui_refresh_ms=int(payload.get("ui_refresh_ms", 100)),
             account_mode=str(payload.get("account_mode", "CROSS_MARGIN")),
-            max_leverage_hint=int(payload.get("max_leverage_hint", 3)),
-            test_notional_usd=float(payload.get("test_notional_usd", 10.0)),
-            test_tick_offset=int(payload.get("test_tick_offset", 1)),
+            leverage_hint=int(
+                payload.get("leverage_hint", payload.get("max_leverage_hint", 3))
+            ),
+            nominal_usd=float(payload.get("nominal_usd", payload.get("test_notional_usd", 10.0))),
+            offset_ticks=int(payload.get("offset_ticks", payload.get("test_tick_offset", 1))),
+            order_type=str(payload.get("order_type", "LIMIT")).upper(),
+            allow_borrow=bool(payload.get("allow_borrow", True)),
+            side_effect_type=str(payload.get("side_effect_type", "AUTO_BORROW_REPAY")).upper(),
             margin_isolated=bool(payload.get("margin_isolated", False)),
         )
 
@@ -606,10 +640,20 @@ class MainWindow(QMainWindow):
         dialog.saved.connect(self._on_trade_settings_saved)
         dialog.exec()
 
-    def _on_trade_settings_saved(self, notional: float, tick_offset: int) -> None:
+    def _on_trade_settings_saved(
+        self,
+        notional: float,
+        tick_offset: int,
+        order_type: str,
+        allow_borrow: bool,
+        side_effect_type: str,
+    ) -> None:
         if self._settings:
-            self._settings.test_notional_usd = notional
-            self._settings.test_tick_offset = tick_offset
+            self._settings.nominal_usd = notional
+            self._settings.offset_ticks = tick_offset
+            self._settings.order_type = order_type
+            self._settings.allow_borrow = allow_borrow
+            self._settings.side_effect_type = side_effect_type
         self._append_log("[SETTINGS] saved")
 
     def _on_api_saved(self, key: str, secret: str) -> None:
@@ -640,6 +684,41 @@ class MainWindow(QMainWindow):
                 logger=self._append_log,
             )
         self._update_trading_controls()
+        if self._trade_executor:
+            self._trade_executor.set_margin_capabilities(
+                self._margin_api_access, self._borrow_allowed_by_api
+            )
+
+    def _probe_borrow_access(self) -> bool:
+        if not self._settings or not self._rest:
+            return False
+        base_asset, _ = self._split_symbol(self._settings.symbol)
+        try:
+            self._rest.probe_margin_borrow_access(base_asset)
+            return True
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code if exc.response else "?"
+            code = None
+            try:
+                payload = exc.response.json() if exc.response else {}
+                code = payload.get("code")
+            except Exception:
+                pass
+            if status == 401 or code == -1002:
+                return False
+            return True
+        except Exception:
+            return True
+
+    @staticmethod
+    def _split_symbol(symbol: str) -> tuple[str, str]:
+        if symbol.endswith("USDT"):
+            return symbol[:-4], "USDT"
+        if symbol.endswith("BUSD"):
+            return symbol[:-4], "BUSD"
+        if symbol.endswith("USDC"):
+            return symbol[:-4], "USDC"
+        return symbol[:-3], symbol[-3:]
 
     def _load_env(self) -> dict:
         env_path = Path(__file__).resolve().parents[2] / "config" / ".env"
