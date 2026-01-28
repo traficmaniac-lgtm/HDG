@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import re
 import time
 from typing import Callable, Optional
 
@@ -28,6 +29,7 @@ class TradeExecutor:
         self._profile = profile
         self._logger = logger
         self.active_test_orders: list[dict] = []
+        self._client_tag = self._sanitize_client_order_id(self.TAG)
 
     def place_test_orders_margin(self) -> int:
         price_state, _ = self._router.build_price_state()
@@ -88,8 +90,8 @@ class TradeExecutor:
         is_isolated = "TRUE" if self._settings.margin_isolated else "FALSE"
         side_effect = "MARGIN_BUY"
         timestamp = int(time.time() * 1000)
-        buy_client_id = f"{self.TAG}_BUY_{timestamp}"
-        sell_client_id = f"{self.TAG}_SELL_{timestamp + 1}"
+        buy_client_id = self._build_client_order_id("BUY", timestamp)
+        sell_client_id = self._build_client_order_id("SELL", timestamp + 1)
 
         buy_order = self._place_margin_order(
             symbol=self._settings.symbol,
@@ -176,7 +178,7 @@ class TradeExecutor:
         cancelled = 0
         for order in open_orders:
             client_order_id = order.get("clientOrderId", "")
-            if not client_order_id.startswith(self.TAG):
+            if not client_order_id.startswith(self._client_tag):
                 continue
             order_id = order.get("orderId")
             if not order_id:
@@ -263,6 +265,17 @@ class TradeExecutor:
             "[TRADE] binance_error | "
             f"action={action} status={status} code={code} msg={msg} params={params} tag={self.TAG}"
         )
+
+    def _build_client_order_id(self, side: str, timestamp: int) -> str:
+        raw = f"{self._client_tag}_{side}_{timestamp}"
+        sanitized = self._sanitize_client_order_id(raw)
+        if len(sanitized) > 36:
+            sanitized = sanitized[-36:]
+        return sanitized
+
+    @staticmethod
+    def _sanitize_client_order_id(value: str) -> str:
+        return re.sub(r"[^a-zA-Z0-9-_]", "_", value)
 
     @staticmethod
     def _round_down(value: float, step: float) -> float:
