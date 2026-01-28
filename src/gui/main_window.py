@@ -5,13 +5,16 @@ from importlib.util import find_spec
 from pathlib import Path
 from typing import Optional
 
+from datetime import datetime
+
 from PySide6.QtCore import Qt, QTimer, Slot
-from PySide6.QtGui import QAction
+from PySide6.QtGui import QAction, QStandardItem, QStandardItemModel
 from PySide6.QtWidgets import (
     QFileDialog,
     QFrame,
     QGroupBox,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QMainWindow,
     QMenu,
@@ -27,6 +30,7 @@ from src.core.config_store import ApiCredentials, ConfigStore
 from src.core.models import Settings, SymbolProfile
 from src.core.version import VERSION
 from src.gui.api_settings_dialog import ApiSettingsDialog
+from src.gui.trade_settings_dialog import TradeSettingsDialog
 from src.services.binance_rest import BinanceRestClient
 from src.services.http_price import HttpPriceService
 from src.services.price_router import PriceRouter
@@ -48,16 +52,18 @@ class MainWindow(QMainWindow):
         self._http_service: Optional[HttpPriceService] = None
         self._trade_executor: Optional[TradeExecutor] = None
         self._symbol_profile = SymbolProfile()
-        self._last_trade_action = "—"
-        self._orders_count = 0
         self._auth_warning_shown = False
         self._api_credentials = ApiCredentials()
         self._config_store = ConfigStore()
+        self._last_mid: Optional[float] = None
+        self._orders_error_logged = False
 
         self._ui_timer = QTimer(self)
         self._ui_timer.timeout.connect(self._refresh_ui)
         self._http_timer = QTimer(self)
         self._http_timer.timeout.connect(self._poll_http)
+        self._orders_timer = QTimer(self)
+        self._orders_timer.timeout.connect(self._refresh_orders)
 
         self._ws_thread = None
         self._ws_worker = None
@@ -74,81 +80,136 @@ class MainWindow(QMainWindow):
 
         header = QFrame()
         header_layout = QHBoxLayout(header)
-        self.title_label = QLabel(f"Directional Hedge Scalper v{VERSION} — EURIUSDT Core")
-        self.title_label.setStyleSheet("font-weight: 600; font-size: 16px;")
+        header_layout.setContentsMargins(8, 6, 8, 6)
+        header_layout.setSpacing(8)
+        self.summary_label = QLabel("EURIUSDT | SRC: NONE | AGE: — ms")
+        self.summary_label.setStyleSheet("font-weight: 600;")
         self.connect_button = QPushButton("CONNECT")
         self.connect_button.clicked.connect(self._toggle_connection)
         self.status_label = QLabel("DISCONNECTED")
         self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.status_label.setFixedWidth(140)
         self.status_label.setStyleSheet("color: #ff5f57; font-weight: 600;")
-        header_layout.addWidget(self.title_label)
+        self.start_button = QPushButton("START")
+        self.start_button.clicked.connect(self._start_trading)
+        self.stop_button = QPushButton("STOP")
+        self.stop_button.clicked.connect(self._stop_trading)
+        self.settings_button = QPushButton("⚙ Настройки")
+        self.settings_button.clicked.connect(self._open_trade_settings)
+        for button in (
+            self.connect_button,
+            self.start_button,
+            self.stop_button,
+            self.settings_button,
+        ):
+            button.setFixedHeight(28)
+        self.start_button.setEnabled(False)
+        self.stop_button.setEnabled(False)
+
+        buttons_layout = QHBoxLayout()
+        buttons_layout.setSpacing(6)
+        buttons_layout.addWidget(self.connect_button)
+        buttons_layout.addWidget(self.start_button)
+        buttons_layout.addWidget(self.stop_button)
+        buttons_layout.addWidget(self.settings_button)
+
+        header_layout.addWidget(self.summary_label)
         header_layout.addStretch(1)
-        header_layout.addWidget(self.connect_button)
+        header_layout.addLayout(buttons_layout)
+        header_layout.addStretch(1)
         header_layout.addWidget(self.status_label)
         root.addWidget(header)
 
-        blocks = QHBoxLayout()
         tabs = QTabWidget()
 
-        self.market_box = QGroupBox("Market (EURIUSDT)")
-        market_layout = QVBoxLayout(self.market_box)
+        summary_frame = QGroupBox("Сводка")
+        summary_layout = QHBoxLayout(summary_frame)
+        summary_layout.setSpacing(16)
+
+        market_column = QVBoxLayout()
+        market_title = QLabel("Market")
+        market_title.setStyleSheet("font-weight: 600;")
         self.mid_label = QLabel("Mid: —")
         self.bid_label = QLabel("Bid: —")
         self.ask_label = QLabel("Ask: —")
-        self.age_label = QLabel("Age (ms): —")
-        self.source_label = QLabel("Source: NONE")
-        market_layout.addWidget(self.mid_label)
-        market_layout.addWidget(self.bid_label)
-        market_layout.addWidget(self.ask_label)
-        market_layout.addWidget(self.age_label)
-        market_layout.addWidget(self.source_label)
-        blocks.addWidget(self.market_box)
+        market_column.addWidget(market_title)
+        market_column.addWidget(self.mid_label)
+        market_column.addWidget(self.bid_label)
+        market_column.addWidget(self.ask_label)
 
-        self.symbol_box = QGroupBox("Symbol Profile")
-        symbol_layout = QVBoxLayout(self.symbol_box)
-        self.tick_label = QLabel("tickSize: —")
-        self.step_label = QLabel("stepSize: —")
-        self.min_qty_label = QLabel("minQty: —")
-        self.min_notional_label = QLabel("minNotional: —")
-        symbol_layout.addWidget(self.tick_label)
-        symbol_layout.addWidget(self.step_label)
-        symbol_layout.addWidget(self.min_qty_label)
-        symbol_layout.addWidget(self.min_notional_label)
-        blocks.addWidget(self.symbol_box)
-
-        self.health_box = QGroupBox("Health")
-        health_layout = QVBoxLayout(self.health_box)
+        health_column = QVBoxLayout()
+        health_title = QLabel("Health")
+        health_title.setStyleSheet("font-weight: 600;")
         self.ws_connected_label = QLabel("ws_connected: False")
         self.ws_age_label = QLabel("ws_age_ms: —")
         self.http_age_label = QLabel("http_age_ms: —")
         self.switch_reason_label = QLabel("last_switch_reason: —")
-        health_layout.addWidget(self.ws_connected_label)
-        health_layout.addWidget(self.ws_age_label)
-        health_layout.addWidget(self.http_age_label)
-        health_layout.addWidget(self.switch_reason_label)
-        blocks.addWidget(self.health_box)
+        health_column.addWidget(health_title)
+        health_column.addWidget(self.ws_connected_label)
+        health_column.addWidget(self.ws_age_label)
+        health_column.addWidget(self.http_age_label)
+        health_column.addWidget(self.switch_reason_label)
 
-        self.trade_box = QGroupBox("Trading (TEST)")
-        trade_layout = QVBoxLayout(self.trade_box)
-        self.start_button = QPushButton("START TRADING (TEST)")
-        self.start_button.clicked.connect(self._start_trading)
-        self.stop_button = QPushButton("STOP")
-        self.stop_button.clicked.connect(self._stop_trading)
-        self.start_button.setEnabled(False)
-        self.stop_button.setEnabled(False)
-        self.orders_label = QLabel("orders: 0")
-        self.last_action_label = QLabel("last_action: —")
-        trade_layout.addWidget(self.start_button)
-        trade_layout.addWidget(self.stop_button)
-        trade_layout.addWidget(self.orders_label)
-        trade_layout.addWidget(self.last_action_label)
-        blocks.addWidget(self.trade_box)
+        profile_column = QVBoxLayout()
+        profile_title = QLabel("Profile")
+        profile_title.setStyleSheet("font-weight: 600;")
+        self.tick_label = QLabel("tickSize: —")
+        self.step_label = QLabel("stepSize: —")
+        self.min_qty_label = QLabel("minQty: —")
+        self.min_notional_label = QLabel("minNotional: —")
+        profile_column.addWidget(profile_title)
+        profile_column.addWidget(self.tick_label)
+        profile_column.addWidget(self.step_label)
+        profile_column.addWidget(self.min_qty_label)
+        profile_column.addWidget(self.min_notional_label)
+
+        summary_layout.addLayout(market_column)
+        summary_layout.addLayout(health_column)
+        summary_layout.addLayout(profile_column)
 
         terminal_tab = QWidget()
         terminal_layout = QVBoxLayout(terminal_tab)
-        terminal_layout.addLayout(blocks)
-        terminal_layout.addStretch(1)
+        terminal_layout.setSpacing(8)
+        terminal_layout.addWidget(summary_frame)
+
+        orders_box = QGroupBox("Ордера")
+        orders_layout = QVBoxLayout(orders_box)
+        pnl_layout = QHBoxLayout()
+        self.pnl_unrealized_label = QLabel("Unrealized (est): —")
+        self.pnl_cycle_label = QLabel("PnL за цикл: —")
+        self.pnl_session_label = QLabel("Session PnL: —")
+        pnl_layout.addWidget(self.pnl_unrealized_label)
+        pnl_layout.addSpacing(12)
+        pnl_layout.addWidget(self.pnl_cycle_label)
+        pnl_layout.addSpacing(12)
+        pnl_layout.addWidget(self.pnl_session_label)
+        pnl_layout.addStretch(1)
+        orders_layout.addLayout(pnl_layout)
+
+        self.orders_model = QStandardItemModel(0, 9, self)
+        self.orders_model.setHorizontalHeaderLabels(
+            [
+                "time",
+                "orderId",
+                "side",
+                "price",
+                "qty",
+                "status",
+                "age_ms",
+                "pnl_est",
+                "tag",
+            ]
+        )
+        self.orders_table = QTableView()
+        self.orders_table.setModel(self.orders_model)
+        self.orders_table.verticalHeader().setVisible(False)
+        self.orders_table.setAlternatingRowColors(True)
+        self.orders_table.setSelectionBehavior(QTableView.SelectionBehavior.SelectRows)
+        header = self.orders_table.horizontalHeader()
+        header.setStretchLastSection(True)
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        orders_layout.addWidget(self.orders_table, stretch=1)
+        terminal_layout.addWidget(orders_box, stretch=1)
         tabs.addTab(terminal_tab, "Terminal")
 
         logs_tab = QWidget()
@@ -252,6 +313,7 @@ class MainWindow(QMainWindow):
         self._start_ws()
         self._http_timer.start(self._settings.http_interval_ms)
         self._ui_timer.start(self._settings.ui_refresh_ms)
+        self._orders_timer.start(1000)
 
         self._connected = True
         self._update_status(True)
@@ -263,6 +325,7 @@ class MainWindow(QMainWindow):
 
         self._ui_timer.stop()
         self._http_timer.stop()
+        self._orders_timer.stop()
 
         if self._ws_worker is not None:
             self._ws_worker.stop()
@@ -278,9 +341,10 @@ class MainWindow(QMainWindow):
         self._trade_executor = None
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(False)
-        self._orders_count = 0
-        self._last_trade_action = "—"
-        self._update_trade_labels()
+        self._orders_model_clear()
+        self.pnl_unrealized_label.setText("Unrealized (est): —")
+        self.pnl_cycle_label.setText("PnL за цикл: —")
+        self.pnl_session_label.setText("Session PnL: —")
 
         self._connected = False
         self._ws_connected = False
@@ -334,14 +398,16 @@ class MainWindow(QMainWindow):
             return
         price_state, health_state = self._router.build_price_state()
         health_state.ws_connected = self._ws_connected
+        self._last_mid = price_state.mid
 
         self.mid_label.setText(f"Mid: {self._fmt_price(price_state.mid)}")
         self.bid_label.setText(f"Bid: {self._fmt_price(price_state.bid)}")
         self.ask_label.setText(f"Ask: {self._fmt_price(price_state.ask)}")
-        self.age_label.setText(
-            f"Age (ms): {self._fmt_int(price_state.mid_age_ms)}"
+        summary_age = self._fmt_int(price_state.mid_age_ms)
+        self.summary_label.setText(
+            f"{self._settings.symbol if self._settings else 'EURIUSDT'} | "
+            f"SRC: {price_state.source} | AGE: {summary_age} ms"
         )
-        self.source_label.setText(f"Source: {price_state.source}")
 
         self.ws_connected_label.setText(f"ws_connected: {health_state.ws_connected}")
         self.ws_age_label.setText(f"ws_age_ms: {self._fmt_int(health_state.ws_age_ms)}")
@@ -351,10 +417,6 @@ class MainWindow(QMainWindow):
         self.switch_reason_label.setText(
             f"last_switch_reason: {health_state.last_switch_reason or '—'}"
         )
-
-    def _update_trade_labels(self) -> None:
-        self.orders_label.setText(f"orders: {self._orders_count}")
-        self.last_action_label.setText(f"last_action: {self._last_trade_action}")
 
     def _update_status(self, connected: bool) -> None:
         if connected:
@@ -372,18 +434,14 @@ class MainWindow(QMainWindow):
             return
         placed = self._trade_executor.place_test_orders_margin()
         if placed:
-            self._orders_count = placed
-            self._last_trade_action = "placed"
-            self._update_trade_labels()
+            self._refresh_orders()
 
     @Slot()
     def _stop_trading(self) -> None:
         if not self._trade_executor:
             return
         self._trade_executor.cancel_test_orders_margin()
-        self._orders_count = 0
-        self._last_trade_action = "cancelled"
-        self._update_trade_labels()
+        self._refresh_orders()
 
     @Slot()
     def _save_log(self) -> None:
@@ -474,6 +532,21 @@ class MainWindow(QMainWindow):
         dialog.saved.connect(self._on_api_saved)
         dialog.exec()
 
+    def _open_trade_settings(self) -> None:
+        dialog = TradeSettingsDialog(
+            self,
+            store=self._config_store,
+            settings=self._settings,
+        )
+        dialog.saved.connect(self._on_trade_settings_saved)
+        dialog.exec()
+
+    def _on_trade_settings_saved(self, notional: float, tick_offset: int) -> None:
+        if self._settings:
+            self._settings.test_notional_usd = notional
+            self._settings.test_tick_offset = tick_offset
+        self._append_log("[SETTINGS] saved")
+
     def _on_api_saved(self, key: str, secret: str) -> None:
         self._api_credentials = ApiCredentials(key=key, secret=secret)
         if self._rest:
@@ -538,6 +611,92 @@ class MainWindow(QMainWindow):
         self.min_notional_label.setText(
             f"minNotional: {self._fmt_price(profile.min_notional)}"
         )
+
+    def _orders_model_clear(self) -> None:
+        self.orders_model.removeRows(0, self.orders_model.rowCount())
+
+    def _refresh_orders(self) -> None:
+        if not self._connected or not self._rest or not self._settings:
+            return
+        try:
+            open_orders = self._rest.get_margin_open_orders(self._settings.symbol)
+        except Exception as exc:
+            if not self._orders_error_logged:
+                self._append_log(f"[ORDERS] fetch failed: {exc}")
+                self._orders_error_logged = True
+            return
+
+        self._orders_error_logged = False
+        self._orders_model_clear()
+        mid = self._last_mid
+        total_pnl = 0.0
+        now_ms = int(datetime.utcnow().timestamp() * 1000)
+        for order in open_orders:
+            order_time = order.get("time")
+            age_ms = None
+            if isinstance(order_time, int):
+                age_ms = max(0, now_ms - order_time)
+            qty = self._safe_float(order.get("origQty"))
+            price = self._safe_float(order.get("price"))
+            side = str(order.get("side", "—")).upper()
+            pnl_est = None
+            if mid is not None and qty is not None and price is not None:
+                if side == "BUY":
+                    pnl_est = (mid - price) * qty
+                elif side == "SELL":
+                    pnl_est = (price - mid) * qty
+            if pnl_est is not None:
+                total_pnl += pnl_est
+            display_time = self._format_time(order_time)
+            row = [
+                display_time,
+                self._short_order_id(order.get("orderId")),
+                side or "—",
+                self._fmt_price(price),
+                self._fmt_qty(qty),
+                str(order.get("status", "—")),
+                self._fmt_int(age_ms),
+                self._fmt_pnl(pnl_est),
+                str(order.get("clientOrderId", "—")),
+            ]
+            items = [QStandardItem(value) for value in row]
+            for item in items:
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.orders_model.appendRow(items)
+
+        if open_orders:
+            self.pnl_unrealized_label.setText(
+                f"Unrealized (est): {self._fmt_pnl(total_pnl)}"
+            )
+        else:
+            self.pnl_unrealized_label.setText("Unrealized (est): —")
+
+    @staticmethod
+    def _format_time(value: Optional[int]) -> str:
+        if not value:
+            return "—"
+        try:
+            return datetime.fromtimestamp(value / 1000).strftime("%H:%M:%S")
+        except (OSError, ValueError):
+            return "—"
+
+    @staticmethod
+    def _short_order_id(value: Optional[int]) -> str:
+        if value is None:
+            return "—"
+        return str(value)[-6:]
+
+    @staticmethod
+    def _fmt_qty(value: Optional[float]) -> str:
+        if value is None:
+            return "—"
+        return f"{value:.4f}"
+
+    @staticmethod
+    def _fmt_pnl(value: Optional[float]) -> str:
+        if value is None:
+            return "—"
+        return f"{value:.4f}"
 
     @staticmethod
     def _fmt_price(value: Optional[float]) -> str:
