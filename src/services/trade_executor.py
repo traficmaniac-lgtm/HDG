@@ -58,6 +58,7 @@ class TradeExecutor:
         self._buy_wait_started_ts: Optional[float] = None
         self._buy_retry_count = 0
         self._entry_attempt_started_ts: Optional[float] = None
+        self._entry_reprice_last_ts = 0.0
         self._sell_wait_started_ts: Optional[float] = None
         self._sell_retry_count = 0
         self.sell_active_order_id: Optional[int] = None
@@ -123,8 +124,7 @@ class TradeExecutor:
                 self._logger("[TRADE] blocked: data_blind")
                 self.last_action = "DATA_BLIND"
                 return 0
-            entry_mode = str(getattr(self._settings, "entry_mode", "NORMAL") or "NORMAL").upper()
-            if mid is None or bid is None or (entry_mode == "AGGRESSIVE" and ask is None):
+            if mid is None or bid is None:
                 now = time.monotonic()
                 if now - self._last_no_price_log_ts >= 2.0:
                     self._last_no_price_log_ts = now
@@ -156,7 +156,7 @@ class TradeExecutor:
                 self.orders_count = 0
                 return 0
 
-            buy_price = self._calculate_entry_price(bid, ask, entry_mode)
+            buy_price = self._calculate_entry_price(bid)
             if buy_price is None:
                 self._logger("[TRADE] place_test_orders | invalid entry price")
                 return 0
@@ -252,6 +252,8 @@ class TradeExecutor:
             self._transition_state(TradeState.STATE_PLACE_BUY)
             self.last_action = "placing_buy"
             self._start_entry_attempt()
+            self._entry_reprice_last_ts = time.monotonic()
+            self._log_entry_place(buy_price, bid, ask)
             buy_order = self._place_margin_order(
                 symbol=self._settings.symbol,
                 side="BUY",
@@ -895,25 +897,23 @@ class TradeExecutor:
         )
         return ok, bid, ask, mid, age_ms, "HTTP", status
 
-    def _calculate_entry_price(
-        self, bid: float, ask: float, mode: str
-    ) -> Optional[float]:
+    def _calculate_entry_price(self, bid: float) -> Optional[float]:
         if not self._profile.tick_size:
             return None
         tick_size = self._profile.tick_size
-        if mode == "AGGRESSIVE":
-            offset = max(0, min(int(self._settings.aggressive_offset_ticks), 2))
-            raw_price = ask - offset * tick_size
-        else:
-            offset = max(0, int(self._settings.entry_offset_ticks))
-            raw_price = bid + offset * tick_size
+        offset = max(0, int(self._settings.entry_offset_ticks))
+        raw_price = bid + offset * tick_size
         return self._round_to_step(raw_price, tick_size)
 
-    def _maybe_handle_buy_ttl(self, open_orders: dict[int, dict]) -> None:
+    def _log_entry_place(
+        self, price: float, bid: Optional[float], ask: Optional[float]
+    ) -> None:
+        bid_label = "?" if bid is None else f"{bid:.8f}"
+        ask_label = "?" if ask is None else f"{ask:.8f}"
+        self._logger(f"[ENTRY_PLACE] price={price:.8f} bid={bid_label} ask={ask_label}")
+
+    def _handle_entry_follow_top(self, open_orders: dict[int, dict]) -> None:
         if self.state != TradeState.STATE_WAIT_BUY:
-            return
-        ttl_ms = int(self._settings.buy_ttl_ms)
-        if ttl_ms <= 0:
             return
         buy_order = self._find_order("BUY")
         if not buy_order or buy_order.get("status") == "FILLED":
@@ -922,107 +922,37 @@ class TradeExecutor:
             return
         if self._buy_wait_started_ts is None:
             self._start_buy_wait()
-            return
-        elapsed_ms = (time.monotonic() - self._buy_wait_started_ts) * 1000.0
-        if elapsed_ms < ttl_ms:
-            return
-        self._logger("[BUY_TTL_EXPIRED]")
-        order_id = buy_order.get("orderId")
-        if order_id:
-            live_order = self._get_margin_order_snapshot(order_id)
-            if live_order:
-                status = str(live_order.get("status") or "").upper()
-                executed_qty = float(
-                    live_order.get("executedQty", 0.0)
-                    or live_order.get("executedQuantity", 0.0)
-                    or 0.0
-                )
-                cum_quote = float(live_order.get("cummulativeQuoteQty", 0.0) or 0.0)
-                avg_price = 0.0
-                if executed_qty > 0 and cum_quote > 0:
-                    avg_price = cum_quote / executed_qty
-                else:
-                    avg_price = float(
-                        live_order.get("avgPrice", 0.0)
-                        or live_order.get("price", 0.0)
-                        or 0.0
-                    )
-                if status:
-                    buy_order["status"] = status
-                if executed_qty > 0:
-                    buy_order["cum_qty"] = executed_qty
-                    buy_order["avg_fill_price"] = avg_price
-                    buy_order["last_fill_price"] = avg_price
-                if status == "FILLED":
-                    buy_order["qty"] = (
-                        executed_qty if executed_qty > 0 else buy_order.get("qty")
-                    )
-                    if avg_price > 0:
-                        buy_order["price"] = avg_price
-                    self._apply_order_filled(buy_order)
-                    self.active_test_orders = [
-                        entry
-                        for entry in self.active_test_orders
-                        if entry.get("orderId") != order_id
-                    ]
-                    self.orders_count = len(self.active_test_orders)
-                    return
-        cum_qty = float(buy_order.get("cum_qty", 0.0) or 0.0)
-        avg_fill_price = float(buy_order.get("avg_fill_price", 0.0) or 0.0)
-        last_fill_price = buy_order.get("last_fill_price")
-        if cum_qty > 0:
-            order_id = buy_order.get("orderId")
-            if order_id and order_id in open_orders:
-                is_isolated = "TRUE" if self._settings.margin_isolated else "FALSE"
-                self._cancel_margin_order(
-                    symbol=self._settings.symbol,
-                    order_id=order_id,
-                    is_isolated=is_isolated,
-                    tag=buy_order.get("tag", self.TAG),
-                )
-            self.active_test_orders = [
-                entry for entry in self.active_test_orders if entry.get("orderId") != order_id
-            ]
-            self.orders_count = len(self.active_test_orders)
-            price_fallback = (
-                avg_fill_price
-                if avg_fill_price > 0
-                else float(last_fill_price or buy_order.get("price") or 0.0)
-            )
-            avg_label = avg_fill_price if avg_fill_price > 0 else price_fallback
-            self.position = {
-                "buy_price": price_fallback if price_fallback > 0 else None,
-                "qty": cum_qty,
-                "opened_ts": int(time.time() * 1000),
-                "partial": True,
-                "initial_qty": cum_qty,
-            }
-            self._set_position_qty_base(cum_qty)
-            self._reset_exit_intent()
-            self._last_buy_price = self.position.get("buy_price") or self._last_buy_price
-            self._reset_buy_retry()
-            self._clear_entry_attempt()
-            self._transition_state(TradeState.STATE_POSITION_OPEN)
-            self._logger(
-                f"[BUY_PARTIAL_COMMIT] qty={cum_qty:.8f} avg={avg_label:.8f}"
-            )
-            if not self._settings.auto_exit_enabled:
-                self._logger("[PARTIAL_HELD_NO_AUTO_EXIT]")
-            return
-        max_retries = int(self._settings.max_buy_retries)
-        if self._buy_retry_count >= max_retries:
-            self._logger(
-                f"[ENTRY_ABORT_RETRIES] n={self._buy_retry_count}/{max_retries}"
-            )
-            self.abort_cycle_with_reason(reason="ENTRY_RETRIES")
-            return
         ok, bid, ask, mid, age_ms, source, status = self._resolve_entry_snapshot()
-        if not ok or bid is None or ask is None or mid is None:
+        if not ok or bid is None or mid is None:
             self._start_price_wait("ENTRY")
             self._log_price_wait("ENTRY", age_ms, source)
             self._maybe_abort_entry_wait()
             return
         self._clear_price_wait("ENTRY")
+        elapsed_ms = self._entry_attempt_elapsed_ms()
+        if elapsed_ms is not None and not self._should_dedup_log("entry_wait", 2.0):
+            self._logger(f"[ENTRY_WAIT] ms={elapsed_ms}")
+        if not self._profile.tick_size or not self._profile.step_size:
+            return
+        current_price = float(buy_order.get("price") or 0.0)
+        if current_price <= 0:
+            return
+        min_ticks = max(1, int(getattr(self._settings, "entry_reprice_min_ticks", 1)))
+        tick_size = self._profile.tick_size
+        bid_diff = (bid - current_price) / tick_size
+        cooldown_ms = max(
+            0, int(getattr(self._settings, "entry_reprice_cooldown_ms", 800))
+        )
+        now = time.monotonic()
+        if bid_diff < min_ticks:
+            return
+        if (now - self._entry_reprice_last_ts) * 1000.0 < cooldown_ms:
+            return
+        new_price = self._calculate_entry_price(bid)
+        if new_price is None:
+            return
+        if new_price <= current_price:
+            return
         order_id = buy_order.get("orderId")
         if order_id and order_id in open_orders:
             is_isolated = "TRUE" if self._settings.margin_isolated else "FALSE"
@@ -1038,36 +968,15 @@ class TradeExecutor:
             entry for entry in self.active_test_orders if entry.get("orderId") != order_id
         ]
         self.orders_count = len(self.active_test_orders)
-        if not self._profile.tick_size or not self._profile.step_size or not self._profile.min_qty:
-            self._logger("[BUY_ABORT retries_exceeded]")
-            self.abort_cycle()
-            return
-        self._buy_retry_count += 1
-        retry_index = self._buy_retry_count
-        entry_mode = str(getattr(self._settings, "entry_mode", "NORMAL") or "NORMAL").upper()
-        buy_price = self._calculate_entry_price(bid, ask, entry_mode)
-        if buy_price is None:
-            self._logger("[BUY_ABORT retries_exceeded]")
-            self.abort_cycle()
-            return
-        self._logger(
-            "[BUY_REPRICE] "
-            f"mode={entry_mode} bid={bid:.8f} ask={ask:.8f} "
-            f"mid={mid:.8f} new_price={buy_price:.8f}"
-        )
         order_quote = float(self._settings.order_quote)
-        qty = self._round_down(order_quote / buy_price, self._profile.step_size)
-        if qty <= 0 or qty < self._profile.min_qty:
-            self._logger("[BUY_ABORT retries_exceeded]")
-            self.abort_cycle()
+        qty = self._round_down(order_quote / new_price, self._profile.step_size)
+        if self._profile.min_qty and qty < self._profile.min_qty:
             return
-        if self._profile.min_notional is not None and qty * buy_price < self._profile.min_notional:
-            self._logger("[BUY_ABORT retries_exceeded]")
-            self.abort_cycle()
+        if self._profile.min_notional is not None and qty * new_price < self._profile.min_notional:
             return
-        retry_price = f"{buy_price:.8f}"
         self._logger(
-            f"[BUY_RETRY {retry_index}/{max_retries} price={retry_price}]"
+            "[ENTRY_REPRICE] "
+            f"old={current_price:.8f} new={new_price:.8f} bid={bid:.8f} reason=bid_moved"
         )
         is_isolated = "TRUE" if self._settings.margin_isolated else "FALSE"
         timestamp = int(time.time() * 1000)
@@ -1075,28 +984,26 @@ class TradeExecutor:
         side_effect_type = self._normalize_side_effect_type(
             self._settings.side_effect_type
         )
+        self._log_entry_place(new_price, bid, ask)
         buy_order = self._place_margin_order(
             symbol=self._settings.symbol,
             side="BUY",
             quantity=qty,
-            price=buy_price,
+            price=new_price,
             is_isolated=is_isolated,
             client_order_id=buy_client_id,
             side_effect=side_effect_type,
             order_type="LIMIT",
         )
         if not buy_order:
-            self._logger("[BUY_ABORT retries_exceeded]")
-            self.abort_cycle()
             return
-        self._transition_state(TradeState.STATE_WAIT_BUY)
-        self._start_buy_wait()
+        self._entry_reprice_last_ts = now
         now_ms = int(time.time() * 1000)
         self.active_test_orders = [
             {
                 "orderId": buy_order.get("orderId"),
                 "side": "BUY",
-                "price": buy_price,
+                "price": new_price,
                 "qty": qty,
                 "cum_qty": 0.0,
                 "avg_fill_price": 0.0,
@@ -1461,7 +1368,7 @@ class TradeExecutor:
             sell_order = self._find_order("SELL")
             if sell_order:
                 self.sell_active_order_id = sell_order.get("orderId")
-        self._maybe_handle_buy_ttl(open_map)
+        self._handle_entry_follow_top(open_map)
         if self._maybe_handle_sell_watchdog(open_map):
             return
         self._maybe_handle_sell_ttl(open_map)

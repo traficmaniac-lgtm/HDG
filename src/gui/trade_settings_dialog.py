@@ -3,15 +3,15 @@ from __future__ import annotations
 from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
     QCheckBox,
-    QComboBox,
     QDialog,
     QDoubleSpinBox,
     QFormLayout,
     QHBoxLayout,
-    QLabel,
     QPushButton,
     QSpinBox,
+    QTabWidget,
     QVBoxLayout,
+    QWidget,
 )
 
 from src.core.config_store import ConfigStore
@@ -21,25 +21,18 @@ from src.core.models import Settings
 class TradeSettingsDialog(QDialog):
     saved = Signal(
         float,
-        int,
-        int,
-        int,
-        int,
-        str,
-        int,
-        int,
-        str,
-        int,
-        int,
-        int,
-        str,
-        bool,
-        str,
-        bool,
         float,
         float,
         int,
         int,
+        int,
+        int,
+        int,
+        int,
+        int,
+        int,
+        bool,
+        bool,
     )
 
     def __init__(
@@ -50,13 +43,18 @@ class TradeSettingsDialog(QDialog):
         self._settings = settings
         self.setWindowTitle("Параметры торговли")
         self.setMinimumWidth(360)
+        self.setFixedHeight(420)
 
         layout = QVBoxLayout(self)
-        form = QFormLayout()
+        tabs = QTabWidget()
+        basic_tab = QWidget()
+        advanced_tab = QWidget()
+        tabs.addTab(basic_tab, "Основное")
+        tabs.addTab(advanced_tab, "Продвинутое")
+        tabs.setCurrentIndex(0)
 
-        order_header = QLabel("ОРДЕР")
-        order_header.setStyleSheet("font-weight: bold;")
-        form.addRow(order_header)
+        basic_form = QFormLayout(basic_tab)
+        basic_form.setVerticalSpacing(8)
 
         self.order_quote_input = QDoubleSpinBox()
         self.order_quote_input.setRange(0.0, 1_000_000_000.0)
@@ -65,41 +63,75 @@ class TradeSettingsDialog(QDialog):
         self.order_quote_input.setValue(
             float(getattr(settings, "order_quote", 50.0) or 0.0) if settings else 50.0
         )
-        form.addRow("Размер ордера (USDT)", self.order_quote_input)
+        basic_form.addRow("Размер ордера (USDT)", self.order_quote_input)
 
-        self.buy_ttl_input = QSpinBox()
-        self.buy_ttl_input.setRange(500, 20000)
-        self.buy_ttl_input.setSingleStep(100)
-        self.buy_ttl_input.setValue(
-            int(getattr(settings, "buy_ttl_ms", 2500) or 2500) if settings else 2500
+        self.max_budget_input = QDoubleSpinBox()
+        self.max_budget_input.setRange(0.0, 1_000_000_000.0)
+        self.max_budget_input.setDecimals(2)
+        self.max_budget_input.setSingleStep(10.0)
+        self.max_budget_input.setValue(
+            float(getattr(settings, "max_budget", 1000.0) or 0.0) if settings else 1000.0
         )
-        form.addRow("TTL входа BUY (мс)", self.buy_ttl_input)
+        basic_form.addRow("Макс. бюджет (USDT)", self.max_budget_input)
 
-        self.buy_retry_input = QSpinBox()
-        self.buy_retry_input.setRange(0, 10)
-        self.buy_retry_input.setValue(
-            int(getattr(settings, "max_buy_retries", 3) or 0) if settings else 3
+        self.budget_reserve_input = QDoubleSpinBox()
+        self.budget_reserve_input.setRange(0.0, 1_000_000_000.0)
+        self.budget_reserve_input.setDecimals(2)
+        self.budget_reserve_input.setSingleStep(1.0)
+        self.budget_reserve_input.setValue(
+            float(getattr(settings, "budget_reserve", 20.0) or 0.0) if settings else 20.0
         )
-        form.addRow("Повторы входа BUY", self.buy_retry_input)
+        basic_form.addRow("Резерв (USDT)", self.budget_reserve_input)
 
-        self.entry_mode_input = QComboBox()
-        self.entry_mode_input.addItems(["NORMAL", "AGGRESSIVE"])
-        current_entry_mode = str(getattr(settings, "entry_mode", "NORMAL") or "NORMAL").upper()
-        index = self.entry_mode_input.findText(current_entry_mode)
-        if index >= 0:
-            self.entry_mode_input.setCurrentIndex(index)
-        form.addRow("Entry mode", self.entry_mode_input)
-
-        self.aggressive_offset_input = QSpinBox()
-        self.aggressive_offset_input.setRange(0, 2)
-        self.aggressive_offset_input.setValue(
-            int(getattr(settings, "aggressive_offset_ticks", 0) or 0) if settings else 0
+        self.cycle_count_input = QSpinBox()
+        self.cycle_count_input.setRange(1, 1000)
+        self.cycle_count_input.setValue(
+            int(getattr(settings, "cycle_count", 1) or 1) if settings else 1
         )
-        form.addRow("Aggressive offset (тики)", self.aggressive_offset_input)
+        basic_form.addRow("Кол-во циклов", self.cycle_count_input)
 
-        advanced_header = QLabel("ADVANCED")
-        advanced_header.setStyleSheet("font-weight: bold;")
-        form.addRow(advanced_header)
+        self.take_profit_input = QSpinBox()
+        self.take_profit_input.setRange(1, 1000)
+        self.take_profit_input.setValue(
+            int(getattr(settings, "take_profit_ticks", 1) or 1) if settings else 1
+        )
+        basic_form.addRow("TP (тики)", self.take_profit_input)
+
+        self.stop_loss_input = QSpinBox()
+        self.stop_loss_input.setRange(1, 1000)
+        self.stop_loss_input.setValue(
+            int(getattr(settings, "stop_loss_ticks", 2) or 2) if settings else 2
+        )
+        basic_form.addRow("SL (тики)", self.stop_loss_input)
+
+        self.entry_offset_input = QSpinBox()
+        self.entry_offset_input.setRange(0, 1000)
+        self.entry_offset_input.setValue(
+            int(getattr(settings, "entry_offset_ticks", 1) or 0) if settings else 1
+        )
+        basic_form.addRow("Смещение входа (тики)", self.entry_offset_input)
+
+        self.exit_offset_input = QSpinBox()
+        self.exit_offset_input.setRange(0, 1000)
+        self.exit_offset_input.setValue(
+            int(getattr(settings, "exit_offset_ticks", 1) or 1) if settings else 1
+        )
+        basic_form.addRow("Смещение выхода (тики)", self.exit_offset_input)
+
+        self.allow_borrow_input = QCheckBox("Разрешить заём (borrow)")
+        self.allow_borrow_input.setChecked(bool(getattr(settings, "allow_borrow", True)))
+        basic_form.addRow("", self.allow_borrow_input)
+
+        self.auto_exit_input = QCheckBox("Авто-выход по TP/SL")
+        self.auto_exit_input.setChecked(
+            bool(
+                getattr(settings, "auto_exit_enabled", getattr(settings, "auto_close", True))
+            )
+        )
+        basic_form.addRow("", self.auto_exit_input)
+
+        advanced_form = QFormLayout(advanced_tab)
+        advanced_form.setVerticalSpacing(8)
 
         self.mid_fresh_input = QSpinBox()
         self.mid_fresh_input.setRange(200, 5000)
@@ -107,17 +139,15 @@ class TradeSettingsDialog(QDialog):
         self.mid_fresh_input.setValue(
             int(getattr(settings, "mid_fresh_ms", 800) or 800) if settings else 800
         )
-        form.addRow("Fresh mid (ms)", self.mid_fresh_input)
+        advanced_form.addRow("Fresh mid (ms)", self.mid_fresh_input)
 
-        self.max_wait_price_input = QSpinBox()
-        self.max_wait_price_input.setRange(1000, 30000)
-        self.max_wait_price_input.setSingleStep(500)
-        self.max_wait_price_input.setValue(
-            int(getattr(settings, "max_wait_price_ms", 5000) or 5000)
-            if settings
-            else 5000
+        self.http_fresh_input = QSpinBox()
+        self.http_fresh_input.setRange(200, 10000)
+        self.http_fresh_input.setSingleStep(100)
+        self.http_fresh_input.setValue(
+            int(getattr(settings, "http_fresh_ms", 1500) or 1500) if settings else 1500
         )
-        form.addRow("Max wait price (ms)", self.max_wait_price_input)
+        advanced_form.addRow("HTTP fresh (ms)", self.http_fresh_input)
 
         self.max_entry_total_input = QSpinBox()
         self.max_entry_total_input.setRange(1000, 120000)
@@ -127,120 +157,9 @@ class TradeSettingsDialog(QDialog):
             if settings
             else 30000
         )
-        form.addRow("Max entry total (ms)", self.max_entry_total_input)
+        advanced_form.addRow("Max entry total (ms)", self.max_entry_total_input)
 
-        self.order_type_input = QComboBox()
-        self.order_type_input.addItems(["LIMIT", "MARKET"])
-        current_order_type = str(getattr(settings, "order_type", "LIMIT") or "LIMIT").upper()
-        index = self.order_type_input.findText(current_order_type)
-        if index >= 0:
-            self.order_type_input.setCurrentIndex(index)
-        form.addRow("Тип ордера", self.order_type_input)
-
-        capital_header = QLabel("КАПИТАЛ")
-        capital_header.setStyleSheet("font-weight: bold;")
-        form.addRow(capital_header)
-
-        self.max_budget_input = QDoubleSpinBox()
-        self.max_budget_input.setRange(0.0, 1_000_000_000.0)
-        self.max_budget_input.setDecimals(2)
-        self.max_budget_input.setSingleStep(10.0)
-        self.max_budget_input.setValue(
-            float(getattr(settings, "max_budget", 1000.0) or 0.0) if settings else 1000.0
-        )
-        form.addRow("Максимальный бюджет (USDT)", self.max_budget_input)
-
-        self.budget_reserve_input = QDoubleSpinBox()
-        self.budget_reserve_input.setRange(0.0, 1_000_000_000.0)
-        self.budget_reserve_input.setDecimals(2)
-        self.budget_reserve_input.setSingleStep(1.0)
-        self.budget_reserve_input.setValue(
-            float(getattr(settings, "budget_reserve", 20.0) or 0.0) if settings else 20.0
-        )
-        form.addRow("Резерв (USDT)", self.budget_reserve_input)
-
-        self.tick_offset_input = QSpinBox()
-        self.tick_offset_input.setRange(0, 1000)
-        self.tick_offset_input.setValue(
-            int(getattr(settings, "offset_ticks", 1) or 0) if settings else 1
-        )
-        form.addRow("Смещение в тиках", self.tick_offset_input)
-
-        self.take_profit_input = QSpinBox()
-        self.take_profit_input.setRange(1, 1000)
-        self.take_profit_input.setValue(
-            int(getattr(settings, "take_profit_ticks", 1) or 1) if settings else 1
-        )
-        form.addRow("Take-profit (тики)", self.take_profit_input)
-
-        self.stop_loss_input = QSpinBox()
-        self.stop_loss_input.setRange(1, 1000)
-        self.stop_loss_input.setValue(
-            int(getattr(settings, "stop_loss_ticks", 2) or 2) if settings else 2
-        )
-        form.addRow("Stop-loss (тики)", self.stop_loss_input)
-
-        self.cycle_count_input = QSpinBox()
-        self.cycle_count_input.setRange(1, 1000)
-        self.cycle_count_input.setValue(
-            int(getattr(settings, "cycle_count", 1) or 1) if settings else 1
-        )
-        form.addRow("Количество циклов", self.cycle_count_input)
-
-        self.exit_order_type_input = QComboBox()
-        self.exit_order_type_input.addItems(["LIMIT", "MARKET"])
-        current_exit_order_type = str(
-            getattr(settings, "exit_order_type", "LIMIT") or "LIMIT"
-        ).upper()
-        index = self.exit_order_type_input.findText(current_exit_order_type)
-        if index >= 0:
-            self.exit_order_type_input.setCurrentIndex(index)
-        form.addRow("Тип выхода", self.exit_order_type_input)
-
-        self.exit_offset_input = QSpinBox()
-        self.exit_offset_input.setRange(0, 1000)
-        self.exit_offset_input.setValue(
-            int(getattr(settings, "exit_offset_ticks", 1) or 1) if settings else 1
-        )
-        form.addRow("Смещение выхода (тики)", self.exit_offset_input)
-
-        self.allow_borrow_input = QCheckBox("Разрешить заём (borrow)")
-        self.allow_borrow_input.setChecked(bool(getattr(settings, "allow_borrow", True)))
-        form.addRow("", self.allow_borrow_input)
-
-        self.auto_exit_input = QCheckBox("Авто-выход по TP/SL")
-        self.auto_exit_input.setChecked(
-            bool(
-                getattr(settings, "auto_exit_enabled", getattr(settings, "auto_close", True))
-            )
-        )
-        form.addRow("", self.auto_exit_input)
-
-        self.side_effect_input = QComboBox()
-        self.side_effect_input.addItems(["AUTO_BORROW_REPAY", "MARGIN_BUY", "NONE"])
-        current_side_effect = str(
-            getattr(settings, "side_effect_type", "AUTO_BORROW_REPAY") or "AUTO_BORROW_REPAY"
-        ).upper()
-        index = self.side_effect_input.findText(current_side_effect)
-        if index >= 0:
-            self.side_effect_input.setCurrentIndex(index)
-        form.addRow("SideEffectType", self.side_effect_input)
-
-        mode_layout = QHBoxLayout()
-        mode_label = QLabel("CROSS MARGIN")
-        mode_hint = QLabel(f"x{getattr(settings, 'leverage_hint', 3)} (hint)")
-        mode_layout.addWidget(mode_label)
-        mode_layout.addSpacing(6)
-        mode_layout.addWidget(mode_hint)
-        mode_layout.addStretch(1)
-        form.addRow("Режим", mode_layout)
-
-        self.hedge_profile = QComboBox()
-        self.hedge_profile.addItem("Default")
-        self.hedge_profile.setEnabled(False)
-        form.addRow("Хедж-профиль", self.hedge_profile)
-
-        layout.addLayout(form)
+        layout.addWidget(tabs)
 
         buttons_layout = QHBoxLayout()
         buttons_layout.addStretch(1)
@@ -262,44 +181,31 @@ class TradeSettingsDialog(QDialog):
         payload["order_quote"] = float(self.order_quote_input.value())
         payload["max_budget"] = float(self.max_budget_input.value())
         payload["budget_reserve"] = float(self.budget_reserve_input.value())
-        payload["offset_ticks"] = int(self.tick_offset_input.value())
+        payload["entry_offset_ticks"] = int(self.entry_offset_input.value())
+        payload["offset_ticks"] = int(self.entry_offset_input.value())
         payload["take_profit_ticks"] = int(self.take_profit_input.value())
         payload["stop_loss_ticks"] = int(self.stop_loss_input.value())
         payload["cycle_count"] = int(self.cycle_count_input.value())
-        payload["order_type"] = str(self.order_type_input.currentText()).upper()
-        payload["buy_ttl_ms"] = int(self.buy_ttl_input.value())
-        payload["max_buy_retries"] = int(self.buy_retry_input.value())
-        payload["entry_mode"] = str(self.entry_mode_input.currentText()).upper()
-        payload["aggressive_offset_ticks"] = int(self.aggressive_offset_input.value())
         payload["mid_fresh_ms"] = int(self.mid_fresh_input.value())
-        payload["max_wait_price_ms"] = int(self.max_wait_price_input.value())
+        payload["http_fresh_ms"] = int(self.http_fresh_input.value())
         payload["max_entry_total_ms"] = int(self.max_entry_total_input.value())
-        payload["exit_order_type"] = str(self.exit_order_type_input.currentText()).upper()
         payload["exit_offset_ticks"] = int(self.exit_offset_input.value())
         payload["allow_borrow"] = bool(self.allow_borrow_input.isChecked())
-        payload["side_effect_type"] = str(self.side_effect_input.currentText()).upper()
         payload["auto_exit_enabled"] = bool(self.auto_exit_input.isChecked())
         self._store.save_settings(payload)
         self.saved.emit(
             float(self.order_quote_input.value()),
-            int(self.tick_offset_input.value()),
-            int(self.take_profit_input.value()),
-            int(self.stop_loss_input.value()),
-            int(self.cycle_count_input.value()),
-            str(self.order_type_input.currentText()).upper(),
-            int(self.buy_ttl_input.value()),
-            int(self.buy_retry_input.value()),
-            str(self.entry_mode_input.currentText()).upper(),
-            int(self.aggressive_offset_input.value()),
-            int(self.max_entry_total_input.value()),
-            int(self.exit_offset_input.value()),
-            str(self.exit_order_type_input.currentText()).upper(),
-            bool(self.allow_borrow_input.isChecked()),
-            str(self.side_effect_input.currentText()).upper(),
-            bool(self.auto_exit_input.isChecked()),
             float(self.max_budget_input.value()),
             float(self.budget_reserve_input.value()),
+            int(self.cycle_count_input.value()),
+            int(self.take_profit_input.value()),
+            int(self.stop_loss_input.value()),
+            int(self.entry_offset_input.value()),
+            int(self.exit_offset_input.value()),
             int(self.mid_fresh_input.value()),
-            int(self.max_wait_price_input.value()),
+            int(self.http_fresh_input.value()),
+            int(self.max_entry_total_input.value()),
+            bool(self.allow_borrow_input.isChecked()),
+            bool(self.auto_exit_input.isChecked()),
         )
         self.accept()
