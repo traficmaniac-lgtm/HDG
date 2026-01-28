@@ -1,5 +1,4 @@
 .env.local
-config/settings.json
 __pycache__/
 *.pyc
 *.pyo
