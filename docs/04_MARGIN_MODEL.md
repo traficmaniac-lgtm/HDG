@@ -1,20 +1,21 @@
 # Margin Model
 
-## Cross Margin (единственный режим)
-- Используется только Cross Margin (`margin_isolated = False`).
-- `account_mode` хранится в настройках, но реальная работа идёт в Cross Margin.
+## Только Cross Margin
+- Используется только **Cross Margin** (isolated не применяется).
+- Плечо: **x3**.
 
 ## sideEffectType
-- BUY-ордер может содержать `sideEffectType`:
-  - `AUTO_BORROW_REPAY`, `MARGIN_BUY`, `NONE` (в UI задаётся как `side_effect_type`).
-- SELL-ордер использует `AUTO_REPAY`, если `allow_borrow = True` и API разрешает borrow.
-- Явные вызовы `borrow/repay` в торговом цикле не используются.
+- **BUY** может использовать:
+  - `AUTO_BORROW_REPAY`
+  - `MARGIN_BUY`
+  - `NONE`
+- **SELL** использует `AUTO_REPAY`, когда разрешён borrow и это поддерживается API.
 
 ## BORROW: OK / FAIL
 - `BORROW = OK|FAIL` отражает результат `probe_margin_borrow_access`.
 - `FAIL` фиксируется при HTTP 401 или коде `-1002`.
-- `OK` означает доступность borrow-эндпоинта, но не гарантирует фактический займ.
+- `OK` означает доступность borrow-эндпоинта, но не гарантию фактического займа.
 
-## Почему явный borrow НЕ используется в цикле
-- Текущий цикл полагается на `sideEffectType` в ордерах.
-- Явный borrow/repay применяется только как вспомогательные методы, не в основном цикле.
+## Почему явный borrow не используется в цикле
+- Цикл опирается на `sideEffectType` в ордерах.
+- Явные `borrow/repay` — только вспомогательные методы вне основного цикла.
