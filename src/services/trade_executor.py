@@ -59,6 +59,9 @@ class TradeExecutor:
         self._buy_retry_count = 0
         self._sell_wait_started_ts: Optional[float] = None
         self._sell_retry_count = 0
+        self._aggregate_sold_qty = 0.0
+        self.position_qty_base: Optional[float] = None
+        self._last_place_error_code: Optional[int] = None
         self.state = TradeState.STATE_IDLE
         self.cycles_target = self._normalize_cycle_target(
             getattr(settings, "cycle_count", 1)
@@ -457,17 +460,20 @@ class TradeExecutor:
                     f"[TRADE] close_position | missing tick/step sizes tag={self.TAG}"
                 )
                 return 0
-            qty = self._resolve_close_qty()
-            if qty > 0:
-                qty = self._round_down(qty, self._profile.step_size)
-            if qty <= 0:
-                self._logger("[TRADE] close_position | qty <= 0")
-                self.last_action = "precheck_failed"
+            remaining_qty_raw = self._resolve_remaining_qty_raw()
+            qty = self._round_down(remaining_qty_raw, self._profile.step_size)
+            if qty <= 0 or remaining_qty_raw <= self._get_step_size_tolerance():
+                self._logger("[SELL_ALREADY_CLOSED_BY_PARTIAL]")
+                self._finalize_partial_close(reason="PARTIAL")
                 return 0
             if self._profile.min_qty and qty < self._profile.min_qty:
                 self._logger(
                     f"[PARTIAL_TOO_SMALL] qty={qty:.8f} minQty={self._profile.min_qty}"
                 )
+                if qty <= self._get_step_size_tolerance():
+                    self._logger("[SELL_ALREADY_CLOSED_BY_PARTIAL]")
+                    self._finalize_partial_close(reason="PARTIAL")
+                    return 0
                 if exit_order_type == "MARKET":
                     return self._place_emergency_market_sell(qty)
                 self.last_action = "partial_too_small"
@@ -504,6 +510,8 @@ class TradeExecutor:
                 order_type=order_type,
             )
             if not sell_order:
+                if self._last_place_error_code == -2010:
+                    return self._handle_sell_insufficient_balance(reason)
                 self._logger("[ORDER] SELL rejected")
                 self.last_action = "place_failed"
                 self._transition_state(TradeState.STATE_ERROR)
@@ -536,9 +544,12 @@ class TradeExecutor:
                     "side": "SELL",
                     "price": sell_price,
                     "qty": qty,
+                    "cum_qty": 0.0,
+                    "sell_executed_qty": 0.0,
                     "created_ts": now_ms,
                     "updated_ts": now_ms,
                     "status": "NEW",
+                    "sell_status": "NEW",
                     "tag": self.TAG,
                     "clientOrderId": sell_order.get("clientOrderId", sell_client_id),
                     "reason": reason_upper,
@@ -597,9 +608,12 @@ class TradeExecutor:
                 "side": "SELL",
                 "price": None,
                 "qty": qty,
+                "cum_qty": 0.0,
+                "sell_executed_qty": 0.0,
                 "created_ts": now_ms,
                 "updated_ts": now_ms,
                 "status": "NEW",
+                "sell_status": "NEW",
                 "tag": self.TAG,
                 "clientOrderId": sell_order.get("clientOrderId", sell_client_id),
                 "reason": "EMERGENCY",
@@ -668,6 +682,7 @@ class TradeExecutor:
                 "partial": True,
                 "initial_qty": cum_qty,
             }
+            self._set_position_qty_base(cum_qty)
             self._last_buy_price = self.position.get("buy_price") or self._last_buy_price
             self._reset_buy_retry()
             self._transition_state(TradeState.STATE_POSITION_OPEN)
@@ -831,9 +846,16 @@ class TradeExecutor:
         self._logger(
             f"[SELL_RETRY {retry_index}/{max_retries} price={retry_price}]"
         )
-        remaining_qty = self._resolve_close_qty()
+        remaining_qty_raw = self._resolve_remaining_qty_raw()
+        remaining_qty = self._round_down(
+            remaining_qty_raw, self._profile.step_size
+        )
         if remaining_qty > 0:
-            self._logger(f"[SELL_RETRY_REMAINING] qty={remaining_qty:.8f}")
+            self._logger(
+                "[SELL_RETRY_REMAINING] "
+                f"qty={remaining_qty:.8f} remaining={remaining_qty_raw:.8f} "
+                f"n={retry_index}/{max_retries}"
+            )
         self._place_sell_order(reason=reason, reset_retry=False)
 
     def _force_close_after_ttl(self, reason: str = "TTL_EXCEEDED") -> None:
@@ -860,7 +882,9 @@ class TradeExecutor:
             self._transition_state(TradeState.STATE_IDLE)
             self._handle_cycle_completion(reason="TTL_EXCEEDED")
             return
-        qty = self._resolve_close_qty()
+        qty = self._round_down(
+            self._resolve_remaining_qty_raw(), self._profile.step_size
+        )
         if qty <= 0:
             self.last_exit_reason = "TTL_EXCEEDED"
             self._transition_state(TradeState.STATE_CLOSED)
@@ -919,6 +943,8 @@ class TradeExecutor:
             if order_id in open_map:
                 status = str(open_map[order_id].get("status", "NEW")).upper()
                 order["status"] = status
+                if order.get("side") == "SELL":
+                    order["sell_status"] = status
                 order["updated_ts"] = now_ms
         self.orders_count = len(self.active_test_orders)
         self._maybe_handle_buy_ttl(open_map)
@@ -936,6 +962,8 @@ class TradeExecutor:
         if order.get("status") == "FILLED":
             return
         order["status"] = "FILLED"
+        if order.get("side") == "SELL":
+            order["sell_status"] = "FILLED"
         order["updated_ts"] = ts_ms
         order["price"] = price
         order["qty"] = qty
@@ -968,16 +996,21 @@ class TradeExecutor:
             )
             return
         if side_upper == "SELL":
-            order["cum_qty"] = cum_qty
+            self._update_sell_execution(order, cum_qty)
             if avg_price > 0:
                 order["avg_fill_price"] = avg_price
                 order["last_fill_price"] = avg_price
             order["updated_ts"] = ts_ms
             if self.position is None:
                 return
-            base_qty = self.position.get("initial_qty", self.position.get("qty", 0.0))
-            remaining_qty = max(base_qty - cum_qty, 0.0)
+            remaining_qty = self._resolve_remaining_qty_raw()
             self.position["qty"] = remaining_qty
+            self._logger(
+                "[SELL_PARTIAL] "
+                f"order_id={order_id} executed={cum_qty:.8f} "
+                f"agg_sold={self._aggregate_sold_qty:.8f} "
+                f"remaining={remaining_qty:.8f}"
+            )
 
     def handle_order_done(self, order_id: int, status: str, ts_ms: int) -> None:
         order = next(
@@ -989,6 +1022,8 @@ class TradeExecutor:
         if order.get("status") == status:
             return
         order["status"] = status
+        if order.get("side") == "SELL":
+            order["sell_status"] = status
         order["updated_ts"] = ts_ms
         side = str(order.get("side", "UNKNOWN")).upper()
         self._logger(f"[ORDER] {side} {status} id={order_id}")
@@ -1023,8 +1058,11 @@ class TradeExecutor:
                     "partial": False,
                     "initial_qty": order.get("qty"),
                 }
+                self._set_position_qty_base(order.get("qty"))
             self._transition_state(TradeState.STATE_POSITION_OPEN)
         elif side == "SELL":
+            if order.get("qty") is not None:
+                self._update_sell_execution(order, float(order.get("qty") or 0.0))
             self._reset_sell_retry()
             reason = str(order.get("reason") or "MANUAL").upper()
             fill_price = order.get("price")
@@ -1095,13 +1133,98 @@ class TradeExecutor:
         if pnl is not None:
             self.pnl_session += pnl
         self.position = None
+        self._reset_position_tracking()
         self.last_action = "closed"
         return pnl
 
     def _resolve_close_qty(self) -> float:
+        return self._resolve_remaining_qty_raw()
+
+    def _resolve_remaining_qty_raw(self) -> float:
+        if self.position_qty_base is None:
+            if self.position is not None:
+                self._set_position_qty_base(self.position.get("initial_qty"))
+            else:
+                return 0.0
+        base_qty = float(self.position_qty_base or 0.0)
+        remaining_qty = base_qty - self._aggregate_sold_qty
+        return max(remaining_qty, 0.0)
+
+    def _get_step_size_tolerance(self) -> float:
+        if not self._profile.step_size:
+            return 0.0
+        return max(1e-8, self._profile.step_size * 0.1)
+
+    def _set_position_qty_base(self, qty: Optional[float]) -> None:
+        if qty is None:
+            return
+        if self.position_qty_base is not None:
+            return
+        base_qty = float(qty)
+        if self._profile.step_size:
+            base_qty = self._round_down(base_qty, self._profile.step_size)
+        self.position_qty_base = base_qty
+        self._aggregate_sold_qty = 0.0
         if self.position is not None:
-            return self.position.get("qty", 0.0)
-        return 0.0
+            self.position["qty"] = base_qty
+            self.position["initial_qty"] = base_qty
+
+    def _reset_position_tracking(self) -> None:
+        self.position_qty_base = None
+        self._aggregate_sold_qty = 0.0
+
+    def _update_sell_execution(self, order: dict, cum_qty: float) -> None:
+        prev_cum = float(order.get("cum_qty") or 0.0)
+        delta = max(cum_qty - prev_cum, 0.0)
+        if delta > 0:
+            self._aggregate_sold_qty += delta
+        order["cum_qty"] = cum_qty
+        order["sell_executed_qty"] = cum_qty
+        if self.position is not None:
+            remaining_qty = self._resolve_remaining_qty_raw()
+            self.position["qty"] = remaining_qty
+
+    def _handle_sell_insufficient_balance(self, reason: str) -> int:
+        remaining_qty_raw = self._resolve_remaining_qty_raw()
+        min_qty = self._profile.min_qty or 0.0
+        if (
+            remaining_qty_raw <= self._get_step_size_tolerance()
+            or remaining_qty_raw < min_qty
+        ):
+            self._logger("[SELL_ALREADY_CLOSED_BY_PARTIAL]")
+            self._finalize_partial_close(reason="PARTIAL")
+            return 0
+        max_retries = int(self._settings.max_sell_retries)
+        if self._sell_retry_count >= max_retries:
+            self._logger(
+                f"[SELL_PLACE_FAILED_INSUFFICIENT] remaining={remaining_qty_raw:.8f}"
+            )
+            self._transition_state(TradeState.STATE_POSITION_OPEN)
+            return 0
+        self._sell_retry_count += 1
+        retry_index = self._sell_retry_count
+        qty_to_sell = self._round_down(
+            remaining_qty_raw, self._profile.step_size
+        )
+        self._logger(
+            f"[SELL_PLACE_FAILED_INSUFFICIENT] remaining={remaining_qty_raw:.8f}"
+        )
+        self._logger(
+            "[SELL_RETRY_REMAINING] "
+            f"qty={qty_to_sell:.8f} remaining={remaining_qty_raw:.8f} "
+            f"n={retry_index}/{max_retries}"
+        )
+        return self._place_sell_order(reason=reason, reset_retry=False)
+
+    def _finalize_partial_close(self, reason: str) -> None:
+        self.last_exit_reason = reason
+        self.active_test_orders = []
+        self.orders_count = 0
+        self.position = None
+        self._reset_position_tracking()
+        self._transition_state(TradeState.STATE_CLOSED)
+        self._handle_cycle_completion(reason=reason)
+        self._transition_state(TradeState.STATE_IDLE)
 
     def _find_order(self, side: str) -> Optional[dict]:
         for order in self.active_test_orders:
@@ -1210,9 +1333,17 @@ class TradeExecutor:
             params["sideEffectType"] = side_effect
         if client_order_id:
             params["newClientOrderId"] = client_order_id
+        self._last_place_error_code = None
         try:
             return self._rest.create_margin_order(params)
         except httpx.HTTPStatusError as exc:
+            code = None
+            try:
+                payload = exc.response.json() if exc.response else {}
+                code = payload.get("code")
+            except Exception:
+                pass
+            self._last_place_error_code = code
             self._log_binance_error("place_order", exc, params)
         except Exception as exc:
             self._logger(f"[TRADE] place_order error: {exc} tag={self.TAG}")
