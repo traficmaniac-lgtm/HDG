@@ -383,6 +383,9 @@ class MainWindow(QMainWindow):
         if not self._connected:
             return
 
+        if self._trade_executor:
+            self._trade_executor.stop_run_by_user(reason="disconnect")
+
         self._ui_timer.stop()
         self._http_timer.stop()
         self._orders_timer.stop()
@@ -535,6 +538,8 @@ class MainWindow(QMainWindow):
         self._log_data_blind_state(price_state, state_label)
         self._update_exit_status(price_state.mid)
         self._update_trading_controls(price_state)
+        if self._trade_executor and self._trade_executor.process_cycle_flow():
+            self._refresh_orders()
 
     def _update_status(self, connected: bool) -> None:
         if connected:
@@ -613,7 +618,7 @@ class MainWindow(QMainWindow):
             self._append_log("[TRADE] blocked: margin_not_authorized")
             self._trade_executor.last_action = "margin_not_authorized"
             return
-        placed = self._trade_executor.place_test_orders_margin()
+        placed = self._trade_executor.start_cycle_run()
         if placed:
             self._refresh_orders()
 
@@ -628,7 +633,7 @@ class MainWindow(QMainWindow):
     def _stop_trading(self) -> None:
         if not self._trade_executor:
             return
-        self._trade_executor.abort_cycle()
+        self._trade_executor.stop_run_by_user()
         self._refresh_orders()
 
     @Slot()
@@ -715,6 +720,7 @@ class MainWindow(QMainWindow):
             sell_ttl_ms=int(payload.get("sell_ttl_ms", 8000)),
             max_sell_retries=int(payload.get("max_sell_retries", 3)),
             force_close_on_ttl=bool(payload.get("force_close_on_ttl", True)),
+            cycle_count=self._bounded_int(payload.get("cycle_count", 1), 1, 1000, 1),
         )
 
     def _log_data_blind_state(self, price_state: PriceState, state_label: str) -> None:
@@ -799,6 +805,7 @@ class MainWindow(QMainWindow):
         tick_offset: int,
         take_profit_ticks: int,
         stop_loss_ticks: int,
+        cycle_count: int,
         order_type: str,
         buy_ttl_ms: int,
         max_buy_retries: int,
@@ -813,6 +820,7 @@ class MainWindow(QMainWindow):
             self._settings.offset_ticks = tick_offset
             self._settings.take_profit_ticks = take_profit_ticks
             self._settings.stop_loss_ticks = stop_loss_ticks
+            self._settings.cycle_count = cycle_count
             self._settings.order_type = order_type
             self._settings.buy_ttl_ms = buy_ttl_ms
             self._settings.max_buy_retries = max_buy_retries

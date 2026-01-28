@@ -60,6 +60,13 @@ class TradeExecutor:
         self._sell_wait_started_ts: Optional[float] = None
         self._sell_retry_count = 0
         self.state = TradeState.STATE_IDLE
+        self.cycles_target = self._normalize_cycle_target(
+            getattr(settings, "cycle_count", 1)
+        )
+        self.cycles_done = 0
+        self.run_active = False
+        self._next_cycle_ready_ts: Optional[float] = None
+        self._cycle_cooldown_s = 0.3
 
     def get_state_label(self) -> str:
         return self.state.value
@@ -206,6 +213,9 @@ class TradeExecutor:
             if not buy_order:
                 self.last_action = "place_failed"
                 self._transition_state(TradeState.STATE_ERROR)
+                self._handle_cycle_completion(reason="ERROR")
+                self._transition_state(TradeState.STATE_CLOSED)
+                self._transition_state(TradeState.STATE_IDLE)
                 self.orders_count = 0
                 return 0
             self._logger(
@@ -236,6 +246,75 @@ class TradeExecutor:
             return self.orders_count
         finally:
             self._inflight_trade_action = False
+
+    def start_cycle_run(self) -> int:
+        self.run_active = True
+        self.cycles_done = 0
+        self.cycles_target = self._normalize_cycle_target(self._settings.cycle_count)
+        self._next_cycle_ready_ts = None
+        return self._attempt_cycle_start()
+
+    def stop_run_by_user(self, reason: str = "user") -> None:
+        self.run_active = False
+        self._next_cycle_ready_ts = None
+        self.cancel_test_orders_margin(reason="stopped")
+        self._transition_state(TradeState.STATE_CLOSED)
+        self._transition_state(TradeState.STATE_IDLE)
+        self._logger(f"[CYCLE_STOPPED_BY_USER] reason={reason}")
+
+    def process_cycle_flow(self) -> int:
+        if not self.run_active:
+            return 0
+        if self.cycles_done >= self.cycles_target:
+            return 0
+        if self._next_cycle_ready_ts is None:
+            return 0
+        if time.monotonic() < self._next_cycle_ready_ts:
+            return 0
+        if self.state != TradeState.STATE_IDLE:
+            return 0
+        self._next_cycle_ready_ts = None
+        placed = self._attempt_cycle_start()
+        if not placed:
+            self._next_cycle_ready_ts = time.monotonic() + self._cycle_cooldown_s
+        return placed
+
+    def _attempt_cycle_start(self) -> int:
+        if self.state != TradeState.STATE_IDLE:
+            return 0
+        cycle_index = self.cycles_done + 1
+        placed = self.place_test_orders_margin()
+        if placed:
+            self._logger(
+                f"[CYCLE_START] idx={cycle_index} target={self.cycles_target}"
+            )
+        return placed
+
+    def _handle_cycle_completion(self, reason: str, critical: bool = False) -> None:
+        if not self.run_active:
+            return
+        self.cycles_done += 1
+        self._logger(
+            f"[CYCLE_DONE] done={self.cycles_done} target={self.cycles_target} reason={reason}"
+        )
+        if critical:
+            self.run_active = False
+            self._next_cycle_ready_ts = None
+            self._logger(
+                f"[CYCLE_STOP] done={self.cycles_done} target={self.cycles_target}"
+            )
+            return
+        if self.run_active and self.cycles_done < self.cycles_target:
+            self._next_cycle_ready_ts = time.monotonic() + self._cycle_cooldown_s
+            self._logger(
+                f"[CYCLE_NEXT] done={self.cycles_done} target={self.cycles_target}"
+            )
+        else:
+            self.run_active = False
+            self._next_cycle_ready_ts = None
+            self._logger(
+                f"[CYCLE_STOP] done={self.cycles_done} target={self.cycles_target}"
+            )
 
     def close_position(self) -> int:
         if self._inflight_trade_action:
@@ -374,6 +453,9 @@ class TradeExecutor:
                 self._logger("[ORDER] SELL rejected")
                 self.last_action = "place_failed"
                 self._transition_state(TradeState.STATE_ERROR)
+                self._handle_cycle_completion(reason="ERROR", critical=True)
+                self._transition_state(TradeState.STATE_CLOSED)
+                self._transition_state(TradeState.STATE_IDLE)
                 return 0
             price_label = (
                 f"{mid:.8f}" if sell_price is None else f"{sell_price:.8f}"
@@ -619,12 +701,14 @@ class TradeExecutor:
             self.last_exit_reason = "TTL_EXCEEDED"
             self._transition_state(TradeState.STATE_CLOSED)
             self._transition_state(TradeState.STATE_IDLE)
+            self._handle_cycle_completion(reason="TTL_EXCEEDED")
             return
         qty = self._resolve_close_qty()
         if qty <= 0:
             self.last_exit_reason = "TTL_EXCEEDED"
             self._transition_state(TradeState.STATE_CLOSED)
             self._transition_state(TradeState.STATE_IDLE)
+            self._handle_cycle_completion(reason="TTL_EXCEEDED")
             return
         timestamp = int(time.time() * 1000)
         sell_client_id = self._build_client_order_id("SELL", timestamp + 1)
@@ -780,6 +864,7 @@ class TradeExecutor:
                 realized = "—" if pnl is None else f"{pnl:.8f}"
                 self._logger(f"[PNL] realized={realized}")
             self._transition_state(TradeState.STATE_CLOSED)
+            self._handle_cycle_completion(reason=reason)
             self.active_test_orders = []
             self.orders_count = 0
             self._transition_state(TradeState.STATE_IDLE)
@@ -841,10 +926,14 @@ class TradeExecutor:
         )
 
     def abort_cycle(self) -> int:
+        return self.abort_cycle_with_reason(reason="ABORT")
+
+    def abort_cycle_with_reason(self, reason: str, critical: bool = False) -> int:
         cancelled = self.cancel_test_orders_margin(reason="aborted")
         self._transition_state(TradeState.STATE_CLOSED)
         self._transition_state(TradeState.STATE_IDLE)
         self.last_action = "aborted"
+        self._handle_cycle_completion(reason=reason, critical=critical)
         return cancelled
 
     def cancel_test_orders_margin(self, reason: str = "cancelled") -> int:
@@ -1147,3 +1236,11 @@ class TradeExecutor:
             return float(value or 0.0)
         except (TypeError, ValueError):
             return 0.0
+
+    @staticmethod
+    def _normalize_cycle_target(value: object) -> int:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return 1
+        return max(1, min(1000, parsed))
