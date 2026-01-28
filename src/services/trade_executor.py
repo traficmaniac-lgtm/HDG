@@ -253,6 +253,12 @@ class TradeExecutor:
             msg = payload.get("msg")
         except Exception:
             pass
+        if code == -2014:
+            self._logger(
+                "[AUTH] invalid api key format (-2014). "
+                "Check API settings in меню -> Настройки API."
+            )
+            return
         self._logger(
             "[TRADE] binance_error | "
             f"action={action} status={status} code={code} msg={msg} params={params} tag={self.TAG}"
