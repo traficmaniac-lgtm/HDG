@@ -11,6 +11,11 @@ class Settings:
     http_fresh_ms: int
     http_interval_ms: int
     ui_refresh_ms: int
+    account_mode: str
+    max_leverage_hint: int
+    test_notional_usd: float
+    test_tick_offset: int
+    margin_isolated: bool
 
 
 @dataclass
