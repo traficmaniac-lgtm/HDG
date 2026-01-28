@@ -371,53 +371,90 @@ class TradeExecutor:
             return
         open_map = {order.get("orderId"): order for order in open_orders}
         now_ms = int(time.time() * 1000)
-        close_filled = False
         for order in self.active_test_orders:
             order_id = order.get("orderId")
             if order_id in open_map:
                 status = str(open_map[order_id].get("status", "NEW")).upper()
                 order["status"] = status
                 order["updated_ts"] = now_ms
-                continue
-            if order.get("status") == "FILLED":
-                continue
-            order["status"] = "FILLED"
-            order["updated_ts"] = now_ms
-            side = order.get("side")
-            if side == "BUY":
+        self.orders_count = len(self.active_test_orders)
+
+    def handle_order_filled(
+        self, order_id: int, side: str, price: float, qty: float, ts_ms: int
+    ) -> None:
+        order = next(
+            (entry for entry in self.active_test_orders if entry.get("orderId") == order_id),
+            None,
+        )
+        if order is None:
+            return
+        if order.get("status") == "FILLED":
+            return
+        order["status"] = "FILLED"
+        order["updated_ts"] = ts_ms
+        order["price"] = price
+        order["qty"] = qty
+        self._apply_order_filled(order)
+        self.orders_count = len(self.active_test_orders)
+
+    def handle_order_done(self, order_id: int, status: str, ts_ms: int) -> None:
+        order = next(
+            (entry for entry in self.active_test_orders if entry.get("orderId") == order_id),
+            None,
+        )
+        if order is None:
+            return
+        if order.get("status") == status:
+            return
+        order["status"] = status
+        order["updated_ts"] = ts_ms
+        side = str(order.get("side", "UNKNOWN")).upper()
+        self._logger(f"[ORDER] {side} {status} id={order_id}")
+        self.active_test_orders = [
+            entry for entry in self.active_test_orders if entry.get("orderId") != order_id
+        ]
+        self.orders_count = len(self.active_test_orders)
+        if side == "BUY":
+            if self.position is None:
+                self._transition_state(TradeState.STATE_IDLE)
+        elif side == "SELL":
+            if self.position is not None:
+                self._transition_state(TradeState.STATE_POSITION_OPEN)
+            else:
+                self._transition_state(TradeState.STATE_IDLE)
+
+    def _apply_order_filled(self, order: dict) -> None:
+        side = order.get("side")
+        if side == "BUY":
+            self._logger(
+                f"[ORDER] BUY filled qty={order.get('qty'):.8f} "
+                f"price={order.get('price'):.8f}"
+            )
+            if self.position is None:
+                self.position = {
+                    "buy_price": order.get("price"),
+                    "qty": order.get("qty"),
+                    "opened_ts": order.get("updated_ts"),
+                }
+            self._transition_state(TradeState.STATE_POSITION_OPEN)
+        elif side == "SELL":
+            if order.get("reason") == "tp":
                 self._logger(
-                    f"[ORDER] BUY filled qty={order.get('qty'):.8f} "
+                    f"[ORDER] SELL filled (tp) qty={order.get('qty'):.8f} "
                     f"price={order.get('price'):.8f}"
                 )
-                if self.position is None:
-                    self.position = {
-                        "buy_price": order.get("price"),
-                        "qty": order.get("qty"),
-                        "opened_ts": now_ms,
-                    }
-                self._transition_state(TradeState.STATE_POSITION_OPEN)
-            elif side == "SELL":
-                if order.get("reason") == "tp":
-                    self._logger(
-                        f"[ORDER] SELL filled (tp) qty={order.get('qty'):.8f} "
-                        f"price={order.get('price'):.8f}"
-                    )
-                else:
-                    self._logger(
-                        f"[ORDER] SELL filled qty={order.get('qty'):.8f} "
-                        f"price={order.get('price'):.8f}"
-                    )
-                pnl = self._finalize_close(order)
-                realized = "—" if pnl is None else f"{pnl:.8f}"
-                self._logger(f"[PNL] realized={realized}")
-                self._transition_state(TradeState.STATE_CLOSED)
-                close_filled = True
-        if close_filled:
+            else:
+                self._logger(
+                    f"[ORDER] SELL filled qty={order.get('qty'):.8f} "
+                    f"price={order.get('price'):.8f}"
+                )
+            pnl = self._finalize_close(order)
+            realized = "—" if pnl is None else f"{pnl:.8f}"
+            self._logger(f"[PNL] realized={realized}")
+            self._transition_state(TradeState.STATE_CLOSED)
             self.active_test_orders = []
             self.orders_count = 0
             self._transition_state(TradeState.STATE_IDLE)
-        else:
-            self.orders_count = len(self.active_test_orders)
 
     def get_orders_snapshot(self) -> list[dict]:
         return [dict(order) for order in self.active_test_orders]
