@@ -35,24 +35,29 @@ class BinanceRestClient:
         return response.json()
 
     def create_margin_order(self, params: dict) -> dict:
-        return self._signed_request("POST", "/sapi/v1/margin/order", params)
+        return self.signed_sapi_request("POST", "/sapi/v1/margin/order", params)
 
     def cancel_margin_order(self, params: dict) -> dict:
-        return self._signed_request("DELETE", "/sapi/v1/margin/order", params)
+        return self.signed_sapi_request("DELETE", "/sapi/v1/margin/order", params)
 
     def get_margin_open_orders(self, symbol: str) -> list[dict]:
-        return self._signed_request(
+        return self.signed_sapi_request(
             "GET", "/sapi/v1/margin/openOrders", {"symbol": symbol}
         )
 
     def get_margin_account(self) -> dict:
-        return self._signed_request("GET", "/sapi/v1/margin/account", {})
+        return self.signed_sapi_request("GET", "/sapi/v1/margin/account", {})
 
     def borrow_margin_asset(self, params: dict) -> dict:
-        return self._signed_request("POST", "/sapi/v1/margin/loan", params)
+        return self.signed_sapi_request("POST", "/sapi/v1/margin/loan", params)
 
     def repay_margin_asset(self, params: dict) -> dict:
-        return self._signed_request("POST", "/sapi/v1/margin/repay", params)
+        return self.signed_sapi_request("POST", "/sapi/v1/margin/repay", params)
+
+    def signed_sapi_request(self, method: str, path: str, params: dict) -> dict:
+        if not path.startswith("/sapi/"):
+            raise ValueError("SAPI path must start with /sapi/")
+        return self._signed_request(method, path, params)
 
     def _signed_request(self, method: str, path: str, params: dict) -> dict:
         payload = dict(params)
