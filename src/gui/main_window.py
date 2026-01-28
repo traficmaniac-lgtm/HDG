@@ -6,7 +6,6 @@ from pathlib import Path
 from typing import Optional
 
 from datetime import datetime
-import time
 
 import httpx
 from PySide6.QtCore import Qt, QTimer, Slot
@@ -63,7 +62,6 @@ class MainWindow(QMainWindow):
         self._margin_checked = False
         self._margin_api_access = False
         self._borrow_allowed_by_api: Optional[bool] = None
-        self._last_age_update_ts = 0.0
 
         self._ui_timer = QTimer(self)
         self._ui_timer.timeout.connect(self._refresh_ui)
@@ -440,13 +438,6 @@ class MainWindow(QMainWindow):
             f"MARGIN_AUTH: {margin_auth} | BORROW: {borrow_status} | "
             f"last_action: {last_action} | orders: {orders_count}"
         )
-        now = time.monotonic()
-        if now - self._last_age_update_ts >= 0.25:
-            self._last_age_update_ts = now
-            self.age_label.setText(
-                f"Age: {self._fmt_int(price_state.mid_age_ms)} ms"
-            )
-
         self.ws_connected_label.setText(f"ws_connected: {health_state.ws_connected}")
         self.ws_age_label.setText(f"ws_age_ms: {self._fmt_int(health_state.ws_age_ms)}")
         self.http_age_label.setText(
@@ -534,7 +525,7 @@ class MainWindow(QMainWindow):
     def _stop_trading(self) -> None:
         if not self._trade_executor:
             return
-        self._trade_executor.cancel_test_orders_margin()
+        self._trade_executor.close_position()
         self._refresh_orders()
 
     @Slot()
@@ -776,17 +767,28 @@ class MainWindow(QMainWindow):
             return
 
         self._orders_error_logged = False
+        if self._router:
+            price_state, _ = self._router.build_price_state()
+            self.age_label.setText(
+                f"Age: {self._fmt_int(price_state.mid_age_ms)} ms"
+            )
+        if self._trade_executor:
+            self._trade_executor.sync_open_orders(open_orders)
         self._orders_model_clear()
         mid = self._last_mid
-        total_pnl = 0.0
         now_ms = int(datetime.utcnow().timestamp() * 1000)
-        for order in open_orders:
-            order_time = order.get("time")
+        orders = (
+            self._trade_executor.get_orders_snapshot()
+            if self._trade_executor
+            else []
+        )
+        for order in orders:
+            order_time = order.get("created_ts")
             age_ms = None
             if isinstance(order_time, int):
                 age_ms = max(0, now_ms - order_time)
-            qty = self._safe_float(order.get("origQty"))
-            price = self._safe_float(order.get("price"))
+            qty = order.get("qty")
+            price = order.get("price")
             side = str(order.get("side", "—")).upper()
             pnl_est = None
             if mid is not None and qty is not None and price is not None:
@@ -794,8 +796,6 @@ class MainWindow(QMainWindow):
                     pnl_est = (mid - price) * qty
                 elif side == "SELL":
                     pnl_est = (price - mid) * qty
-            if pnl_est is not None:
-                total_pnl += pnl_est
             display_time = self._format_time(order_time)
             row = [
                 display_time,
@@ -813,12 +813,24 @@ class MainWindow(QMainWindow):
                 item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             self.orders_model.appendRow(items)
 
-        if open_orders:
-            self.pnl_unrealized_label.setText(
-                f"Unrealized (est): {self._fmt_pnl(total_pnl)}"
+        if self._trade_executor:
+            unrealized = self._trade_executor.get_unrealized_pnl(mid)
+            if unrealized is not None:
+                self.pnl_unrealized_label.setText(
+                    f"Unrealized (est): {self._fmt_pnl(unrealized)}"
+                )
+            else:
+                self.pnl_unrealized_label.setText("Unrealized (est): —")
+            cycle_pnl = self._trade_executor.pnl_cycle
+            if cycle_pnl is None:
+                self.pnl_cycle_label.setText("PnL за цикл: —")
+            else:
+                self.pnl_cycle_label.setText(
+                    f"PnL за цикл: {self._fmt_pnl(cycle_pnl)}"
+                )
+            self.pnl_session_label.setText(
+                f"Session PnL: {self._fmt_pnl(self._trade_executor.pnl_session)}"
             )
-        else:
-            self.pnl_unrealized_label.setText("Unrealized (est): —")
 
     @staticmethod
     def _format_time(value: Optional[int]) -> str:
