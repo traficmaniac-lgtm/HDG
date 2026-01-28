@@ -25,7 +25,7 @@ class TradeState(Enum):
 
 
 class TradeExecutor:
-    TAG = "TEST_V0_5_9"
+    TAG = "PRE_V0_8_0"
 
     def __init__(
         self,
@@ -90,6 +90,10 @@ class TradeExecutor:
                 return 0
             price_state, health_state = self._router.build_price_state()
             mid = price_state.mid
+            if price_state.data_blind:
+                self._logger("[TRADE] blocked: data_blind")
+                self.last_action = "DATA_BLIND"
+                return 0
             if mid is None:
                 now = time.monotonic()
                 if now - self._last_no_price_log_ts >= 2.0:
@@ -233,7 +237,7 @@ class TradeExecutor:
             return 0
         return self._place_sell_order(reason="manual")
 
-    def evaluate_exit_conditions(self, mid: Optional[float]) -> None:
+    def evaluate_exit_conditions(self, mid: Optional[float], data_blind: bool) -> None:
         if self.state != TradeState.STATE_POSITION_OPEN:
             return
         if not self._settings.auto_exit_enabled:

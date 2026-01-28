@@ -24,6 +24,15 @@ class PriceRouter:
         self._last_switch_reason = ""
         self._ws_fresh_streak = 0
         self._ws_stable_since: Optional[float] = None
+        self._last_good_bid: Optional[float] = None
+        self._last_good_ask: Optional[float] = None
+        self._last_good_mid: Optional[float] = None
+        self._last_good_ts: Optional[float] = None
+        self._last_good_source: str = "NONE"
+        self._tick_size: Optional[float] = None
+        self._log_queue: list[str] = []
+        self._last_source_log_ts = 0.0
+        self._last_effective_source = "NONE"
 
     def update_ws(self, bid: float, ask: float) -> None:
         self._ws_bid = bid
@@ -48,8 +57,34 @@ class PriceRouter:
         self._http_ask = ask
         self._last_http_ts = time.monotonic()
 
+    def set_tick_size(self, tick_size: Optional[float]) -> None:
+        self._tick_size = tick_size
+
+    def consume_logs(self) -> list[str]:
+        if not self._log_queue:
+            return []
+        logs = list(self._log_queue)
+        self._log_queue.clear()
+        return logs
+
+    def is_ws_stale(self) -> bool:
+        if self._last_ws_ts is None:
+            return True
+        age_ms = (time.monotonic() - self._last_ws_ts) * 1000
+        return age_ms > self._settings.ws_stale_ms
+
     def get_best_quote(self) -> tuple[
-        Optional[float], Optional[float], Optional[float], str, Optional[int], Optional[int], Optional[int]
+        Optional[float],
+        Optional[float],
+        Optional[float],
+        str,
+        Optional[int],
+        Optional[int],
+        Optional[int],
+        bool,
+        bool,
+        Optional[int],
+        bool,
     ]:
         now = time.monotonic()
         ws_age_ms = (
@@ -60,7 +95,7 @@ class PriceRouter:
             if self._last_http_ts is not None
             else None
         )
-        ws_fresh = ws_age_ms is not None and ws_age_ms <= self._settings.ws_fresh_ms
+        ws_fresh = ws_age_ms is not None and ws_age_ms <= self._settings.ws_stale_ms
         http_fresh = http_age_ms is not None and http_age_ms <= self._settings.http_fresh_ms
 
         ws_stable = False
@@ -71,7 +106,7 @@ class PriceRouter:
                 else 0
             )
             ws_stable = self._ws_fresh_streak >= 3 or (
-                stable_ms >= self._settings.source_switch_hysteresis_ms
+                stable_ms >= self._settings.ws_switch_hysteresis_ms
             )
 
         effective_source = self._stable_source
@@ -94,16 +129,44 @@ class PriceRouter:
 
         bid = None
         ask = None
+        quote_source = "NONE"
         if effective_source == "WS" and ws_fresh:
             bid = self._ws_bid
             ask = self._ws_ask
-        elif effective_source == "HTTP" and http_fresh:
+            quote_source = "WS"
+        elif http_fresh:
             bid = self._http_bid
             ask = self._http_ask
+            quote_source = "HTTP"
 
         mid = (bid + ask) / 2.0 if bid is not None and ask is not None else None
-        min_interval_s = 0.2
+        if mid is not None and self._tick_size:
+            mid = round(mid / self._tick_size) * self._tick_size
         if mid is not None:
+            self._last_good_bid = bid
+            self._last_good_ask = ask
+            self._last_good_mid = mid
+            self._last_good_ts = now
+            self._last_good_source = quote_source
+
+        data_blind = False
+        from_cache = False
+        cache_age_ms = None
+        ttl_expired = False
+        if mid is None:
+            data_blind = True
+            if self._last_good_ts is not None:
+                cache_age_ms = int((now - self._last_good_ts) * 1000)
+                if cache_age_ms <= self._settings.good_quote_ttl_ms:
+                    bid = self._last_good_bid
+                    ask = self._last_good_ask
+                    mid = self._last_good_mid
+                    quote_source = self._last_good_source
+                    from_cache = True
+                else:
+                    ttl_expired = True
+        if mid is not None:
+            min_interval_s = 0.2
             should_update = (
                 self._stable_ts is None or (now - self._stable_ts) >= min_interval_s
             )
@@ -111,12 +174,19 @@ class PriceRouter:
                 self._stable_bid = bid
                 self._stable_ask = ask
                 self._stable_mid = mid
-                self._stable_ts = now
-                self._stable_source = effective_source
+                self._stable_ts = self._last_good_ts if from_cache else now
+                self._stable_source = quote_source if quote_source != "NONE" else effective_source
+        elif ttl_expired:
+            self._stable_bid = None
+            self._stable_ask = None
+            self._stable_mid = None
+            self._stable_ts = None
+            self._stable_source = "NONE"
 
-        mid_age_ms = (
-            int((now - self._stable_ts) * 1000) if self._stable_ts is not None else None
-        )
+        age_ref = self._stable_ts
+        if from_cache and self._last_good_ts is not None:
+            age_ref = self._last_good_ts
+        mid_age_ms = int((now - age_ref) * 1000) if age_ref is not None else None
         return (
             self._stable_bid,
             self._stable_ask,
@@ -125,19 +195,46 @@ class PriceRouter:
             ws_age_ms,
             http_age_ms,
             mid_age_ms,
+            data_blind,
+            from_cache,
+            cache_age_ms,
+            ttl_expired,
         )
 
     def build_price_state(self) -> tuple[PriceState, HealthState]:
-        bid, ask, mid, source, ws_age_ms, http_age_ms, mid_age_ms = self.get_best_quote()
+        (
+            bid,
+            ask,
+            mid,
+            source,
+            ws_age_ms,
+            http_age_ms,
+            mid_age_ms,
+            data_blind,
+            from_cache,
+            cache_age_ms,
+            ttl_expired,
+        ) = self.get_best_quote()
 
         if source != self._last_source:
             if source == "WS":
-                self._last_switch_reason = "WS fresh"
+                self._last_switch_reason = "ws_stable"
             elif source == "HTTP":
-                self._last_switch_reason = "HTTP fallback"
+                self._last_switch_reason = "ws_stale"
             else:
-                self._last_switch_reason = "No fresh data"
+                self._last_switch_reason = "no_fresh_data"
             self._last_source = source
+
+        if source != self._last_effective_source:
+            now = time.monotonic()
+            if now - self._last_source_log_ts >= 5.0:
+                self._last_source_log_ts = now
+                ws_age_label = ws_age_ms if ws_age_ms is not None else "?"
+                self._log_queue.append(
+                    f"[DATA] source={self._last_effective_source} -> {source} "
+                    f"reason={self._last_switch_reason} ws_age={ws_age_label}"
+                )
+            self._last_effective_source = source
 
         price_state = PriceState(
             bid=bid,
@@ -145,6 +242,10 @@ class PriceRouter:
             mid=mid,
             source=source,
             mid_age_ms=mid_age_ms,
+            data_blind=data_blind,
+            from_cache=from_cache,
+            cache_age_ms=cache_age_ms,
+            ttl_expired=ttl_expired,
         )
         health_state = HealthState(
             ws_connected=False,

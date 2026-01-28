@@ -30,7 +30,7 @@ from PySide6.QtWidgets import (
 )
 
 from src.core.config_store import ApiCredentials, ConfigStore
-from src.core.models import Settings, SymbolProfile
+from src.core.models import PriceState, Settings, SymbolProfile
 from src.core.version import VERSION
 from src.gui.api_settings_dialog import ApiSettingsDialog
 from src.gui.trade_settings_dialog import TradeSettingsDialog
@@ -66,6 +66,10 @@ class MainWindow(QMainWindow):
         self._borrow_allowed_by_api: Optional[bool] = None
         self._order_tracker: Optional[OrderTracker] = None
         self._last_ws_status_log_ts = 0.0
+        self._data_blind_active = False
+        self._ttl_expired_logged = False
+        self._last_data_blind_log_ts = 0.0
+        self._last_ttl_expired_log_ts = 0.0
 
         self._ui_timer = QTimer(self)
         self._ui_timer.timeout.connect(self._refresh_ui)
@@ -149,7 +153,7 @@ class MainWindow(QMainWindow):
         self.mid_label = QLabel("Mid: —")
         self.bid_label = QLabel("Bid: —")
         self.ask_label = QLabel("Ask: —")
-        self.age_label = QLabel("Age: — ms")
+        self.age_label = QLabel("SRC: —")
         market_column.addWidget(market_title)
         market_column.addWidget(self.mid_label)
         market_column.addWidget(self.bid_label)
@@ -322,6 +326,8 @@ class MainWindow(QMainWindow):
             exchange_info = self._rest.get_exchange_info(self._settings.symbol)
             self._symbol_profile = self._parse_symbol_profile(exchange_info)
             self._render_symbol_profile(self._symbol_profile)
+            if self._router:
+                self._router.set_tick_size(self._symbol_profile.tick_size)
         except Exception as exc:
             self._append_log(f"REST init error: {exc}")
 
@@ -365,7 +371,7 @@ class MainWindow(QMainWindow):
                 self._append_log("[API] missing, trading disabled")
 
         self._start_ws()
-        self._http_timer.start(self._settings.http_interval_ms)
+        self._http_timer.start(self._settings.http_poll_ms)
         self._ui_timer.start(self._settings.ui_refresh_ms)
         self._orders_timer.start(1000)
 
@@ -473,6 +479,13 @@ class MainWindow(QMainWindow):
     def _poll_http(self) -> None:
         if not self._settings or not self._http_service:
             return
+        if self._router and not self._settings.position_guard_http:
+            state_label = (
+                self._trade_executor.get_state_label() if self._trade_executor else "—"
+            )
+            in_position = state_label in {"POSITION_OPEN", "WAIT_SELL"}
+            if not in_position and not self._router.is_ws_stale():
+                return
         try:
             payload = self._http_service.fetch_book_ticker(self._settings.symbol)
             bid = float(payload.get("bidPrice", 0.0))
@@ -488,6 +501,8 @@ class MainWindow(QMainWindow):
         price_state, health_state = self._router.build_price_state()
         health_state.ws_connected = self._ws_connected
         self._last_mid = price_state.mid
+        for log_message in self._router.consume_logs():
+            self._append_log(log_message)
 
         self.mid_label.setText(f"Mid: {self._fmt_price(price_state.mid)}")
         self.bid_label.setText(f"Bid: {self._fmt_price(price_state.bid)}")
@@ -517,6 +532,7 @@ class MainWindow(QMainWindow):
         self.switch_reason_label.setText(
             f"last_switch_reason: {health_state.last_switch_reason or '—'}"
         )
+        self._log_data_blind_state(price_state, state_label)
         self._update_exit_status(price_state.mid)
         self._update_trading_controls(price_state)
 
@@ -534,7 +550,9 @@ class MainWindow(QMainWindow):
         if price_state is not None:
             self._last_mid = price_state.mid
             if self._trade_executor:
-                self._trade_executor.evaluate_exit_conditions(price_state.mid)
+                self._trade_executor.evaluate_exit_conditions(
+                    price_state.mid, price_state.data_blind
+                )
         can_trade = (
             self._connected
             and self._trade_executor is not None
@@ -658,15 +676,20 @@ class MainWindow(QMainWindow):
         return Settings(
             symbol=payload.get("symbol", "EURIUSDT"),
             ws_fresh_ms=int(payload.get("ws_fresh_ms", 700)),
+            ws_stale_ms=int(payload.get("ws_stale_ms", 1500)),
             http_fresh_ms=int(payload.get("http_fresh_ms", 1500)),
-            http_interval_ms=int(payload.get("http_interval_ms", 1000)),
+            http_poll_ms=int(payload.get("http_poll_ms", payload.get("http_interval_ms", 350))),
             ui_refresh_ms=int(payload.get("ui_refresh_ms", 100)),
             ws_log_throttle_ms=int(payload.get("ws_log_throttle_ms", 5000)),
             ws_reconnect_dedup_ms=int(payload.get("ws_reconnect_dedup_ms", 10000)),
             order_poll_ms=int(payload.get("order_poll_ms", 1500)),
-            source_switch_hysteresis_ms=int(
-                payload.get("source_switch_hysteresis_ms", 1000)
+            ws_switch_hysteresis_ms=int(
+                payload.get(
+                    "ws_switch_hysteresis_ms", payload.get("source_switch_hysteresis_ms", 1000)
+                )
             ),
+            good_quote_ttl_ms=int(payload.get("good_quote_ttl_ms", 3000)),
+            position_guard_http=bool(payload.get("position_guard_http", True)),
             account_mode=str(payload.get("account_mode", "CROSS_MARGIN")),
             leverage_hint=int(
                 payload.get("leverage_hint", payload.get("max_leverage_hint", 3))
@@ -685,6 +708,31 @@ class MainWindow(QMainWindow):
                 payload.get("auto_exit_enabled", payload.get("auto_close", True))
             ),
         )
+
+    def _log_data_blind_state(self, price_state: PriceState, state_label: str) -> None:
+        now = time.monotonic()
+        if price_state.data_blind and price_state.from_cache:
+            if not self._data_blind_active or now - self._last_data_blind_log_ts >= 5.0:
+                self._data_blind_active = True
+                self._last_data_blind_log_ts = now
+                age_label = (
+                    str(price_state.cache_age_ms)
+                    if price_state.cache_age_ms is not None
+                    else "?"
+                )
+                self._append_log(
+                    f"[DATA] mid_from_cache age_ms={age_label} state={state_label}"
+                )
+            self._ttl_expired_logged = False
+        elif price_state.data_blind and price_state.ttl_expired:
+            if not self._ttl_expired_logged or now - self._last_ttl_expired_log_ts >= 5.0:
+                self._ttl_expired_logged = True
+                self._last_ttl_expired_log_ts = now
+                self._append_log(
+                    f"[DATA_BLIND] ttl_expired state={state_label} action=freeze_exits"
+                )
+        else:
+            self._data_blind_active = False
 
     def _load_api_state(self) -> None:
         creds = self._config_store.load_api_credentials()
@@ -910,9 +958,7 @@ class MainWindow(QMainWindow):
             self._orders_error_logged = False
         if self._router:
             price_state, _ = self._router.build_price_state()
-            self.age_label.setText(
-                f"Age: {self._fmt_int(price_state.mid_age_ms)} ms"
-            )
+            self.age_label.setText(f"SRC: {price_state.source}")
         if self._trade_executor:
             self._trade_executor.sync_open_orders(open_orders)
         self._orders_model_clear()
