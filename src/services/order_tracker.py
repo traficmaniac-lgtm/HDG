@@ -9,8 +9,8 @@ from src.services.binance_rest import BinanceRestClient
 
 
 class OrderTracker(QObject):
-    order_filled = Signal(int, str, float, float, int)
-    order_done = Signal(int, str, int)
+    order_filled = Signal(int, str, float, float, "qint64")
+    order_done = Signal(int, str, "qint64")
 
     def __init__(
         self,
