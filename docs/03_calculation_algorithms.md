@@ -49,21 +49,30 @@ impulse_bps = abs(last_ws_mid_raw - prev_ws_mid_raw) / prev_ws_mid_raw * 10_000
 
 Флаг `impulse_ready` становится `True`, когда есть минимум два WS mid значения.
 
-## Фильтры входа (entry filters)
+## Entry-фильтры и анти-шум
 
 Вход запрещён, если выполнено любое условие:
 
 1. `data_stale=True` — отсутствует актуальный источник данных.
 2. `spread_bps > max_spread_bps`.
 3. `tick_rate < min_tick_rate`.
-4. `impulse_bps < impulse_min_bps` (если импульс-фильтр включён).
-5. Нарушение лимита по плечу (см. ниже).
+4. Импульс-фильтр не выполнен:
+   - нет двух WS mid (`impulse_ready=False`),
+   - или `impulse_bps < impulse_min_bps`.
+5. Нарушен лимит по плечу (см. ниже).
+6. **Анти-шум:**
+   - `abs(raw_bps) <= fee_total_bps` → `noise_zone`.
+   - `raw_bps < raw_bps_min_enter` → `raw_bps_min`.
+   - `expected_net_bps = raw_bps - fee_total_bps <= 0` → `no_edge`.
+
+`raw_bps_min_enter` рассчитывается как `fee_total_bps * 1.5`,
+а если `fee_total_bps == 7`, то минимум `11`.
 
 ### Деградация импульса
 
 Импульс-фильтр может быть автоматически «ослаблен» после `impulse_grace_ms`:
 
-- Если прошло достаточно времени после `ARMED`,
+- Если прошло достаточно времени после `arm()` (`impulse_grace_ms`),
 - И остальные фильтры (data/spread/tick rate) выполняются,
 - Тогда импульс-фильтр логируется как `impulse_degraded` и не блокирует вход.
 
@@ -85,16 +94,23 @@ leverage_ok = notional_total <= equity_usdt * leverage_max
 ## Расчёт количества и округление
 
 - Базовый объём: `qty = usd_notional / mid`.
-- Округление вниз по `step_size` (лот фильтр).
-- Дополнительные ограничения:
-  - `qty >= min_qty`.
-  - `qty * mid >= min_notional`.
+- Округление вниз по `step_size` (лот-фильтр).
+- Проверки `min_qty` и `min_notional`.
+
+## Нормализация цены для aggressive_limit
+
+Если `order_mode = aggressive_limit`, цена вычисляется с учётом проскальзывания
+и нормализуется по `tick_size`:
+
+- BUY: `ask * (1 + slip_bps / 10_000)` (округление вверх).
+- SELL: `bid * (1 - slip_bps / 10_000)` (округление вниз).
+
+При невозможности рассчитать валидную цену — fallback на `market`.
 
 ## Детект победителя
 
 - Окно детекта: `detect_window_ticks` (минимум 5).
-- Таймаут детекта: `detect_timeout_ms`, но не меньше
-  `(detect_window_ticks / min_tick_rate) * 1000 + 500`.
+- Таймаут детекта: `detect_timeout_ms`.
 
 Победитель фиксируется, если:
 
@@ -114,18 +130,15 @@ if best >= winner_threshold_bps:
 
 ## Условия выхода победителя
 
-Выход из `RIDING` по любому условию:
+Выход из `WAIT_WINNER` по любому условию:
 
 - `winner_net_bps >= target_net_bps` → цель.
 - `winner_raw_bps <= -emergency_stop_bps` → экстренный стоп.
 - `winner_raw_bps <= -max_loss_bps` → обычный стоп-лосс.
-- `effective_age_ms > 1500` → данные устарели.
+- `effective_age_ms > data_stale_exit_ms` → данные устарели.
 
-## Aggressive limit
+## Таймауты и ожидания
 
-Цена для `aggressive_limit`:
-
-- BUY: `ask * (1 + slip_bps / 10_000)`.
-- SELL: `bid * (1 - slip_bps / 10_000)`.
-
-При `aggressive_limit` ожидание fill — 0.4s, затем отмена и fallback на `market`.
+- Ожидание fill для entry/exit задаётся параметрами:
+  `wait_fill_timeout_ms`, `wait_exit_timeout_ms`.
+- Дополнительная проверка «флет» позиции — `wait_positions_timeout_ms`.
