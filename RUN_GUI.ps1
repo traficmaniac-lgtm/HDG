@@ -45,7 +45,7 @@ if (Test-Path $logFile) {
 }
 
 Write-Host "[INFO] Logs will be written to: $logFile"
-& $venvPython -m src.app.main 1> $logFile 2>&1
+& $venvPython -m src.app 1> $logFile 2>&1
 $exitCode = $LASTEXITCODE
 
 if ($exitCode -ne 0) {
