@@ -19,7 +19,7 @@ from src.core.models import Settings
 
 
 class TradeSettingsDialog(QDialog):
-    saved = Signal(float, int, int, int, str, int, str, bool, str, bool)
+    saved = Signal(float, int, int, int, str, int, int, int, str, bool, str, bool)
 
     def __init__(
         self, parent=None, store: ConfigStore | None = None, settings: Settings | None = None
@@ -72,6 +72,21 @@ class TradeSettingsDialog(QDialog):
         if index >= 0:
             self.order_type_input.setCurrentIndex(index)
         form.addRow("Тип ордера", self.order_type_input)
+
+        self.buy_ttl_input = QSpinBox()
+        self.buy_ttl_input.setRange(500, 20000)
+        self.buy_ttl_input.setSingleStep(100)
+        self.buy_ttl_input.setValue(
+            int(getattr(settings, "buy_ttl_ms", 2500) or 2500) if settings else 2500
+        )
+        form.addRow("TTL входа BUY (мс)", self.buy_ttl_input)
+
+        self.buy_retry_input = QSpinBox()
+        self.buy_retry_input.setRange(0, 10)
+        self.buy_retry_input.setValue(
+            int(getattr(settings, "max_buy_retries", 3) or 0) if settings else 3
+        )
+        form.addRow("Повторы входа (BUY)", self.buy_retry_input)
 
         self.exit_order_type_input = QComboBox()
         self.exit_order_type_input.addItems(["LIMIT", "MARKET"])
@@ -145,6 +160,8 @@ class TradeSettingsDialog(QDialog):
         payload["take_profit_ticks"] = int(self.take_profit_input.value())
         payload["stop_loss_ticks"] = int(self.stop_loss_input.value())
         payload["order_type"] = str(self.order_type_input.currentText()).upper()
+        payload["buy_ttl_ms"] = int(self.buy_ttl_input.value())
+        payload["max_buy_retries"] = int(self.buy_retry_input.value())
         payload["exit_order_type"] = str(self.exit_order_type_input.currentText()).upper()
         payload["exit_offset_ticks"] = int(self.exit_offset_input.value())
         payload["allow_borrow"] = bool(self.allow_borrow_input.isChecked())
@@ -157,6 +174,8 @@ class TradeSettingsDialog(QDialog):
             int(self.take_profit_input.value()),
             int(self.stop_loss_input.value()),
             str(self.order_type_input.currentText()).upper(),
+            int(self.buy_ttl_input.value()),
+            int(self.buy_retry_input.value()),
             int(self.exit_offset_input.value()),
             str(self.exit_order_type_input.currentText()).upper(),
             bool(self.allow_borrow_input.isChecked()),

@@ -702,8 +702,10 @@ class MainWindow(QMainWindow):
             order_type=str(payload.get("order_type", "LIMIT")).upper(),
             exit_order_type=str(payload.get("exit_order_type", "LIMIT")).upper(),
             exit_offset_ticks=int(payload.get("exit_offset_ticks", 1)),
-            buy_ttl_ms=int(payload.get("buy_ttl_ms", 1500)),
-            max_buy_retries=int(payload.get("max_buy_retries", 3)),
+            buy_ttl_ms=self._bounded_int(payload.get("buy_ttl_ms", 2500), 500, 20000, 2500),
+            max_buy_retries=self._bounded_int(
+                payload.get("max_buy_retries", 3), 0, 10, 3
+            ),
             allow_borrow=bool(payload.get("allow_borrow", True)),
             side_effect_type=str(payload.get("side_effect_type", "AUTO_BORROW_REPAY")).upper(),
             margin_isolated=bool(payload.get("margin_isolated", False)),
@@ -769,6 +771,14 @@ class MainWindow(QMainWindow):
     def _sanitize_api_value(value: str) -> str:
         return value.strip().strip("'\"")
 
+    @staticmethod
+    def _bounded_int(value: object, min_value: int, max_value: int, default: int) -> int:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return default
+        return max(min_value, min(max_value, parsed))
+
     def _open_api_settings(self) -> None:
         dialog = ApiSettingsDialog(self, store=self._config_store)
         dialog.saved.connect(self._on_api_saved)
@@ -790,6 +800,8 @@ class MainWindow(QMainWindow):
         take_profit_ticks: int,
         stop_loss_ticks: int,
         order_type: str,
+        buy_ttl_ms: int,
+        max_buy_retries: int,
         exit_offset_ticks: int,
         exit_order_type: str,
         allow_borrow: bool,
@@ -802,6 +814,8 @@ class MainWindow(QMainWindow):
             self._settings.take_profit_ticks = take_profit_ticks
             self._settings.stop_loss_ticks = stop_loss_ticks
             self._settings.order_type = order_type
+            self._settings.buy_ttl_ms = buy_ttl_ms
+            self._settings.max_buy_retries = max_buy_retries
             self._settings.exit_offset_ticks = exit_offset_ticks
             self._settings.exit_order_type = exit_order_type
             self._settings.allow_borrow = allow_borrow
