@@ -120,6 +120,8 @@ class DirectionalCycle:
         self._phase_seq = 0
         self._ride_start_ts: Optional[float] = None
         self._last_transition_reason: Optional[str] = None
+        self._wait_winner_start_ts: Optional[float] = None
+        self._entry_actions: set[str] = set()
         self._market_data.set_detect_window_ticks(self._detect_window_ticks)
 
     @property
@@ -216,21 +218,38 @@ class DirectionalCycle:
 
     def _condition_from_state(self, state: BotState) -> str:
         return {
-            BotState.ENTERING: "ENTER",
-            BotState.DETECTING: "DETECT_WAIT",
-            BotState.CUTTING: "CUT_LOSER",
-            BotState.RIDING: "RIDE_TARGET",
-            BotState.EXITING: "EXIT",
-            BotState.CONTROLLED_FLATTEN: "FLATTEN",
+            BotState.DETECT: "DETECT",
+            BotState.ENTERED_LONG: "ENTERED_LONG",
+            BotState.ENTERED_SHORT: "ENTERED_SHORT",
+            BotState.WAIT_WINNER: "WAIT_WINNER",
+            BotState.EXIT: "EXIT",
+            BotState.FLATTEN: "FLATTEN",
             BotState.COOLDOWN: "COOLDOWN",
             BotState.ERROR: "ERROR",
-            BotState.ARMED: "ARMED",
             BotState.IDLE: "IDLE",
         }.get(state, state.value)
 
     def _set_phase(self, state: BotState, reason: str, action: Optional[str] = None) -> None:
-        self._state_machine.state = state
-        self._phase_seq += 1
+        previous = self._state_machine.state
+        if not self._state_machine.transition(state):
+            self._emit_log(
+                "FSM",
+                "ERROR",
+                "[FSM] invalid_transition",
+                cycle_id=self._state_machine.cycle_id,
+                from_state=previous.value,
+                to_state=state.value,
+                reason=reason,
+            )
+            return
+        if previous != state:
+            self._phase_seq += 1
+            self._emit_log(
+                "FSM",
+                "INFO",
+                f"[FSM] cycle_id={self._state_machine.cycle_id} FROM={previous.value} "
+                f"TO={state.value} reason={reason}",
+            )
         self._last_transition_reason = reason
         if action:
             self._last_action = action
@@ -296,10 +315,11 @@ class DirectionalCycle:
             self._waiting_for_data = False
         self._maybe_log_data_source()
         self._maybe_log_data_health()
-        if self._state_machine.state == BotState.DETECTING:
-            self._evaluate_detecting()
-        elif self._state_machine.state == BotState.RIDING:
-            self._evaluate_riding()
+        if self._state_machine.state == BotState.WAIT_WINNER:
+            if self._winner_side:
+                self._evaluate_riding()
+            else:
+                self._evaluate_detecting()
 
     def attempt_entry(self) -> None:
         self._check_timeouts()
@@ -326,7 +346,7 @@ class DirectionalCycle:
         if self._state_machine.state == BotState.COOLDOWN:
             self._log_skip("cooldown")
             return
-        if self._state_machine.state != BotState.ARMED:
+        if self._state_machine.state != BotState.DETECT:
             return
         if not self._market_data.get_last_ws_tick() and not self._market_data.get_last_http_tick():
             self._log_skip("no_tick")
@@ -359,6 +379,7 @@ class DirectionalCycle:
         last_ws_tick = self._market_data.get_last_ws_tick() or {}
         self._armed_ts = time.monotonic()
         self._last_non_impulse_skip_ts = self._armed_ts
+        previous = self._state_machine.state
         self._emit_log(
             "INFO",
             "INFO",
@@ -371,15 +392,38 @@ class DirectionalCycle:
             ws_connected=self._market_data.is_ws_connected(),
         )
         self._state_machine.arm()
+        if previous != self._state_machine.state:
+            self._emit_log(
+                "FSM",
+                "INFO",
+                f"[FSM] cycle_id={self._state_machine.cycle_id} FROM={previous.value} "
+                f"TO={self._state_machine.state.value} reason=arm",
+            )
 
     def stop(self) -> None:
+        previous = self._state_machine.state
         self._state_machine.stop()
         self._execution.cancel_open_orders()
         self._emergency_flatten(reason="stop")
+        if previous != self._state_machine.state:
+            self._emit_log(
+                "FSM",
+                "INFO",
+                f"[FSM] cycle_id={self._state_machine.cycle_id} FROM={previous.value} "
+                f"TO={self._state_machine.state.value} reason=stop",
+            )
 
     def end_cooldown(self, auto_resume: bool) -> None:
         if not auto_resume:
+            previous = self._state_machine.state
             self._state_machine.stop()
+            if previous != self._state_machine.state:
+                self._emit_log(
+                    "FSM",
+                    "INFO",
+                    f"[FSM] cycle_id={self._state_machine.cycle_id} FROM={previous.value} "
+                    f"TO={self._state_machine.state.value} reason=cooldown_stop",
+                )
             return
         if not self._is_flat(force=True):
             self._emit_log(
@@ -394,7 +438,15 @@ class DirectionalCycle:
             self._last_action = "FLATTEN"
             self._controlled_flatten(reason="cooldown_not_flat")
             return
+        previous = self._state_machine.state
         self._state_machine.end_cooldown()
+        if previous != self._state_machine.state:
+            self._emit_log(
+                "FSM",
+                "INFO",
+                f"[FSM] cycle_id={self._state_machine.cycle_id} FROM={previous.value} "
+                f"TO={self._state_machine.state.value} reason=cooldown_end",
+            )
 
     def emergency_flatten(self, reason: str) -> None:
         self._emergency_flatten(reason=reason)
@@ -446,7 +498,8 @@ class DirectionalCycle:
         self._last_detect_sample_log_ts = 0.0
         self._last_action = None
         self._trades_count = 0
-        self._set_phase(BotState.ENTERING, reason="cycle_start")
+        self._entry_actions = set()
+        self._wait_winner_start_ts = None
         self._reset_detect_buffer()
         self._emit_log(
             "CYCLE",
@@ -469,8 +522,9 @@ class DirectionalCycle:
             self._inflight_entry = False
             return
         self._inflight_entry = False
-        self._set_phase(BotState.DETECTING, reason="enter_filled", action="ENTER_FILLED")
+        self._set_phase(BotState.WAIT_WINNER, reason="enter_filled", action="ENTER_FILLED")
         self._detect_start_ts = time.monotonic()
+        self._wait_winner_start_ts = self._detect_start_ts
         self._reset_detect_buffer()
         self._emit_log(
             "INFO",
@@ -485,7 +539,11 @@ class DirectionalCycle:
     def _enter_hedge(self) -> bool:
         if self._inflight_entry is False:
             self._inflight_entry = True
-        if self._state_machine.state != BotState.ENTERING:
+        if self._state_machine.state not in {
+            BotState.DETECT,
+            BotState.ENTERED_LONG,
+            BotState.ENTERED_SHORT,
+        }:
             self._emit_log(
                 "GUARD",
                 "WARN",
@@ -608,7 +666,9 @@ class DirectionalCycle:
             sell_status = self._execution.get_order(int(sell_id)) if sell_id else None
             self._log_partial("partial_hedge_entry", qty, buy_status, sell_status)
             return False
+        self._set_phase(BotState.ENTERED_LONG, reason="entry_long_filled", action="ENTER_LONG")
         self._entry_long_price = buy_fill[0]
+        self._set_phase(BotState.ENTERED_SHORT, reason="entry_short_filled", action="ENTER_SHORT")
         self._entry_short_price = sell_fill[0]
         effective_mid = self._get_effective_mid_decimal()
         if effective_mid is None:
@@ -662,9 +722,6 @@ class DirectionalCycle:
         min_tick_rate = max(1, int(self._strategy.min_tick_rate))
         min_timeout_ms = (self._detect_window_ticks / min_tick_rate) * 1000 + 500
         detect_timeout_ms = max(float(self._strategy.detect_timeout_ms), min_timeout_ms)
-        if elapsed > detect_timeout_ms and len(self._detect_mid_buffer) >= self._detect_window_ticks:
-            self._handle_detect_timeout()
-            return
         tick = self._market_data.get_last_effective_tick() or {}
         mid_now = self._mid_from_tick_decimal(tick)
         if mid_now is None:
@@ -676,6 +733,15 @@ class DirectionalCycle:
         self._short_raw_bps = short_raw
         winner_threshold = self._strategy.winner_threshold_bps
         best = max(long_raw, short_raw)
+        if self._wait_winner_start_ts:
+            wait_elapsed_ms = (time.monotonic() - self._wait_winner_start_ts) * 1000
+            if wait_elapsed_ms >= self._strategy.max_wait_ms:
+                if abs(best) < self._strategy.raw_bps_min_exit:
+                    self._force_flatten("wait_winner_timeout", result="TIMEOUT")
+                    return
+        if elapsed > detect_timeout_ms and len(self._detect_mid_buffer) >= self._detect_window_ticks:
+            self._handle_detect_timeout()
+            return
         delta_mid_bps = None
         if len(self._detect_mid_buffer) >= self._detect_window_ticks:
             mid_first = self._detect_mid_buffer[0]
@@ -735,7 +801,7 @@ class DirectionalCycle:
             cycle_id=self._state_machine.cycle_id,
             winner=self._winner_side,
         )
-        self._set_phase(BotState.CUTTING, reason="detect_winner", action="CUT_SENT")
+        self._set_phase(BotState.WAIT_WINNER, reason="detect_winner", action="CUT_SENT")
         self._cut_loser()
 
     def _cut_loser(self) -> None:
@@ -849,12 +915,12 @@ class DirectionalCycle:
             client_order_id=client_order_id,
         )
         self._emit_log("STATE", "INFO", "CUT_DONE", cycle_id=self._state_machine.cycle_id)
-        self._set_phase(BotState.RIDING, reason="cut_done", action="CUT_FILLED")
+        self._set_phase(BotState.WAIT_WINNER, reason="cut_done", action="CUT_FILLED")
         self._ride_start_ts = time.monotonic()
         self._evaluate_riding()
 
     def _evaluate_riding(self) -> None:
-        if self._state_machine.state != BotState.RIDING:
+        if self._state_machine.state != BotState.WAIT_WINNER:
             return
         if not self._last_tick or not self._entry_mid or not self._winner_side:
             return
@@ -868,6 +934,15 @@ class DirectionalCycle:
         winner_net_bps = winner_raw_bps - self._strategy.fee_total_bps
         self._winner_raw_bps = winner_raw_bps
         self._winner_net_bps = winner_net_bps
+        total_net_bps = winner_net_bps
+        if self._loser_net_bps is not None:
+            total_net_bps += self._loser_net_bps
+        if self._wait_winner_start_ts:
+            wait_elapsed_ms = (time.monotonic() - self._wait_winner_start_ts) * 1000
+            if wait_elapsed_ms >= self._strategy.max_wait_ms:
+                if abs(winner_raw_bps) < self._strategy.raw_bps_min_exit:
+                    self._force_flatten("wait_winner_timeout", result="TIMEOUT")
+                    return
         now = time.monotonic()
         if now - self._last_ride_log_ts > 0.5:
             self._emit_log(
@@ -876,7 +951,7 @@ class DirectionalCycle:
                 "RIDE update",
                 winner=self._winner_side,
                 raw_bps=f"{winner_raw_bps:.2f}",
-                net_bps=f"{winner_net_bps:.2f}",
+                net_bps=f"{total_net_bps:.2f}",
             )
             self._emit_log(
                 "STATE",
@@ -884,7 +959,7 @@ class DirectionalCycle:
                 "RIDE_UPDATE",
                 cycle_id=self._state_machine.cycle_id,
                 raw_bps=f"{winner_raw_bps:.2f}",
-                net_bps=f"{winner_net_bps:.2f}",
+                net_bps=f"{total_net_bps:.2f}",
             )
             self._last_ride_log_ts = now
         if snapshot.data_stale or effective_age_ms > self._strategy.data_stale_exit_ms:
@@ -898,16 +973,16 @@ class DirectionalCycle:
         if winner_raw_bps <= -self._strategy.emergency_stop_bps:
             self._exit_winner("emergency_stop")
             return
-        if winner_net_bps >= self._strategy.target_net_bps:
+        if total_net_bps >= self._strategy.target_net_bps:
             self._exit_winner("target")
             return
-        if winner_raw_bps <= -self._strategy.max_loss_bps:
+        if total_net_bps <= -self._strategy.max_loss_bps:
             self._exit_winner("stop_loss")
 
     def _exit_winner(self, note: str) -> None:
         if not self._entry_qty or not self._winner_side:
             return
-        self._set_phase(BotState.EXITING, reason=note, action="EXIT_SENT")
+        self._set_phase(BotState.EXIT, reason=note, action="EXIT_SENT")
         self._last_reason = note
         self._inflight_exit = True
         try:
@@ -1004,16 +1079,11 @@ class DirectionalCycle:
                 pos_short_qty=self._pos_short_qty,
             )
             if not self._cleanup_close_winner():
-                self._timeout_to_cooldown("exit_not_flat")
+                self._force_flatten("exit_not_flat", result="TIMEOUT")
                 return
-        self._state_machine.finish_cycle()
-        self._inflight_exit = False
-        self._emit_log("STATE", "INFO", "CYCLE_DONE", cycle_id=self._state_machine.cycle_id)
-        self._log_cycle_end("OK", reason=note)
+        self._finish_cycle("OK", reason=note)
 
     def _timeout_to_cooldown(self, reason: str) -> None:
-        self._last_reason = reason
-        self._last_action = "FLATTEN_SENT"
         self._emit_log(
             "ERROR",
             "ERROR",
@@ -1021,14 +1091,66 @@ class DirectionalCycle:
             cycle_id=self._state_machine.cycle_id,
             reason=reason,
         )
+        self._force_flatten(reason, result="TIMEOUT")
+
+    def _force_flatten(self, reason: str, result: str) -> None:
+        self._last_reason = reason
+        self._last_action = "FLATTEN_SENT"
+        self._set_phase(BotState.FLATTEN, reason=reason, action="FLATTEN_SENT")
         self._execution.cancel_open_orders()
-        if not self._abort_if_not_authorized("timeout_cancel_orders"):
-            self._emergency_flatten(reason=reason)
-        self._state_machine.finish_cycle()
+        if not self._abort_if_not_authorized("force_flatten_cancel_orders"):
+            success = self._controlled_flatten(reason=reason)
+            if not success:
+                self._emergency_flatten(reason=reason)
+        self._finish_cycle(result, reason=reason)
+
+    def _finish_cycle(self, result: str, reason: Optional[str] = None) -> None:
+        self._execution.cancel_open_orders()
         self._inflight_entry = False
         self._inflight_exit = False
+        self._set_phase(BotState.COOLDOWN, reason="cycle_done")
         self._emit_log("STATE", "INFO", "CYCLE_DONE", cycle_id=self._state_machine.cycle_id)
-        self._log_cycle_end("TIMEOUT", reason=reason)
+        self._log_cycle_end(result, reason=reason)
+        if result != "OK":
+            reason_code = self._flatten_reason_code(reason or "")
+            self._emit_log(
+                "FSM",
+                "WARN",
+                f"[FSM] cycle_id={self._state_machine.cycle_id} result=FLATTEN "
+                f"reason={reason_code}",
+            )
+        self._reset_cycle_state()
+
+    def _flatten_reason_code(self, reason: str) -> str:
+        reason_lower = reason.lower()
+        if "timeout" in reason_lower:
+            return "TIMEOUT"
+        if "edge" in reason_lower or "raw_bps" in reason_lower or "noise" in reason_lower:
+            return "NO_EDGE"
+        if "loss" in reason_lower or "stop" in reason_lower:
+            return "LOSS"
+        return "NO_EDGE"
+
+    def _reset_cycle_state(self) -> None:
+        self._execution.cancel_open_orders()
+        self._winner_side = None
+        self._loser_side = None
+        self._winner_raw_bps = None
+        self._winner_net_bps = None
+        self._loser_raw_bps = None
+        self._loser_net_bps = None
+        self._long_raw_bps = None
+        self._short_raw_bps = None
+        self._last_cycle_net_bps = None
+        self._last_net_usd = None
+        self._entry_actions = set()
+        self._entry_mid = None
+        self._entry_qty = None
+        self._detect_mid = None
+        self._exit_mid = None
+        self._detect_start_ts = None
+        self._ride_start_ts = None
+        self._wait_winner_start_ts = None
 
     def _wait_for_positions(self, label: str, timeout_ms: float) -> bool:
         start = time.monotonic()
@@ -1116,11 +1238,8 @@ class DirectionalCycle:
                 policy=self._strategy.no_winner_policy,
             )
         self._last_reason = reason
-        if self._state_machine.state != BotState.ERROR:
-            self._state_machine.finish_cycle()
-            self._emit_log("STATE", "INFO", "CYCLE_DONE", cycle_id=self._state_machine.cycle_id)
         self._inflight_exit = False
-        self._log_cycle_end(result, reason=reason)
+        self._finish_cycle(result, reason=reason)
 
     def _log_partial(
         self,
@@ -1148,8 +1267,7 @@ class DirectionalCycle:
         self._last_reason = reason
         self._emergency_flatten(reason=reason)
         self._state_machine.set_error(reason)
-        self._state_machine.finish_cycle()
-        self._log_cycle_end("ENTER_FAILED", reason=reason)
+        self._finish_cycle("ENTER_FAILED", reason=reason)
 
     def _log_deal(self, order: dict[str, Any], tag: str) -> None:
         if not order:
@@ -1238,7 +1356,11 @@ class DirectionalCycle:
         client_order_id: Optional[str],
         order_kind: Optional[str],
     ) -> Optional[dict[str, Any]]:
-        if order_kind in {"OPEN_LONG", "OPEN_SHORT"} and self._state_machine.state != BotState.ENTERING:
+        if order_kind in {"OPEN_LONG", "OPEN_SHORT"} and self._state_machine.state not in {
+            BotState.DETECT,
+            BotState.ENTERED_LONG,
+            BotState.ENTERED_SHORT,
+        }:
             self._emit_log(
                 "GUARD",
                 "WARN",
@@ -1247,6 +1369,14 @@ class DirectionalCycle:
                 state=self._state_machine.state.value,
                 kind=order_kind,
                 side=side,
+            )
+            return None
+        if order_kind in {"OPEN_LONG", "OPEN_SHORT"} and side in self._entry_actions:
+            self._emit_log(
+                "FSM",
+                "ERROR",
+                f"[FSM] cycle_id={self._state_machine.cycle_id} duplicate_entry "
+                f"side={side} blocked",
             )
             return None
         order = self._execution.place_order(
@@ -1274,13 +1404,15 @@ class DirectionalCycle:
             client_order_id=client_order_id,
         )
         self._abort_if_not_authorized("place_ioc_order")
+        if order_kind in {"OPEN_LONG", "OPEN_SHORT"} and order:
+            self._entry_actions.add(side)
         return order
 
     def _close_no_winner_positions(self, reason: str) -> bool:
         if not self._entry_qty or not self._entry_mid:
             self._set_error("no_winner_missing_entry")
             return False
-        self._state_machine.state = BotState.CONTROLLED_FLATTEN
+        self._set_phase(BotState.FLATTEN, reason=reason, action="FLATTEN_SENT")
         order_mode = self._strategy.order_mode
         buy_side_effect = "AUTO_REPAY"
         sell_side_effect = "NO_SIDE_EFFECT"
@@ -1459,6 +1591,18 @@ class DirectionalCycle:
 
     def _entry_filter_reason(self) -> Optional[str]:
         metrics = self._compute_entry_metrics()
+        commission_bps = float(self._strategy.fee_total_bps)
+        raw_bps = float(metrics["impulse_bps"])
+        raw_bps_min_enter = commission_bps * 1.5
+        if commission_bps == 7:
+            raw_bps_min_enter = max(raw_bps_min_enter, 11.0)
+        expected_net_bps = raw_bps - commission_bps
+        if abs(raw_bps) <= commission_bps:
+            return "noise_zone"
+        if raw_bps < raw_bps_min_enter:
+            return "raw_bps_min"
+        if expected_net_bps <= 0:
+            return "no_edge"
         if metrics["data_stale"]:
             return "data_stale"
         if metrics["spread_bps"] > self._strategy.max_spread_bps:
@@ -1634,7 +1778,7 @@ class DirectionalCycle:
             self._detect_mid_buffer.append(mid)
 
     def _handle_detect_timeout(self) -> None:
-        self._timeout_to_cooldown("detect_timeout")
+        self._force_flatten("detect_timeout", result="TIMEOUT")
 
     def _round_step(self, qty: float) -> float:
         step = self._filters.step_size
@@ -1738,7 +1882,11 @@ class DirectionalCycle:
         client_order_id: Optional[str] = None,
         order_kind: Optional[str] = None,
     ) -> Optional[dict[str, Any]]:
-        if order_kind in {"OPEN_LONG", "OPEN_SHORT"} and self._state_machine.state != BotState.ENTERING:
+        if order_kind in {"OPEN_LONG", "OPEN_SHORT"} and self._state_machine.state not in {
+            BotState.DETECT,
+            BotState.ENTERED_LONG,
+            BotState.ENTERED_SHORT,
+        }:
             self._emit_log(
                 "GUARD",
                 "WARN",
@@ -1747,6 +1895,14 @@ class DirectionalCycle:
                 state=self._state_machine.state.value,
                 kind=order_kind,
                 side=side,
+            )
+            return None
+        if order_kind in {"OPEN_LONG", "OPEN_SHORT"} and side in self._entry_actions:
+            self._emit_log(
+                "FSM",
+                "ERROR",
+                f"[FSM] cycle_id={self._state_machine.cycle_id} duplicate_entry "
+                f"side={side} blocked",
             )
             return None
         time_in_force = "GTC" if order_mode == "aggressive_limit" else None
@@ -1775,6 +1931,8 @@ class DirectionalCycle:
             client_order_id=client_order_id,
         )
         self._abort_if_not_authorized("place_order")
+        if order_kind in {"OPEN_LONG", "OPEN_SHORT"} and order:
+            self._entry_actions.add(side)
         return order
 
     def _wait_for_fill_with_fallback(
@@ -1945,7 +2103,7 @@ class DirectionalCycle:
         self._last_reason = reason
         self._inflight_exit = True
         self._last_action = "FLATTEN"
-        self._set_phase(BotState.CONTROLLED_FLATTEN, reason=reason, action="FLATTEN_SENT")
+        self._set_phase(BotState.FLATTEN, reason=reason, action="FLATTEN_SENT")
         self._emit_log(
             "STATE",
             "INFO",
@@ -2082,6 +2240,7 @@ class DirectionalCycle:
         self._last_reason = reason
         self._inflight_exit = True
         self._last_action = "FLATTEN"
+        self._set_phase(BotState.FLATTEN, reason=reason, action="FLATTEN_SENT")
         if self._abort_if_not_authorized("emergency_start"):
             return
         open_orders = self._execution.get_open_orders()
@@ -2209,9 +2368,12 @@ class DirectionalCycle:
                     return
 
     def _check_timeouts(self) -> None:
-        if self._state_machine.state == BotState.DETECTING:
-            self._evaluate_detecting()
-        if self._state_machine.state == BotState.RIDING and self._ride_start_ts:
+        if self._state_machine.state == BotState.WAIT_WINNER:
+            if self._winner_side:
+                self._evaluate_riding()
+            else:
+                self._evaluate_detecting()
+        if self._state_machine.state == BotState.WAIT_WINNER and self._ride_start_ts:
             elapsed_ms = (time.monotonic() - self._ride_start_ts) * 1000
             if elapsed_ms >= self._strategy.max_ride_ms:
                 self._exit_winner("max_ride_timeout")
