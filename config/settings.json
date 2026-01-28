@@ -25,6 +25,9 @@
   "side_effect_type": "AUTO_BORROW_REPAY",
   "margin_isolated": false,
   "auto_exit_enabled": true,
+  "sell_ttl_ms": 8000,
+  "max_sell_retries": 3,
+  "force_close_on_ttl": true,
   "api": {
     "key": "",
     "secret": ""

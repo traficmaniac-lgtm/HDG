@@ -55,6 +55,8 @@ class TradeExecutor:
         self.pnl_session: float = 0.0
         self.last_exit_reason: Optional[str] = None
         self._last_buy_price: Optional[float] = None
+        self._sell_wait_started_ts: Optional[float] = None
+        self._sell_retry_count = 0
         self.state = TradeState.STATE_IDLE
 
     def get_state_label(self) -> str:
@@ -286,6 +288,7 @@ class TradeExecutor:
         self,
         reason: str = "manual",
         mid_override: Optional[float] = None,
+        reset_retry: bool = True,
     ) -> int:
         if self._has_active_order("SELL"):
             self._logger("[TRADE] close_position | SELL already active")
@@ -374,6 +377,9 @@ class TradeExecutor:
                     f"id={sell_order.get('orderId')}"
                 )
             self._transition_state(TradeState.STATE_WAIT_SELL)
+            if reset_retry:
+                self._reset_sell_retry()
+            self._start_sell_wait()
             now_ms = int(time.time() * 1000)
             self.active_test_orders.append(
                 {
@@ -394,6 +400,139 @@ class TradeExecutor:
         finally:
             self._inflight_trade_action = False
 
+    def _reset_sell_retry(self) -> None:
+        self._sell_wait_started_ts = None
+        self._sell_retry_count = 0
+
+    def _start_sell_wait(self) -> None:
+        self._sell_wait_started_ts = time.monotonic()
+
+    def _maybe_handle_sell_ttl(self, open_orders: dict[int, dict]) -> None:
+        if self.state != TradeState.STATE_WAIT_SELL:
+            return
+        ttl_ms = int(self._settings.sell_ttl_ms)
+        if ttl_ms <= 0:
+            return
+        sell_order = self._find_order("SELL")
+        if not sell_order:
+            return
+        if sell_order.get("status") == "FILLED":
+            return
+        if self._sell_wait_started_ts is None:
+            self._start_sell_wait()
+            return
+        elapsed_ms = (time.monotonic() - self._sell_wait_started_ts) * 1000.0
+        if elapsed_ms < ttl_ms:
+            return
+        self._logger("[SELL_TTL_EXPIRED]")
+        max_retries = int(self._settings.max_sell_retries)
+        if self._sell_retry_count >= max_retries:
+            self._force_close_after_ttl()
+            return
+        order_id = sell_order.get("orderId")
+        if order_id and order_id in open_orders:
+            is_isolated = "TRUE" if self._settings.margin_isolated else "FALSE"
+            cancelled = self._cancel_margin_order(
+                symbol=self._settings.symbol,
+                order_id=order_id,
+                is_isolated=is_isolated,
+                tag=sell_order.get("tag", self.TAG),
+            )
+            if not cancelled:
+                return
+        self.active_test_orders = [
+            entry for entry in self.active_test_orders if entry.get("orderId") != order_id
+        ]
+        self.orders_count = len(self.active_test_orders)
+        self._sell_retry_count += 1
+        retry_index = self._sell_retry_count
+        reason = str(sell_order.get("reason") or "MANUAL").upper()
+        price_state, _ = self._router.build_price_state()
+        mid = price_state.mid
+        if mid is None:
+            self._force_close_after_ttl(reason="NO_PRICE")
+            return
+        exit_order_type = self._normalize_order_type(self._settings.exit_order_type)
+        retry_price = "MARKET" if exit_order_type == "MARKET" else f"{mid:.8f}"
+        self._logger(
+            f"[SELL_RETRY {retry_index}/{max_retries} price={retry_price}]"
+        )
+        self._place_sell_order(
+            reason=reason,
+            mid_override=mid,
+            reset_retry=False,
+        )
+
+    def _force_close_after_ttl(self, reason: str = "TTL_EXCEEDED") -> None:
+        self._logger(f"[SELL_FORCE_CLOSE reason={reason}]")
+        self._sell_wait_started_ts = None
+        self._sell_retry_count = 0
+        is_isolated = "TRUE" if self._settings.margin_isolated else "FALSE"
+        for order in list(self.active_test_orders):
+            if order.get("side") != "SELL":
+                continue
+            self._cancel_margin_order(
+                symbol=self._settings.symbol,
+                order_id=order.get("orderId"),
+                is_isolated=is_isolated,
+                tag=order.get("tag", self.TAG),
+            )
+        self.active_test_orders = [
+            entry for entry in self.active_test_orders if entry.get("side") != "SELL"
+        ]
+        self.orders_count = len(self.active_test_orders)
+        if not self._settings.force_close_on_ttl:
+            self.last_exit_reason = "TTL_EXCEEDED"
+            self._transition_state(TradeState.STATE_CLOSED)
+            self._transition_state(TradeState.STATE_IDLE)
+            return
+        qty = self._resolve_close_qty()
+        if qty <= 0:
+            self.last_exit_reason = "TTL_EXCEEDED"
+            self._transition_state(TradeState.STATE_CLOSED)
+            self._transition_state(TradeState.STATE_IDLE)
+            return
+        timestamp = int(time.time() * 1000)
+        sell_client_id = self._build_client_order_id("SELL", timestamp + 1)
+        side_effect_type = (
+            "AUTO_REPAY"
+            if self._settings.allow_borrow and self._borrow_allowed_by_api is not False
+            else None
+        )
+        sell_order = self._place_margin_order(
+            symbol=self._settings.symbol,
+            side="SELL",
+            quantity=qty,
+            price=None,
+            is_isolated=is_isolated,
+            client_order_id=sell_client_id,
+            side_effect=side_effect_type,
+            order_type="MARKET",
+        )
+        if not sell_order:
+            self.last_exit_reason = "TTL_EXCEEDED"
+            self._transition_state(TradeState.STATE_CLOSED)
+            self._transition_state(TradeState.STATE_IDLE)
+            return
+        now_ms = int(time.time() * 1000)
+        self.active_test_orders.append(
+            {
+                "orderId": sell_order.get("orderId"),
+                "side": "SELL",
+                "price": None,
+                "qty": qty,
+                "created_ts": now_ms,
+                "updated_ts": now_ms,
+                "status": "NEW",
+                "tag": self.TAG,
+                "clientOrderId": sell_order.get("clientOrderId", sell_client_id),
+                "reason": "TTL_EXCEEDED",
+            }
+        )
+        self.orders_count = len(self.active_test_orders)
+        self._transition_state(TradeState.STATE_WAIT_SELL)
+        self._start_sell_wait()
+
     def sync_open_orders(self, open_orders: list[dict]) -> None:
         if not self.active_test_orders:
             self.orders_count = 0
@@ -407,6 +546,7 @@ class TradeExecutor:
                 order["status"] = status
                 order["updated_ts"] = now_ms
         self.orders_count = len(self.active_test_orders)
+        self._maybe_handle_sell_ttl(open_map)
 
     def handle_order_filled(
         self, order_id: int, side: str, price: float, qty: float, ts_ms: int
@@ -447,6 +587,7 @@ class TradeExecutor:
             if self.position is None:
                 self._transition_state(TradeState.STATE_IDLE)
         elif side == "SELL":
+            self._reset_sell_retry()
             if self.position is not None:
                 self._transition_state(TradeState.STATE_POSITION_OPEN)
             else:
@@ -467,6 +608,7 @@ class TradeExecutor:
                 }
             self._transition_state(TradeState.STATE_POSITION_OPEN)
         elif side == "SELL":
+            self._reset_sell_retry()
             reason = str(order.get("reason") or "MANUAL").upper()
             fill_price = order.get("price")
             qty = order.get("qty")
@@ -563,6 +705,7 @@ class TradeExecutor:
 
     def abort_cycle(self) -> int:
         cancelled = self.cancel_test_orders_margin(reason="aborted")
+        self._transition_state(TradeState.STATE_CLOSED)
         self._transition_state(TradeState.STATE_IDLE)
         self.last_action = "aborted"
         return cancelled
@@ -586,6 +729,7 @@ class TradeExecutor:
 
         self.active_test_orders = []
         self._repay_borrowed_assets()
+        self._reset_sell_retry()
         self.last_action = reason
         self.orders_count = 0
         self._logger(f"[TRADE] cancel_test_orders | cancelled={cancelled} tag={self.TAG}")
