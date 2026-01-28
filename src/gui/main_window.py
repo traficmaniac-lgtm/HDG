@@ -760,6 +760,10 @@ class MainWindow(QMainWindow):
             sell_ttl_ms=int(payload.get("sell_ttl_ms", 8000)),
             max_sell_retries=int(payload.get("max_sell_retries", 3)),
             force_close_on_ttl=bool(payload.get("force_close_on_ttl", True)),
+            max_wait_sell_ms=self._bounded_int(
+                payload.get("max_wait_sell_ms", 15000), 1000, 120000, 15000
+            ),
+            allow_force_close=bool(payload.get("allow_force_close", False)),
             cycle_count=self._bounded_int(payload.get("cycle_count", 1), 1, 1000, 1),
             order_quote=order_quote,
             max_budget=max_budget,
