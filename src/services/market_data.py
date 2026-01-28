@@ -21,6 +21,7 @@ class MarketDataService:
         ws_min_connected_ms: int = 1000,
         switch_cooldown_ms: int = 800,
         ws_grace_ms: int = 300,
+        mid_fresh_ms: int = 1500,
     ) -> None:
         self._symbol: Optional[str] = None
         self.ws_fresh_ms = ws_fresh_ms
@@ -30,6 +31,7 @@ class MarketDataService:
         self.ws_min_connected_ms = ws_min_connected_ms
         self.switch_cooldown_ms = switch_cooldown_ms
         self.ws_grace_ms = ws_grace_ms
+        self.mid_fresh_ms = mid_fresh_ms
         self.mode = MarketDataMode.HYBRID
         self._lock = threading.Lock()
         self._logger = logging.getLogger("dhs")
@@ -49,6 +51,7 @@ class MarketDataService:
         self._prev_ws_mid_raw: Optional[Decimal] = None
         self._last_ws_mid_raw: Optional[Decimal] = None
         self._last_status_log_ms = 0.0
+        self._last_mid_update_ms: Optional[float] = None
 
     def set_symbol(self, symbol: str) -> None:
         normalized = symbol.upper().strip()
@@ -72,6 +75,7 @@ class MarketDataService:
             self._prev_ws_mid_raw = None
             self._last_ws_mid_raw = None
             self._last_status_log_ms = 0.0
+            self._last_mid_update_ms = None
 
     def get_symbol(self) -> Optional[str]:
         with self._lock:
@@ -105,6 +109,9 @@ class MarketDataService:
                 self._last_http_tick = dict(payload)
                 self._snapshot.last_http_tick_ms = float(rx_time_ms)
             self._update_snapshot_prices(payload)
+            if self._payload_has_mid_update(payload):
+                self._last_mid_update_ms = now_ms
+                self._snapshot.last_mid_update_ms = now_ms
             self._update_effective_tick(now_ms, ws_tick_received=ws_tick_received)
 
     def set_mode(self, mode: MarketDataMode) -> None:
@@ -257,6 +264,12 @@ class MarketDataService:
             self._last_effective_tick = None
         self._snapshot.ws_age_ms = self._ws_age_ms(now_ms)
         self._snapshot.http_age_ms = self._http_age_ms(now_ms)
+        mid_age_ms = (
+            max(0.0, now_ms - self._last_mid_update_ms)
+            if self._last_mid_update_ms is not None
+            else 9999.0
+        )
+        self._snapshot.mid_age_ms = mid_age_ms
         self._snapshot.effective_source = self._last_effective_source
         if self._snapshot.effective_source == "WS":
             self._snapshot.effective_age_ms = self._snapshot.ws_age_ms
@@ -264,8 +277,23 @@ class MarketDataService:
             self._snapshot.effective_age_ms = self._snapshot.http_age_ms
         else:
             self._snapshot.effective_age_ms = 9999.0
-        self._snapshot.data_stale = self._snapshot.effective_source == "NONE"
+        self._snapshot.data_stale = mid_age_ms > self.mid_fresh_ms
         self._maybe_log_status(now_ms)
+
+    @staticmethod
+    def _payload_has_mid_update(payload: dict[str, Any]) -> bool:
+        for key in ("mid", "bid", "ask", "mid_raw", "bid_raw", "ask_raw"):
+            if key not in payload:
+                continue
+            value = payload.get(key)
+            if value is None:
+                continue
+            try:
+                if Decimal(str(value)) > 0:
+                    return True
+            except (ValueError, ArithmeticError):
+                continue
+        return False
 
     def _is_ws_recovered(self, now_ms: float) -> bool:
         if not self._ws_connected:

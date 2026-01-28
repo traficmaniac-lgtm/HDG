@@ -755,7 +755,9 @@ class DirectionalCycle:
             delta_window_ticks = self._round_ticks(mid_last - mid_first)
         now = time.monotonic()
         if now - self._last_detect_sample_log_ts > 0.3:
+            snapshot = self._market_data.get_snapshot()
             mid_disp = self._format_decimal(mid_now)
+            bps_per_tick = float(self._filters.bps_per_tick)
             self._emit_log(
                 "INFO",
                 "INFO",
@@ -765,6 +767,11 @@ class DirectionalCycle:
                 long_raw=f"{long_raw:.4f}",
                 short_raw=f"{short_raw:.4f}",
                 delta_window_ticks=delta_window_ticks,
+                mid=f"{float(mid_now):.6f}",
+                mid_age_ms=int(snapshot.mid_age_ms),
+                bps_per_tick=bps_per_tick,
+                data_stale=bool(snapshot.data_stale),
+                effective_source=snapshot.effective_source,
             )
             self._last_detect_sample_log_ts = now
         if len(self._detect_mid_buffer) < self._detect_window_ticks:
