@@ -8,13 +8,16 @@ from typing import Optional
 class Settings:
     symbol: str
     ws_fresh_ms: int
+    ws_stale_ms: int
     http_fresh_ms: int
-    http_interval_ms: int
+    http_poll_ms: int
     ui_refresh_ms: int
     ws_log_throttle_ms: int
     ws_reconnect_dedup_ms: int
     order_poll_ms: int
-    source_switch_hysteresis_ms: int
+    ws_switch_hysteresis_ms: int
+    good_quote_ttl_ms: int
+    position_guard_http: bool
     account_mode: str
     leverage_hint: int
     nominal_usd: float
@@ -45,6 +48,10 @@ class PriceState:
     mid: Optional[float] = None
     source: str = "NONE"
     mid_age_ms: Optional[int] = None
+    data_blind: bool = False
+    from_cache: bool = False
+    cache_age_ms: Optional[int] = None
+    ttl_expired: bool = False
 
 
 @dataclass
