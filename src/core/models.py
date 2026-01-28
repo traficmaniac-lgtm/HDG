@@ -86,6 +86,8 @@ class StrategyParams:
     wait_exit_timeout_ms: int = 4000
     max_ride_ms: int = 30000
     data_stale_exit_ms: int = 1500
+    max_wait_ms: int = 4000
+    raw_bps_min_exit: float = 2.0
 
 
 @dataclass

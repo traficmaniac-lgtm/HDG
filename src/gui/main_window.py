@@ -903,7 +903,11 @@ class MainWindow(QMainWindow):
         winner_side = view_model.winner or "—"
         loser_side = view_model.loser or "—"
         self.sim_condition = f"{winner_side} / {loser_side}"
-        if self.state_machine.state == BotState.ENTERING:
+        if self.state_machine.state in {
+            BotState.DETECT,
+            BotState.ENTERED_LONG,
+            BotState.ENTERED_SHORT,
+        }:
             self.sim_total_raw_bps = None
             self.sim_total_net_bps = None
             self.sim_winner_raw_bps = None
@@ -1204,12 +1208,12 @@ class MainWindow(QMainWindow):
             self.run_mode
             or self.state_machine.state
             in {
-                BotState.ENTERING,
-                BotState.DETECTING,
-                BotState.CUTTING,
-                BotState.RIDING,
-                BotState.EXITING,
-                BotState.CONTROLLED_FLATTEN,
+                BotState.DETECT,
+                BotState.ENTERED_LONG,
+                BotState.ENTERED_SHORT,
+                BotState.WAIT_WINNER,
+                BotState.EXIT,
+                BotState.FLATTEN,
                 BotState.COOLDOWN,
             }
         )

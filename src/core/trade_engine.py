@@ -267,7 +267,7 @@ class TradeEngine(QObject):
             return
         if self._state_machine.active_cycle and self._state_machine.state not in {
             BotState.IDLE,
-            BotState.ARMED,
+            BotState.DETECT,
         }:
             self._emit_log(
                 "GUARD",
@@ -286,7 +286,7 @@ class TradeEngine(QObject):
             return
         if self._state_machine.active_cycle and self._state_machine.state not in {
             BotState.IDLE,
-            BotState.ARMED,
+            BotState.DETECT,
         }:
             self._emit_log(
                 "GUARD",
@@ -330,7 +330,7 @@ class TradeEngine(QObject):
         now = time.monotonic()
         state_changed = state != self._last_cycle_emit_state
         if not force:
-            if state in {BotState.DETECTING, BotState.RIDING} and not state_changed:
+            if state in {BotState.WAIT_WINNER} and not state_changed:
                 if now - self._last_cycle_emit_ts < 0.25:
                     return
             elif not state_changed and now - self._last_cycle_emit_ts < 0.1:
