@@ -1,0 +1,7 @@
+{
+  "symbol": "EURIUSDT",
+  "ws_fresh_ms": 700,
+  "http_fresh_ms": 1500,
+  "http_interval_ms": 1000,
+  "ui_refresh_ms": 100
+}
