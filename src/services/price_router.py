@@ -254,3 +254,20 @@ class PriceRouter:
             last_switch_reason=self._last_switch_reason,
         )
         return price_state, health_state
+
+    def get_mid_snapshot(
+        self, required_fresh_ms: int
+    ) -> tuple[bool, Optional[float], Optional[int], str, str]:
+        price_state, _ = self.build_price_state()
+        mid = price_state.mid
+        age_ms = price_state.mid_age_ms
+        source = price_state.source
+        if price_state.data_blind:
+            return False, mid, age_ms, source, "data_blind"
+        if mid is None:
+            return False, None, age_ms, source, "no_mid"
+        if age_ms is None:
+            return False, mid, None, source, "no_age"
+        if age_ms > required_fresh_ms:
+            return False, mid, age_ms, source, "stale"
+        return True, mid, age_ms, source, "fresh"

@@ -17,6 +17,9 @@ class Settings:
     order_poll_ms: int
     ws_switch_hysteresis_ms: int
     good_quote_ttl_ms: int
+    mid_fresh_ms: int
+    max_wait_price_ms: int
+    price_wait_log_every_ms: int
     position_guard_http: bool
     account_mode: str
     leverage_hint: int

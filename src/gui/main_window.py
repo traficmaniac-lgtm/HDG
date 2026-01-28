@@ -570,9 +570,7 @@ class MainWindow(QMainWindow):
         if price_state is not None:
             self._last_mid = price_state.mid
             if self._trade_executor:
-                self._trade_executor.evaluate_exit_conditions(
-                    price_state.mid, price_state.data_blind
-                )
+                self._trade_executor.evaluate_exit_conditions()
         can_trade = (
             self._connected
             and self._trade_executor is not None
@@ -716,6 +714,13 @@ class MainWindow(QMainWindow):
                 )
             ),
             good_quote_ttl_ms=int(payload.get("good_quote_ttl_ms", 3000)),
+            mid_fresh_ms=self._bounded_int(payload.get("mid_fresh_ms", 800), 200, 5000, 800),
+            max_wait_price_ms=self._bounded_int(
+                payload.get("max_wait_price_ms", 5000), 1000, 30000, 5000
+            ),
+            price_wait_log_every_ms=self._bounded_int(
+                payload.get("price_wait_log_every_ms", 1000), 250, 10000, 1000
+            ),
             position_guard_http=bool(payload.get("position_guard_http", True)),
             account_mode=str(payload.get("account_mode", "CROSS_MARGIN")),
             leverage_hint=int(
@@ -850,6 +855,8 @@ class MainWindow(QMainWindow):
         auto_exit_enabled: bool,
         max_budget: float,
         budget_reserve: float,
+        mid_fresh_ms: int,
+        max_wait_price_ms: int,
     ) -> None:
         if self._settings:
             self._settings.order_quote = order_quote
@@ -867,6 +874,12 @@ class MainWindow(QMainWindow):
             self._settings.auto_exit_enabled = auto_exit_enabled
             self._settings.max_budget = max_budget
             self._settings.budget_reserve = budget_reserve
+            self._settings.mid_fresh_ms = self._bounded_int(
+                mid_fresh_ms, 200, 5000, 800
+            )
+            self._settings.max_wait_price_ms = self._bounded_int(
+                max_wait_price_ms, 1000, 30000, 5000
+            )
         self._append_log("[SETTINGS] saved")
 
     def _on_api_saved(self, key: str, secret: str) -> None:
