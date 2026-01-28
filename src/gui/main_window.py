@@ -405,9 +405,15 @@ class MainWindow(QMainWindow):
         self.bid_label.setText(f"Bid: {self._fmt_price(price_state.bid)}")
         self.ask_label.setText(f"Ask: {self._fmt_price(price_state.ask)}")
         summary_age = self._fmt_int(price_state.mid_age_ms)
+        last_action = "—"
+        orders_count = "—"
+        if self._trade_executor:
+            last_action = self._trade_executor.last_action
+            orders_count = str(self._trade_executor.orders_count)
         self.summary_label.setText(
             f"{self._settings.symbol if self._settings else 'EURIUSDT'} | "
-            f"SRC: {price_state.source} | AGE: {summary_age} ms"
+            f"SRC: {price_state.source} | AGE: {summary_age} ms | "
+            f"last_action: {last_action} | orders: {orders_count}"
         )
 
         self.ws_connected_label.setText(f"ws_connected: {health_state.ws_connected}")
@@ -598,11 +604,15 @@ class MainWindow(QMainWindow):
         lot = filters.get("LOT_SIZE", {})
         price = filters.get("PRICE_FILTER", {})
         notional = filters.get("MIN_NOTIONAL", {})
+        min_notional = self._safe_float(notional.get("minNotional"))
+        if min_notional is None:
+            notional = filters.get("NOTIONAL", {})
+            min_notional = self._safe_float(notional.get("minNotional"))
         return SymbolProfile(
             tick_size=self._safe_float(price.get("tickSize")),
             step_size=self._safe_float(lot.get("stepSize")),
             min_qty=self._safe_float(lot.get("minQty")),
-            min_notional=self._safe_float(notional.get("minNotional")),
+            min_notional=min_notional,
         )
 
     def _render_symbol_profile(self, profile: SymbolProfile) -> None:

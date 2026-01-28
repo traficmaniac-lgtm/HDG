@@ -13,7 +13,7 @@ from src.services.price_router import PriceRouter
 
 
 class TradeExecutor:
-    TAG = "TEST_V0_5_2"
+    TAG = "TEST_V0_5_6"
 
     def __init__(
         self,
@@ -30,6 +30,9 @@ class TradeExecutor:
         self._logger = logger
         self.active_test_orders: list[dict] = []
         self._client_tag = self._sanitize_client_order_id(self.TAG)
+        self.borrowed_assets: dict[str, float] = {}
+        self.last_action = "idle"
+        self.orders_count = 0
 
     def place_test_orders_margin(self) -> int:
         price_state, _ = self._router.build_price_state()
@@ -79,6 +82,48 @@ class TradeExecutor:
             )
             return 0
 
+        base_asset, quote_asset = self._split_symbol(self._settings.symbol)
+        base_state = self._get_margin_asset(base_asset)
+        quote_state = self._get_margin_asset(quote_asset)
+        if base_state is None or quote_state is None:
+            self._logger(
+                f"[PRECHECK] margin asset info unavailable symbol={self._settings.symbol}"
+            )
+            self.last_action = "precheck_failed"
+            self.orders_count = 0
+            return 0
+
+        buy_cost = qty * buy_price
+        if quote_state["free"] < buy_cost:
+            self._logger(
+                f"[PRECHECK] insufficient {quote_asset} for BUY"
+            )
+            self.last_action = "precheck_failed"
+            self.orders_count = 0
+            return 0
+
+        borrowed_amount = 0.0
+        if base_state["free"] < qty:
+            need = qty - base_state["free"]
+            borrowed_amount = self._round_up(need, self._profile.step_size)
+            if borrowed_amount <= 0:
+                self._logger(
+                    f"[PRECHECK] insufficient {base_asset} for SELL"
+                )
+                self.last_action = "precheck_failed"
+                self.orders_count = 0
+                return 0
+            if not self._borrow_margin_asset(base_asset, borrowed_amount):
+                self.last_action = "borrow_failed"
+                self.orders_count = 0
+                return 0
+            self.borrowed_assets[base_asset] = (
+                self.borrowed_assets.get(base_asset, 0.0) + borrowed_amount
+            )
+            self._logger(
+                f"[BORROW] asset={base_asset} amount={borrowed_amount:.8f} ok"
+            )
+
         self._logger(
             "[TRADE] place_test_orders | "
             f"mode={self._settings.account_mode} "
@@ -88,8 +133,6 @@ class TradeExecutor:
         )
 
         is_isolated = "TRUE" if self._settings.margin_isolated else "FALSE"
-        buy_side_effect = "MARGIN_BUY"
-        sell_side_effect = "AUTO_BORROW_REPAY"
         timestamp = int(time.time() * 1000)
         buy_client_id = self._build_client_order_id("BUY", timestamp)
         sell_client_id = self._build_client_order_id("SELL", timestamp + 1)
@@ -101,10 +144,21 @@ class TradeExecutor:
             price=buy_price,
             is_isolated=is_isolated,
             client_order_id=buy_client_id,
-            side_effect=buy_side_effect,
+            side_effect=None,
         )
         if not buy_order:
+            self._rollback_after_failure(
+                base_asset=base_asset,
+                borrowed_amount=borrowed_amount,
+                reason="buy_failed",
+            )
+            self.last_action = "place_failed"
+            self.orders_count = 0
             return 0
+        self._logger(
+            f"[ORDER] placed side=BUY qty={qty:.8f} price={buy_price:.8f} "
+            f"id={buy_order.get('orderId')}"
+        )
 
         sell_order = self._place_margin_order(
             symbol=self._settings.symbol,
@@ -113,7 +167,7 @@ class TradeExecutor:
             price=sell_price,
             is_isolated=is_isolated,
             client_order_id=sell_client_id,
-            side_effect=sell_side_effect,
+            side_effect=None,
         )
         if not sell_order:
             self._cancel_margin_order(
@@ -122,7 +176,18 @@ class TradeExecutor:
                 is_isolated=is_isolated,
                 tag=self.TAG,
             )
-            return 1
+            self._rollback_after_failure(
+                base_asset=base_asset,
+                borrowed_amount=borrowed_amount,
+                reason="sell_failed",
+            )
+            self.last_action = "place_failed"
+            self.orders_count = 0
+            return 0
+        self._logger(
+            f"[ORDER] placed side=SELL qty={qty:.8f} price={sell_price:.8f} "
+            f"id={sell_order.get('orderId')}"
+        )
 
         now = time.time()
         self.active_test_orders = [
@@ -143,6 +208,8 @@ class TradeExecutor:
                 "tag": self.TAG,
             },
         ]
+        self.last_action = "placed_test_orders"
+        self.orders_count = 2
         return 2
 
     def cancel_test_orders_margin(self) -> int:
@@ -163,6 +230,9 @@ class TradeExecutor:
         cancelled += self._cancel_tagged_open_orders(is_isolated=is_isolated)
 
         self.active_test_orders = []
+        self._repay_borrowed_assets()
+        self.last_action = "cancelled"
+        self.orders_count = 0
         self._logger(f"[TRADE] cancel_test_orders | cancelled={cancelled} tag={self.TAG}")
         return cancelled
 
@@ -201,7 +271,7 @@ class TradeExecutor:
         price: float,
         is_isolated: str,
         client_order_id: Optional[str],
-        side_effect: str,
+        side_effect: Optional[str],
     ) -> Optional[dict]:
         params = {
             "symbol": symbol,
@@ -211,8 +281,9 @@ class TradeExecutor:
             "quantity": f"{quantity:.8f}",
             "price": f"{price:.8f}",
             "isIsolated": is_isolated,
-            "sideEffectType": side_effect,
         }
+        if side_effect:
+            params["sideEffectType"] = side_effect
         if client_order_id:
             params["newClientOrderId"] = client_order_id
         try:
@@ -263,8 +334,7 @@ class TradeExecutor:
             )
             return
         self._logger(
-            "[TRADE] binance_error | "
-            f"action={action} status={status} code={code} msg={msg} params={params} tag={self.TAG}"
+            f"[BINANCE_ERROR] code={code} msg={msg} action={action} status={status}"
         )
 
     def _build_client_order_id(self, side: str, timestamp: int) -> str:
@@ -285,3 +355,97 @@ class TradeExecutor:
     @staticmethod
     def _round_to_step(value: float, step: float) -> float:
         return round(value / step) * step
+
+    @staticmethod
+    def _round_up(value: float, step: float) -> float:
+        return math.ceil(value / step) * step
+
+    @staticmethod
+    def _split_symbol(symbol: str) -> tuple[str, str]:
+        if symbol.endswith("USDT"):
+            return symbol[:-4], "USDT"
+        if symbol.endswith("BUSD"):
+            return symbol[:-4], "BUSD"
+        if symbol.endswith("USDC"):
+            return symbol[:-4], "USDC"
+        return symbol[:-3], symbol[-3:]
+
+    def _get_margin_asset(self, asset: str) -> Optional[dict]:
+        try:
+            account = self._rest.get_margin_account()
+        except httpx.HTTPStatusError as exc:
+            self._log_binance_error("margin_account", exc, {"asset": asset})
+            return None
+        except Exception as exc:
+            self._logger(f"[TRADE] margin_account error: {exc} tag={self.TAG}")
+            return None
+        assets = account.get("userAssets", [])
+        for entry in assets:
+            if entry.get("asset") == asset:
+                return {
+                    "free": self._safe_float(entry.get("free")),
+                    "borrowed": self._safe_float(entry.get("borrowed")),
+                    "interest": self._safe_float(entry.get("interest")),
+                    "netAsset": self._safe_float(entry.get("netAsset")),
+                }
+        return None
+
+    def _borrow_margin_asset(self, asset: str, amount: float) -> bool:
+        params = {"asset": asset, "amount": f"{amount:.8f}"}
+        try:
+            self._rest.borrow_margin_asset(params)
+            return True
+        except httpx.HTTPStatusError as exc:
+            self._log_binance_error("borrow", exc, {"asset": asset})
+        except Exception as exc:
+            self._logger(f"[TRADE] borrow error: {exc} tag={self.TAG}")
+        return False
+
+    def _repay_margin_asset(self, asset: str, amount: float) -> bool:
+        params = {"asset": asset, "amount": f"{amount:.8f}"}
+        try:
+            self._rest.repay_margin_asset(params)
+            return True
+        except httpx.HTTPStatusError as exc:
+            self._log_binance_error("repay", exc, {"asset": asset})
+        except Exception as exc:
+            self._logger(f"[TRADE] repay error: {exc} tag={self.TAG}")
+        return False
+
+    def _rollback_after_failure(
+        self,
+        base_asset: str,
+        borrowed_amount: float,
+        reason: str,
+    ) -> None:
+        if borrowed_amount > 0:
+            self._repay_after_borrow(base_asset, borrowed_amount)
+        self._logger(f"[ROLLBACK] reason={reason}")
+
+    def _repay_after_borrow(self, asset: str, borrowed_amount: float) -> None:
+        asset_state = self._get_margin_asset(asset)
+        free_amount = asset_state["free"] if asset_state else 0.0
+        repay_amount = min(borrowed_amount, free_amount)
+        if repay_amount <= 0:
+            self._logger(f"[REPAY] asset={asset} amount=0.00000000")
+            return
+        success = self._repay_margin_asset(asset, repay_amount)
+        if success:
+            self.borrowed_assets[asset] = max(
+                0.0, self.borrowed_assets.get(asset, 0.0) - repay_amount
+            )
+        status = "ok" if success else "failed"
+        self._logger(f"[REPAY] asset={asset} amount={repay_amount:.8f} {status}")
+
+    def _repay_borrowed_assets(self) -> None:
+        for asset, amount in list(self.borrowed_assets.items()):
+            if amount <= 0:
+                continue
+            self._repay_after_borrow(asset, amount)
+
+    @staticmethod
+    def _safe_float(value: Optional[str]) -> float:
+        try:
+            return float(value or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
