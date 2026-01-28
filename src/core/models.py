@@ -31,6 +31,9 @@ class Settings:
     side_effect_type: str
     margin_isolated: bool
     auto_exit_enabled: bool
+    sell_ttl_ms: int
+    max_sell_retries: int
+    force_close_on_ttl: bool
 
 
 @dataclass

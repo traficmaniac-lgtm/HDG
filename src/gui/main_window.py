@@ -707,6 +707,9 @@ class MainWindow(QMainWindow):
             auto_exit_enabled=bool(
                 payload.get("auto_exit_enabled", payload.get("auto_close", True))
             ),
+            sell_ttl_ms=int(payload.get("sell_ttl_ms", 8000)),
+            max_sell_retries=int(payload.get("max_sell_retries", 3)),
+            force_close_on_ttl=bool(payload.get("force_close_on_ttl", True)),
         )
 
     def _log_data_blind_state(self, price_state: PriceState, state_label: str) -> None:
