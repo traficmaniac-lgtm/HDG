@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QPlainTextEdit,
     QPushButton,
+    QFileDialog,
     QVBoxLayout,
     QWidget,
 )
@@ -24,6 +25,7 @@ from src.core.version import VERSION
 from src.services.binance_rest import BinanceRestClient
 from src.services.http_price import HttpPriceService
 from src.services.price_router import PriceRouter
+from src.services.trade_executor import TradeExecutor
 from src.services.ws_price import WsPriceWorker
 
 
@@ -39,6 +41,10 @@ class MainWindow(QMainWindow):
         self._router: Optional[PriceRouter] = None
         self._rest: Optional[BinanceRestClient] = None
         self._http_service: Optional[HttpPriceService] = None
+        self._trade_executor: Optional[TradeExecutor] = None
+        self._symbol_profile = SymbolProfile()
+        self._last_trade_action = "—"
+        self._orders_count = 0
 
         self._ui_timer = QTimer(self)
         self._ui_timer.timeout.connect(self._refresh_ui)
@@ -112,10 +118,33 @@ class MainWindow(QMainWindow):
         health_layout.addWidget(self.switch_reason_label)
         blocks.addWidget(self.health_box)
 
+        self.trade_box = QGroupBox("Trading (TEST)")
+        trade_layout = QVBoxLayout(self.trade_box)
+        self.start_button = QPushButton("START TRADING (TEST)")
+        self.start_button.clicked.connect(self._start_trading)
+        self.stop_button = QPushButton("STOP")
+        self.stop_button.clicked.connect(self._stop_trading)
+        self.start_button.setEnabled(False)
+        self.stop_button.setEnabled(False)
+        self.orders_label = QLabel("orders: 0")
+        self.last_action_label = QLabel("last_action: —")
+        trade_layout.addWidget(self.start_button)
+        trade_layout.addWidget(self.stop_button)
+        trade_layout.addWidget(self.orders_label)
+        trade_layout.addWidget(self.last_action_label)
+        blocks.addWidget(self.trade_box)
+
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
         self.log.setMaximumBlockCount(500)
         root.addWidget(self.log, stretch=1)
+
+        log_actions = QHBoxLayout()
+        self.save_log_button = QPushButton("Save Log")
+        self.save_log_button.clicked.connect(self._save_log)
+        log_actions.addStretch(1)
+        log_actions.addWidget(self.save_log_button)
+        root.addLayout(log_actions)
 
         self.setCentralWidget(central)
 
@@ -149,10 +178,21 @@ class MainWindow(QMainWindow):
             server_time = self._rest.get_server_time()
             self._append_log(f"Server time synced: {server_time.get('serverTime')}")
             exchange_info = self._rest.get_exchange_info(self._settings.symbol)
-            profile = self._parse_symbol_profile(exchange_info)
-            self._render_symbol_profile(profile)
+            self._symbol_profile = self._parse_symbol_profile(exchange_info)
+            self._render_symbol_profile(self._symbol_profile)
         except Exception as exc:
             self._append_log(f"REST init error: {exc}")
+
+        if self._rest and self._router and self._settings:
+            self._trade_executor = TradeExecutor(
+                rest=self._rest,
+                router=self._router,
+                settings=self._settings,
+                profile=self._symbol_profile,
+                logger=self._append_log,
+            )
+            self.start_button.setEnabled(True)
+            self.stop_button.setEnabled(True)
 
         self._start_ws()
         self._http_timer.start(self._settings.http_interval_ms)
@@ -179,6 +219,13 @@ class MainWindow(QMainWindow):
             self._rest.close()
         if self._http_service:
             self._http_service.close()
+
+        self._trade_executor = None
+        self.start_button.setEnabled(False)
+        self.stop_button.setEnabled(False)
+        self._orders_count = 0
+        self._last_trade_action = "—"
+        self._update_trade_labels()
 
         self._connected = False
         self._ws_connected = False
@@ -248,6 +295,10 @@ class MainWindow(QMainWindow):
             f"last_switch_reason: {health_state.last_switch_reason or '—'}"
         )
 
+    def _update_trade_labels(self) -> None:
+        self.orders_label.setText(f"orders: {self._orders_count}")
+        self.last_action_label.setText(f"last_action: {self._last_trade_action}")
+
     def _update_status(self, connected: bool) -> None:
         if connected:
             self.status_label.setText("CONNECTED")
@@ -258,6 +309,39 @@ class MainWindow(QMainWindow):
             self.status_label.setStyleSheet("color: #ff5f57; font-weight: 600;")
             self.connect_button.setText("CONNECT")
 
+    @Slot()
+    def _start_trading(self) -> None:
+        if not self._trade_executor:
+            return
+        placed = self._trade_executor.place_test_orders_margin()
+        if placed:
+            self._orders_count = placed
+            self._last_trade_action = "placed"
+            self._update_trade_labels()
+
+    @Slot()
+    def _stop_trading(self) -> None:
+        if not self._trade_executor:
+            return
+        self._trade_executor.cancel_test_orders_margin()
+        self._orders_count = 0
+        self._last_trade_action = "cancelled"
+        self._update_trade_labels()
+
+    @Slot()
+    def _save_log(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Log", "trade_log.txt", "Text Files (*.txt)"
+        )
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(self.log.toPlainText())
+            self._append_log(f"Log saved: {path}")
+        except Exception as exc:
+            self._append_log(f"Failed to save log: {exc}")
+
     def _append_log(self, message: str) -> None:
         self.log.appendPlainText(message)
 
@@ -266,11 +350,16 @@ class MainWindow(QMainWindow):
         with settings_path.open("r", encoding="utf-8") as handle:
             payload = json.load(handle)
         return Settings(
-            symbol="EURIUSDT",
+            symbol=payload.get("symbol", "EURIUSDT"),
             ws_fresh_ms=int(payload.get("ws_fresh_ms", 700)),
             http_fresh_ms=int(payload.get("http_fresh_ms", 1500)),
             http_interval_ms=int(payload.get("http_interval_ms", 1000)),
             ui_refresh_ms=int(payload.get("ui_refresh_ms", 100)),
+            account_mode=str(payload.get("account_mode", "CROSS_MARGIN")),
+            max_leverage_hint=int(payload.get("max_leverage_hint", 3)),
+            test_notional_usd=float(payload.get("test_notional_usd", 10.0)),
+            test_tick_offset=int(payload.get("test_tick_offset", 1)),
+            margin_isolated=bool(payload.get("margin_isolated", False)),
         )
 
     def _load_env(self) -> dict:
