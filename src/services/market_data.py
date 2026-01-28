@@ -279,33 +279,19 @@ class MarketDataService:
     def _evaluate_source(self, now_ms: float) -> tuple[str, str]:
         ws_fresh = self._is_ws_fresh(now_ms)
         http_fresh = self._is_http_fresh(now_ms)
-        ws_age_ms = self._ws_age_ms(now_ms)
         if self.mode == MarketDataMode.WS_ONLY:
             return ("WS", "ws_only") if ws_fresh else ("NONE", "ws_only_stale")
         if self.mode == MarketDataMode.HTTP_ONLY:
             return ("HTTP", "http_only") if http_fresh else ("NONE", "http_only_stale")
-        if self._last_effective_source == "WS":
-            if ws_fresh:
-                return "WS", "ws_fresh"
-            if http_fresh and ws_age_ms > self.ws_fresh_ms + self.ws_grace_ms:
-                return "HTTP", "ws_stale"
-            if http_fresh:
-                return "HTTP", "ws_stale"
-            return "NONE", "ws_stale"
-        if self._last_effective_source == "HTTP":
-            if http_fresh and now_ms < self._http_hold_until_ms:
-                return "HTTP", "hold"
-            if ws_fresh and self._is_ws_recovered(now_ms):
-                if now_ms - self._last_source_change_ms >= self.switch_cooldown_ms:
-                    return "WS", "recovered"
-            if http_fresh:
-                return "HTTP", "http_fresh"
-            return "NONE", "http_stale"
+        if ws_fresh:
+            if self._last_effective_source == "HTTP":
+                if self._is_ws_recovered(now_ms):
+                    return "WS", "ws_fresh"
+                if http_fresh:
+                    return "HTTP", "http_fresh"
+            return "WS", "ws_fresh"
         if http_fresh:
             return "HTTP", "http_fresh"
-        if ws_fresh and self._is_ws_recovered(now_ms):
-            if now_ms - self._last_source_change_ms >= self.switch_cooldown_ms:
-                return "WS", "recovered"
         return "NONE", "no_fresh"
 
     def _log_switch(
@@ -315,36 +301,32 @@ class MarketDataService:
             return
         ws_age_ms = int(self._ws_age_ms(now_ms))
         http_age_ms = int(self._http_age_ms(now_ms))
+        if to_source == "WS":
+            self._logger.info(
+                "[DATA] switch from=%s to=%s reason=%s ws_age_ms=%s",
+                from_source,
+                to_source,
+                reason,
+                ws_age_ms,
+            )
+            return
         if to_source == "HTTP":
-            hold_ms = int(self.http_hold_ms)
             self._logger.info(
-                "[DATA] switch from=%s to=%s reason=%s http_age_ms=%s ws_age_ms=%s hold_ms=%s",
+                "[DATA] switch from=%s to=%s reason=%s http_age_ms=%s",
                 from_source,
                 to_source,
                 reason,
                 http_age_ms,
-                ws_age_ms,
-                hold_ms,
             )
-        elif to_source == "WS":
-            self._logger.info(
-                "[DATA] switch from=%s to=%s reason=%s ws_good_streak=%s ws_age_ms=%s http_age_ms=%s",
-                from_source,
-                to_source,
-                reason,
-                self._ws_good_streak,
-                ws_age_ms,
-                http_age_ms,
-            )
-        else:
-            self._logger.info(
-                "[DATA] switch from=%s to=%s reason=%s ws_age_ms=%s http_age_ms=%s",
-                from_source,
-                to_source,
-                reason,
-                ws_age_ms,
-                http_age_ms,
-            )
+            return
+        self._logger.info(
+            "[DATA] switch from=%s to=%s reason=%s ws_age_ms=%s http_age_ms=%s",
+            from_source,
+            to_source,
+            reason,
+            ws_age_ms,
+            http_age_ms,
+        )
 
     def _maybe_log_status(self, now_ms: float) -> None:
         if now_ms - self._last_status_log_ms < 5000:
