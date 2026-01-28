@@ -1,0 +1,88 @@
+from __future__ import annotations
+
+from PySide6.QtCore import Signal
+from PySide6.QtWidgets import (
+    QComboBox,
+    QDialog,
+    QDoubleSpinBox,
+    QFormLayout,
+    QHBoxLayout,
+    QLabel,
+    QPushButton,
+    QSpinBox,
+    QVBoxLayout,
+)
+
+from src.core.config_store import ConfigStore
+from src.core.models import Settings
+
+
+class TradeSettingsDialog(QDialog):
+    saved = Signal(float, int)
+
+    def __init__(
+        self, parent=None, store: ConfigStore | None = None, settings: Settings | None = None
+    ) -> None:
+        super().__init__(parent)
+        self._store = store or ConfigStore()
+        self._settings = settings
+        self.setWindowTitle("Параметры торговли")
+        self.setMinimumWidth(360)
+
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+
+        self.notional_input = QDoubleSpinBox()
+        self.notional_input.setRange(0.0, 1000000.0)
+        self.notional_input.setDecimals(2)
+        self.notional_input.setSingleStep(1.0)
+        self.notional_input.setValue(
+            float(getattr(settings, "test_notional_usd", 10.0) or 0.0)
+            if settings
+            else 10.0
+        )
+        form.addRow("Номинал (USD)", self.notional_input)
+
+        self.tick_offset_input = QSpinBox()
+        self.tick_offset_input.setRange(0, 1000)
+        self.tick_offset_input.setValue(
+            int(getattr(settings, "test_tick_offset", 1) or 0) if settings else 1
+        )
+        form.addRow("Смещение в тиках", self.tick_offset_input)
+
+        mode_layout = QHBoxLayout()
+        mode_label = QLabel("CROSS MARGIN")
+        mode_hint = QLabel(f"x{getattr(settings, 'max_leverage_hint', 3)} (hint)")
+        mode_layout.addWidget(mode_label)
+        mode_layout.addSpacing(6)
+        mode_layout.addWidget(mode_hint)
+        mode_layout.addStretch(1)
+        form.addRow("Режим", mode_layout)
+
+        self.hedge_profile = QComboBox()
+        self.hedge_profile.addItem("Default")
+        self.hedge_profile.setEnabled(False)
+        form.addRow("Хедж-профиль", self.hedge_profile)
+
+        layout.addLayout(form)
+
+        buttons_layout = QHBoxLayout()
+        buttons_layout.addStretch(1)
+        save_button = QPushButton("Сохранить")
+        cancel_button = QPushButton("Отмена")
+        save_button.clicked.connect(self._on_save)
+        cancel_button.clicked.connect(self.reject)
+        buttons_layout.addWidget(save_button)
+        buttons_layout.addWidget(cancel_button)
+        layout.addLayout(buttons_layout)
+
+    def _on_save(self) -> None:
+        payload = self._store.load_settings()
+        payload["test_notional_usd"] = float(self.notional_input.value())
+        payload["test_tick_offset"] = int(self.tick_offset_input.value())
+        self._store.save_settings(payload)
+        self.saved.emit(
+            float(self.notional_input.value()),
+            int(self.tick_offset_input.value()),
+        )
+        self.accept()
