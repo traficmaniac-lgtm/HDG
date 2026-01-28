@@ -38,6 +38,10 @@ class Settings:
     max_sell_retries: int
     force_close_on_ttl: bool
     cycle_count: int
+    budget_mode_enabled: bool
+    budget_quote: float
+    usage_pct: float
+    min_quote_reserve: float
 
 
 @dataclass

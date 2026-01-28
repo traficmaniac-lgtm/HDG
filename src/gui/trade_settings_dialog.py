@@ -19,7 +19,9 @@ from src.core.models import Settings
 
 
 class TradeSettingsDialog(QDialog):
-    saved = Signal(float, int, int, int, int, str, int, int, int, str, bool, str, bool)
+    saved = Signal(
+        float, int, int, int, int, str, int, int, int, str, bool, str, bool, bool, float, float, float
+    )
 
     def __init__(
         self, parent=None, store: ConfigStore | None = None, settings: Settings | None = None
@@ -43,6 +45,41 @@ class TradeSettingsDialog(QDialog):
             else 10.0
         )
         form.addRow("Номинал (USD)", self.notional_input)
+
+        self.budget_mode_input = QCheckBox("Budget Mode")
+        self.budget_mode_input.setChecked(
+            bool(getattr(settings, "budget_mode_enabled", False)) if settings else False
+        )
+        form.addRow("Budget Mode", self.budget_mode_input)
+
+        self.budget_quote_input = QDoubleSpinBox()
+        self.budget_quote_input.setRange(0.0, 1_000_000_000.0)
+        self.budget_quote_input.setDecimals(2)
+        self.budget_quote_input.setSingleStep(10.0)
+        self.budget_quote_input.setValue(
+            float(getattr(settings, "budget_quote", 1000.0) or 0.0)
+            if settings
+            else 1000.0
+        )
+        form.addRow("Budget (USDT)", self.budget_quote_input)
+
+        self.usage_pct_input = QDoubleSpinBox()
+        self.usage_pct_input.setRange(0.50, 0.99)
+        self.usage_pct_input.setDecimals(2)
+        self.usage_pct_input.setSingleStep(0.01)
+        self.usage_pct_input.setValue(
+            float(getattr(settings, "usage_pct", 0.98) or 0.0) if settings else 0.98
+        )
+        form.addRow("Usage %", self.usage_pct_input)
+
+        self.reserve_input = QDoubleSpinBox()
+        self.reserve_input.setRange(0.0, 1_000_000_000.0)
+        self.reserve_input.setDecimals(2)
+        self.reserve_input.setSingleStep(1.0)
+        self.reserve_input.setValue(
+            float(getattr(settings, "min_quote_reserve", 5.0) or 0.0) if settings else 5.0
+        )
+        form.addRow("Reserve (USDT)", self.reserve_input)
 
         self.tick_offset_input = QSpinBox()
         self.tick_offset_input.setRange(0, 1000)
@@ -163,6 +200,10 @@ class TradeSettingsDialog(QDialog):
     def _on_save(self) -> None:
         payload = self._store.load_settings()
         payload["nominal_usd"] = float(self.notional_input.value())
+        payload["budget_mode_enabled"] = bool(self.budget_mode_input.isChecked())
+        payload["budget_quote"] = float(self.budget_quote_input.value())
+        payload["usage_pct"] = float(self.usage_pct_input.value())
+        payload["min_quote_reserve"] = float(self.reserve_input.value())
         payload["offset_ticks"] = int(self.tick_offset_input.value())
         payload["take_profit_ticks"] = int(self.take_profit_input.value())
         payload["stop_loss_ticks"] = int(self.stop_loss_input.value())
@@ -190,5 +231,9 @@ class TradeSettingsDialog(QDialog):
             bool(self.allow_borrow_input.isChecked()),
             str(self.side_effect_input.currentText()).upper(),
             bool(self.auto_exit_input.isChecked()),
+            bool(self.budget_mode_input.isChecked()),
+            float(self.budget_quote_input.value()),
+            float(self.usage_pct_input.value()),
+            float(self.reserve_input.value()),
         )
         self.accept()

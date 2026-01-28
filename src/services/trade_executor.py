@@ -127,12 +127,37 @@ class TradeExecutor:
                 )
                 return 0
 
+            base_asset, quote_asset = self._split_symbol(self._settings.symbol)
+            base_state = self._get_margin_asset(base_asset)
+            quote_state = self._get_margin_asset(quote_asset)
+            if base_state is None or quote_state is None:
+                self._logger(
+                    f"[PRECHECK] margin asset info unavailable symbol={self._settings.symbol}"
+                )
+                self.last_action = "precheck_failed"
+                self.orders_count = 0
+                return 0
+
             tick_offset = max(0, int(self._settings.entry_offset_ticks))
             buy_price = bid + tick_offset * self._profile.tick_size
             buy_price = self._round_to_step(buy_price, self._profile.tick_size)
-            qty = self._round_down(
-                self._settings.nominal_usd / mid, self._profile.step_size
-            )
+            if self._settings.budget_mode_enabled:
+                self._logger(
+                    "[BUDGET] enabled=1 "
+                    f"budget={self._settings.budget_quote:.8f} "
+                    f"usage_pct={self._settings.usage_pct:.2f} "
+                    f"reserve={self._settings.min_quote_reserve:.8f}"
+                )
+                qty = self._compute_budget_buy_qty(
+                    price_ref=buy_price, quote_free=quote_state["free"]
+                )
+                if qty <= 0:
+                    self.abort_cycle_with_reason(reason="ABORT")
+                    return 0
+            else:
+                qty = self._round_down(
+                    self._settings.nominal_usd / mid, self._profile.step_size
+                )
 
             if qty <= 0:
                 self._logger(f"[TRADE] place_test_orders | qty <= 0 tag={self.TAG}")
@@ -153,17 +178,6 @@ class TradeExecutor:
                     f"notional below minNotional ({notional} < {self._profile.min_notional}) "
                     f"tag={self.TAG}"
                 )
-                return 0
-
-            base_asset, quote_asset = self._split_symbol(self._settings.symbol)
-            base_state = self._get_margin_asset(base_asset)
-            quote_state = self._get_margin_asset(quote_asset)
-            if base_state is None or quote_state is None:
-                self._logger(
-                    f"[PRECHECK] margin asset info unavailable symbol={self._settings.symbol}"
-                )
-                self.last_action = "precheck_failed"
-                self.orders_count = 0
                 return 0
 
             buy_cost = qty * buy_price
@@ -633,6 +647,7 @@ class TradeExecutor:
                 "qty": cum_qty,
                 "opened_ts": int(time.time() * 1000),
                 "partial": True,
+                "initial_qty": cum_qty,
             }
             self._last_buy_price = self.position.get("buy_price") or self._last_buy_price
             self._reset_buy_retry()
@@ -686,9 +701,26 @@ class TradeExecutor:
         tick_offset = max(0, int(self._settings.entry_offset_ticks))
         buy_price = bid + tick_offset * self._profile.tick_size
         buy_price = self._round_to_step(buy_price, self._profile.tick_size)
-        qty = self._round_down(
-            self._settings.nominal_usd / mid, self._profile.step_size
-        )
+        if self._settings.budget_mode_enabled:
+            base_asset, quote_asset = self._split_symbol(self._settings.symbol)
+            quote_state = self._get_margin_asset(quote_asset)
+            if quote_state is None:
+                self._logger(
+                    f"[PRECHECK] margin asset info unavailable symbol={self._settings.symbol}"
+                )
+                self._logger("[BUY_ABORT retries_exceeded]")
+                self.abort_cycle()
+                return
+            qty = self._compute_budget_buy_qty(
+                price_ref=buy_price, quote_free=quote_state["free"]
+            )
+            if qty <= 0:
+                self.abort_cycle_with_reason(reason="ABORT")
+                return
+        else:
+            qty = self._round_down(
+                self._settings.nominal_usd / mid, self._profile.step_size
+            )
         if qty <= 0 or qty < self._profile.min_qty:
             self._logger("[BUY_ABORT retries_exceeded]")
             self.abort_cycle()
@@ -798,6 +830,9 @@ class TradeExecutor:
         self._logger(
             f"[SELL_RETRY {retry_index}/{max_retries} price={retry_price}]"
         )
+        remaining_qty = self._resolve_close_qty()
+        if remaining_qty > 0:
+            self._logger(f"[SELL_RETRY_REMAINING] qty={remaining_qty:.8f}")
         self._place_sell_order(reason=reason, reset_retry=False)
 
     def _force_close_after_ttl(self, reason: str = "TTL_EXCEEDED") -> None:
@@ -920,16 +955,28 @@ class TradeExecutor:
         )
         if order is None:
             return
-        if str(side).upper() != "BUY":
+        side_upper = str(side).upper()
+        if side_upper == "BUY":
+            order["cum_qty"] = cum_qty
+            if avg_price > 0:
+                order["avg_fill_price"] = avg_price
+                order["last_fill_price"] = avg_price
+            order["updated_ts"] = ts_ms
+            self._logger(
+                f"[BUY_PARTIAL] cum_qty={cum_qty:.8f} avg={avg_price:.8f}"
+            )
             return
-        order["cum_qty"] = cum_qty
-        if avg_price > 0:
-            order["avg_fill_price"] = avg_price
-            order["last_fill_price"] = avg_price
-        order["updated_ts"] = ts_ms
-        self._logger(
-            f"[BUY_PARTIAL] cum_qty={cum_qty:.8f} avg={avg_price:.8f}"
-        )
+        if side_upper == "SELL":
+            order["cum_qty"] = cum_qty
+            if avg_price > 0:
+                order["avg_fill_price"] = avg_price
+                order["last_fill_price"] = avg_price
+            order["updated_ts"] = ts_ms
+            if self.position is None:
+                return
+            base_qty = self.position.get("initial_qty", self.position.get("qty", 0.0))
+            remaining_qty = max(base_qty - cum_qty, 0.0)
+            self.position["qty"] = remaining_qty
 
     def handle_order_done(self, order_id: int, status: str, ts_ms: int) -> None:
         order = next(
@@ -973,6 +1020,7 @@ class TradeExecutor:
                     "qty": order.get("qty"),
                     "opened_ts": order.get("updated_ts"),
                     "partial": False,
+                    "initial_qty": order.get("qty"),
                 }
             self._transition_state(TradeState.STATE_POSITION_OPEN)
         elif side == "SELL":
@@ -1290,6 +1338,44 @@ class TradeExecutor:
         if upper in {"AUTO_BORROW_REPAY", "MARGIN_BUY"}:
             return upper
         return "AUTO_BORROW_REPAY"
+
+    def _compute_budget_buy_qty(self, price_ref: float, quote_free: float) -> float:
+        if price_ref <= 0 or not self._profile.step_size:
+            return 0.0
+        min_notional = self._profile.min_notional or 0.0
+        min_budget = 10.0
+        if self._profile.min_notional:
+            min_budget = max(min_budget, self._profile.min_notional * 2)
+        budget_quote = max(0.0, float(self._settings.budget_quote))
+        if budget_quote < min_budget:
+            self._logger(
+                "[BUDGET_SKIP] reason=budget_too_small "
+                f"budget={budget_quote:.8f} min_required={min_budget:.8f}"
+            )
+            return 0.0
+        usage_pct = float(self._settings.usage_pct)
+        reserve = float(self._settings.min_quote_reserve)
+        free_quote = min(quote_free, budget_quote)
+        usable_quote = max(0.0, free_quote * usage_pct - reserve)
+        raw_qty = usable_quote / price_ref
+        qty = self._round_down(raw_qty, self._profile.step_size)
+        self._logger(
+            f"[BUDGET_QTY] free_quote={free_quote:.8f} usable_quote={usable_quote:.8f} "
+            f"price_ref={price_ref:.8f} qty={qty:.8f}"
+        )
+        if usable_quote < min_notional:
+            self._logger(f"[BUDGET_SKIP] reason=too_small usable_quote={usable_quote:.8f}")
+            return 0.0
+        if qty <= 0:
+            self._logger(f"[BUDGET_SKIP] reason=too_small usable_quote={usable_quote:.8f}")
+            return 0.0
+        if self._profile.min_qty and qty < self._profile.min_qty:
+            self._logger(f"[BUDGET_SKIP] reason=too_small usable_quote={usable_quote:.8f}")
+            return 0.0
+        if self._profile.min_notional and qty * price_ref < self._profile.min_notional:
+            self._logger(f"[BUDGET_SKIP] reason=too_small usable_quote={usable_quote:.8f}")
+            return 0.0
+        return qty
 
     def _get_margin_asset(self, asset: str) -> Optional[dict]:
         try:

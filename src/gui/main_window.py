@@ -693,6 +693,13 @@ class MainWindow(QMainWindow):
 
     def _load_settings(self) -> Settings:
         payload = self._config_store.load_settings()
+        budget_quote = self._bounded_float(payload.get("budget_quote", 1000.0), 0.0, 1e9, 1000.0)
+        if budget_quote < 10.0:
+            budget_quote = 10.0
+        usage_pct = self._bounded_float(payload.get("usage_pct", 0.98), 0.50, 0.99, 0.98)
+        min_quote_reserve = self._bounded_float(
+            payload.get("min_quote_reserve", 5.0), 0.0, budget_quote * 0.2, 5.0
+        )
         return Settings(
             symbol=payload.get("symbol", "EURIUSDT"),
             ws_fresh_ms=int(payload.get("ws_fresh_ms", 700)),
@@ -736,6 +743,10 @@ class MainWindow(QMainWindow):
             max_sell_retries=int(payload.get("max_sell_retries", 3)),
             force_close_on_ttl=bool(payload.get("force_close_on_ttl", True)),
             cycle_count=self._bounded_int(payload.get("cycle_count", 1), 1, 1000, 1),
+            budget_mode_enabled=bool(payload.get("budget_mode_enabled", False)),
+            budget_quote=budget_quote,
+            usage_pct=usage_pct,
+            min_quote_reserve=min_quote_reserve,
         )
 
     def _log_data_blind_state(self, price_state: PriceState, state_label: str) -> None:
@@ -800,6 +811,16 @@ class MainWindow(QMainWindow):
             return default
         return max(min_value, min(max_value, parsed))
 
+    @staticmethod
+    def _bounded_float(
+        value: object, min_value: float, max_value: float, default: float
+    ) -> float:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return default
+        return max(min_value, min(max_value, parsed))
+
     def _open_api_settings(self) -> None:
         dialog = ApiSettingsDialog(self, store=self._config_store)
         dialog.saved.connect(self._on_api_saved)
@@ -829,6 +850,10 @@ class MainWindow(QMainWindow):
         allow_borrow: bool,
         side_effect_type: str,
         auto_exit_enabled: bool,
+        budget_mode_enabled: bool,
+        budget_quote: float,
+        usage_pct: float,
+        min_quote_reserve: float,
     ) -> None:
         if self._settings:
             self._settings.nominal_usd = notional
@@ -844,6 +869,10 @@ class MainWindow(QMainWindow):
             self._settings.allow_borrow = allow_borrow
             self._settings.side_effect_type = side_effect_type
             self._settings.auto_exit_enabled = auto_exit_enabled
+            self._settings.budget_mode_enabled = budget_mode_enabled
+            self._settings.budget_quote = budget_quote
+            self._settings.usage_pct = usage_pct
+            self._settings.min_quote_reserve = min_quote_reserve
         self._append_log("[SETTINGS] saved")
 
     def _on_api_saved(self, key: str, secret: str) -> None:
