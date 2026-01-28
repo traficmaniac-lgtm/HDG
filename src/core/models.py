@@ -37,6 +37,7 @@ class Settings:
     sell_ttl_ms: int
     max_sell_retries: int
     force_close_on_ttl: bool
+    cycle_count: int
 
 
 @dataclass

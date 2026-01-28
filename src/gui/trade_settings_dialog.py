@@ -19,7 +19,7 @@ from src.core.models import Settings
 
 
 class TradeSettingsDialog(QDialog):
-    saved = Signal(float, int, int, int, str, int, int, int, str, bool, str, bool)
+    saved = Signal(float, int, int, int, int, str, int, int, int, str, bool, str, bool)
 
     def __init__(
         self, parent=None, store: ConfigStore | None = None, settings: Settings | None = None
@@ -64,6 +64,13 @@ class TradeSettingsDialog(QDialog):
             int(getattr(settings, "stop_loss_ticks", 2) or 2) if settings else 2
         )
         form.addRow("Stop-loss (тики)", self.stop_loss_input)
+
+        self.cycle_count_input = QSpinBox()
+        self.cycle_count_input.setRange(1, 1000)
+        self.cycle_count_input.setValue(
+            int(getattr(settings, "cycle_count", 1) or 1) if settings else 1
+        )
+        form.addRow("Количество циклов", self.cycle_count_input)
 
         self.order_type_input = QComboBox()
         self.order_type_input.addItems(["LIMIT", "MARKET"])
@@ -159,6 +166,7 @@ class TradeSettingsDialog(QDialog):
         payload["offset_ticks"] = int(self.tick_offset_input.value())
         payload["take_profit_ticks"] = int(self.take_profit_input.value())
         payload["stop_loss_ticks"] = int(self.stop_loss_input.value())
+        payload["cycle_count"] = int(self.cycle_count_input.value())
         payload["order_type"] = str(self.order_type_input.currentText()).upper()
         payload["buy_ttl_ms"] = int(self.buy_ttl_input.value())
         payload["max_buy_retries"] = int(self.buy_retry_input.value())
@@ -173,6 +181,7 @@ class TradeSettingsDialog(QDialog):
             int(self.tick_offset_input.value()),
             int(self.take_profit_input.value()),
             int(self.stop_loss_input.value()),
+            int(self.cycle_count_input.value()),
             str(self.order_type_input.currentText()).upper(),
             int(self.buy_ttl_input.value()),
             int(self.buy_retry_input.value()),
