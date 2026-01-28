@@ -449,7 +449,7 @@ class MainWindow(QMainWindow):
             self._last_ws_status_log_ts = now
             self._append_log(f"WS connected: {status}")
 
-    @Slot(int, str, float, float, int)
+    @Slot(int, str, float, float, "qint64")
     def _on_order_filled(
         self, order_id: int, side: str, price: float, qty: float, ts_ms: int
     ) -> None:
@@ -463,7 +463,7 @@ class MainWindow(QMainWindow):
             )
         self._refresh_orders()
 
-    @Slot(int, str, int)
+    @Slot(int, str, "qint64")
     def _on_order_done(self, order_id: int, status: str, ts_ms: int) -> None:
         if self._trade_executor:
             self._trade_executor.handle_order_done(order_id, status, ts_ms)
