@@ -11,6 +11,10 @@ class Settings:
     http_fresh_ms: int
     http_interval_ms: int
     ui_refresh_ms: int
+    ws_log_throttle_ms: int
+    ws_reconnect_dedup_ms: int
+    order_poll_ms: int
+    source_switch_hysteresis_ms: int
     account_mode: str
     leverage_hint: int
     nominal_usd: float

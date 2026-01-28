@@ -17,13 +17,17 @@ class WsPriceWorker(QObject):
     log = Signal(str)
     finished = Signal()
 
-    def __init__(self, symbol: str) -> None:
+    def __init__(self, symbol: str, reconnect_dedup_ms: int = 10000) -> None:
         super().__init__()
         self._symbol = symbol.lower()
         self._stop_event = threading.Event()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._ws: Optional[websockets.WebSocketClientProtocol] = None
         self._connected = False
+        self._reconnect_dedup_s = reconnect_dedup_ms / 1000.0
+        self._reconnect_cooldown_s = 2.0
+        self._last_reconnect_ts = 0.0
+        self._reconnect_log_ts: dict[str, float] = {}
 
     @Slot()
     def run(self) -> None:
@@ -69,9 +73,16 @@ class WsPriceWorker(QObject):
                 if self._stop_event.is_set():
                     break
                 self._set_connected(False)
+                now = time.monotonic()
+                reason = str(exc) or "unknown"
+                last_log_ts = self._reconnect_log_ts.get(reason, 0.0)
+                if now - last_log_ts >= self._reconnect_dedup_s:
+                    self._reconnect_log_ts[reason] = now
+                    self.log.emit(f"WS reconnect: {reason}")
                 jitter = random.uniform(0.0, 0.2)
-                self.log.emit(f"WS reconnect: {exc}")
-                await asyncio.sleep(backoff + jitter)
+                cooldown = max(0.0, self._reconnect_cooldown_s - (now - self._last_reconnect_ts))
+                await asyncio.sleep(max(backoff + jitter, cooldown))
+                self._last_reconnect_ts = time.monotonic()
                 backoff = min(backoff * 2.0, 10.0)
             finally:
                 self._ws = None

@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Optional
 
 from datetime import datetime
+import time
 
 import httpx
 from PySide6.QtCore import Qt, QTimer, Slot
@@ -35,6 +36,7 @@ from src.gui.api_settings_dialog import ApiSettingsDialog
 from src.gui.trade_settings_dialog import TradeSettingsDialog
 from src.services.binance_rest import BinanceRestClient
 from src.services.http_price import HttpPriceService
+from src.services.order_tracker import OrderTracker
 from src.services.price_router import PriceRouter
 from src.services.trade_executor import TradeExecutor
 from src.services.ws_price import WsPriceWorker
@@ -62,6 +64,8 @@ class MainWindow(QMainWindow):
         self._margin_checked = False
         self._margin_api_access = False
         self._borrow_allowed_by_api: Optional[bool] = None
+        self._order_tracker: Optional[OrderTracker] = None
+        self._last_ws_status_log_ts = 0.0
 
         self._ui_timer = QTimer(self)
         self._ui_timer.timeout.connect(self._refresh_ui)
@@ -338,6 +342,16 @@ class MainWindow(QMainWindow):
             self._trade_executor.set_margin_capabilities(
                 self._margin_api_access, self._borrow_allowed_by_api
             )
+            self._order_tracker = OrderTracker(
+                rest=self._rest,
+                symbol=self._settings.symbol,
+                poll_ms=self._settings.order_poll_ms,
+                logger=self._append_log,
+                parent=self,
+            )
+            self._order_tracker.order_filled.connect(self._on_order_filled)
+            self._order_tracker.order_done.connect(self._on_order_done)
+            self._order_tracker.start()
             self._update_trading_controls()
         else:
             self.start_button.setEnabled(False)
@@ -361,6 +375,9 @@ class MainWindow(QMainWindow):
         self._ui_timer.stop()
         self._http_timer.stop()
         self._orders_timer.stop()
+        if self._order_tracker:
+            self._order_tracker.stop()
+            self._order_tracker = None
 
         if self._ws_worker is not None:
             self._ws_worker.stop()
@@ -395,7 +412,10 @@ class MainWindow(QMainWindow):
         if not self._settings:
             return
         self._ws_thread = QThread()
-        self._ws_worker = WsPriceWorker(self._settings.symbol)
+        self._ws_worker = WsPriceWorker(
+            self._settings.symbol,
+            reconnect_dedup_ms=self._settings.ws_reconnect_dedup_ms,
+        )
         self._ws_worker.moveToThread(self._ws_thread)
         self._ws_thread.started.connect(self._ws_worker.run)
         self._ws_worker.finished.connect(self._ws_thread.quit)
@@ -416,7 +436,33 @@ class MainWindow(QMainWindow):
         if status == self._ws_connected:
             return
         self._ws_connected = status
-        self._append_log(f"WS connected: {status}")
+        now = time.monotonic()
+        throttle_s = (
+            self._settings.ws_log_throttle_ms / 1000.0 if self._settings else 5.0
+        )
+        if now - self._last_ws_status_log_ts >= throttle_s:
+            self._last_ws_status_log_ts = now
+            self._append_log(f"WS connected: {status}")
+
+    @Slot(int, str, float, float, int)
+    def _on_order_filled(
+        self, order_id: int, side: str, price: float, qty: float, ts_ms: int
+    ) -> None:
+        if self._trade_executor:
+            self._trade_executor.handle_order_filled(
+                order_id=order_id,
+                side=side,
+                price=price,
+                qty=qty,
+                ts_ms=ts_ms,
+            )
+        self._refresh_orders()
+
+    @Slot(int, str, int)
+    def _on_order_done(self, order_id: int, status: str, ts_ms: int) -> None:
+        if self._trade_executor:
+            self._trade_executor.handle_order_done(order_id, status, ts_ms)
+        self._refresh_orders()
 
     @Slot()
     def _poll_http(self) -> None:
@@ -610,6 +656,12 @@ class MainWindow(QMainWindow):
             http_fresh_ms=int(payload.get("http_fresh_ms", 1500)),
             http_interval_ms=int(payload.get("http_interval_ms", 1000)),
             ui_refresh_ms=int(payload.get("ui_refresh_ms", 100)),
+            ws_log_throttle_ms=int(payload.get("ws_log_throttle_ms", 5000)),
+            ws_reconnect_dedup_ms=int(payload.get("ws_reconnect_dedup_ms", 10000)),
+            order_poll_ms=int(payload.get("order_poll_ms", 1500)),
+            source_switch_hysteresis_ms=int(
+                payload.get("source_switch_hysteresis_ms", 1000)
+            ),
             account_mode=str(payload.get("account_mode", "CROSS_MARGIN")),
             leverage_hint=int(
                 payload.get("leverage_hint", payload.get("max_leverage_hint", 3))
@@ -818,15 +870,18 @@ class MainWindow(QMainWindow):
     def _refresh_orders(self) -> None:
         if not self._connected or not self._rest or not self._settings:
             return
+        open_orders = []
+        orders_error = False
         try:
             open_orders = self._rest.get_margin_open_orders(self._settings.symbol)
         except Exception as exc:
             if not self._orders_error_logged:
                 self._append_log(f"[ORDERS] fetch failed: {exc}")
                 self._orders_error_logged = True
-            return
+            orders_error = True
 
-        self._orders_error_logged = False
+        if not orders_error:
+            self._orders_error_logged = False
         if self._router:
             price_state, _ = self._router.build_price_state()
             self.age_label.setText(
@@ -842,6 +897,8 @@ class MainWindow(QMainWindow):
             if self._trade_executor
             else []
         )
+        if self._order_tracker:
+            self._order_tracker.sync_active_orders(orders)
         for order in orders:
             order_time = order.get("created_ts")
             age_ms = None

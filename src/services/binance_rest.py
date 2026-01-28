@@ -45,6 +45,13 @@ class BinanceRestClient:
             "GET", "/sapi/v1/margin/openOrders", {"symbol": symbol}
         )
 
+    def get_margin_order(self, symbol: str, order_id: int) -> dict:
+        return self.signed_sapi_request(
+            "GET",
+            "/sapi/v1/margin/order",
+            {"symbol": symbol, "orderId": order_id},
+        )
+
     def get_margin_account(self) -> dict:
         return self.signed_sapi_request("GET", "/sapi/v1/margin/account", {})
 
