@@ -19,6 +19,7 @@ class Settings:
     allow_borrow: bool
     side_effect_type: str
     margin_isolated: bool
+    auto_close: bool
 
 
 @dataclass
