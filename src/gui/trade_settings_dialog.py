@@ -19,7 +19,7 @@ from src.core.models import Settings
 
 
 class TradeSettingsDialog(QDialog):
-    saved = Signal(float, int, str, bool, str, bool)
+    saved = Signal(float, int, int, str, bool, str, bool)
 
     def __init__(
         self, parent=None, store: ConfigStore | None = None, settings: Settings | None = None
@@ -51,6 +51,13 @@ class TradeSettingsDialog(QDialog):
         )
         form.addRow("Смещение в тиках", self.tick_offset_input)
 
+        self.take_profit_input = QSpinBox()
+        self.take_profit_input.setRange(1, 1000)
+        self.take_profit_input.setValue(
+            int(getattr(settings, "take_profit_ticks", 1) or 1) if settings else 1
+        )
+        form.addRow("Take-profit (тики)", self.take_profit_input)
+
         self.order_type_input = QComboBox()
         self.order_type_input.addItems(["LIMIT", "MARKET"])
         current_order_type = str(getattr(settings, "order_type", "LIMIT") or "LIMIT").upper()
@@ -63,7 +70,7 @@ class TradeSettingsDialog(QDialog):
         self.allow_borrow_input.setChecked(bool(getattr(settings, "allow_borrow", True)))
         form.addRow("", self.allow_borrow_input)
 
-        self.auto_close_input = QCheckBox("Авто-закрытие после BUY")
+        self.auto_close_input = QCheckBox("Авто-выход по тейку")
         self.auto_close_input.setChecked(bool(getattr(settings, "auto_close", False)))
         form.addRow("", self.auto_close_input)
 
@@ -107,6 +114,7 @@ class TradeSettingsDialog(QDialog):
         payload = self._store.load_settings()
         payload["nominal_usd"] = float(self.notional_input.value())
         payload["offset_ticks"] = int(self.tick_offset_input.value())
+        payload["take_profit_ticks"] = int(self.take_profit_input.value())
         payload["order_type"] = str(self.order_type_input.currentText()).upper()
         payload["allow_borrow"] = bool(self.allow_borrow_input.isChecked())
         payload["side_effect_type"] = str(self.side_effect_input.currentText()).upper()
@@ -115,6 +123,7 @@ class TradeSettingsDialog(QDialog):
         self.saved.emit(
             float(self.notional_input.value()),
             int(self.tick_offset_input.value()),
+            int(self.take_profit_input.value()),
             str(self.order_type_input.currentText()).upper(),
             bool(self.allow_borrow_input.isChecked()),
             str(self.side_effect_input.currentText()).upper(),

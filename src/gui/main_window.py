@@ -178,9 +178,21 @@ class MainWindow(QMainWindow):
         profile_column.addWidget(self.min_qty_label)
         profile_column.addWidget(self.min_notional_label)
 
+        position_column = QVBoxLayout()
+        position_title = QLabel("Position")
+        position_title.setStyleSheet("font-weight: 600;")
+        self.buy_price_label = QLabel("buy_price: —")
+        self.current_mid_label = QLabel("current mid: —")
+        self.target_price_label = QLabel("target_price: —")
+        position_column.addWidget(position_title)
+        position_column.addWidget(self.buy_price_label)
+        position_column.addWidget(self.current_mid_label)
+        position_column.addWidget(self.target_price_label)
+
         summary_layout.addLayout(market_column)
         summary_layout.addLayout(health_column)
         summary_layout.addLayout(profile_column)
+        summary_layout.addLayout(position_column)
 
         terminal_tab = QWidget()
         terminal_layout = QVBoxLayout(terminal_tab)
@@ -454,6 +466,7 @@ class MainWindow(QMainWindow):
         self.switch_reason_label.setText(
             f"last_switch_reason: {health_state.last_switch_reason or '—'}"
         )
+        self._update_take_profit_status(price_state.mid)
         self._update_trading_controls(price_state)
 
     def _update_status(self, connected: bool) -> None:
@@ -469,6 +482,8 @@ class MainWindow(QMainWindow):
     def _update_trading_controls(self, price_state: Optional[object] = None) -> None:
         if price_state is not None:
             self._last_mid = price_state.mid
+            if self._trade_executor:
+                self._trade_executor.evaluate_take_profit(price_state.mid)
         can_trade = (
             self._connected
             and self._trade_executor is not None
@@ -601,6 +616,7 @@ class MainWindow(QMainWindow):
             ),
             nominal_usd=float(payload.get("nominal_usd", payload.get("test_notional_usd", 10.0))),
             offset_ticks=int(payload.get("offset_ticks", payload.get("test_tick_offset", 1))),
+            take_profit_ticks=int(payload.get("take_profit_ticks", 1)),
             order_type=str(payload.get("order_type", "LIMIT")).upper(),
             allow_borrow=bool(payload.get("allow_borrow", True)),
             side_effect_type=str(payload.get("side_effect_type", "AUTO_BORROW_REPAY")).upper(),
@@ -655,6 +671,7 @@ class MainWindow(QMainWindow):
         self,
         notional: float,
         tick_offset: int,
+        take_profit_ticks: int,
         order_type: str,
         allow_borrow: bool,
         side_effect_type: str,
@@ -663,6 +680,7 @@ class MainWindow(QMainWindow):
         if self._settings:
             self._settings.nominal_usd = notional
             self._settings.offset_ticks = tick_offset
+            self._settings.take_profit_ticks = take_profit_ticks
             self._settings.order_type = order_type
             self._settings.allow_borrow = allow_borrow
             self._settings.side_effect_type = side_effect_type
@@ -745,6 +763,26 @@ class MainWindow(QMainWindow):
             key: value or ""
             for key, value in dotenv.dotenv_values(env_path).items()
         }
+
+    def _update_take_profit_status(self, mid: Optional[float]) -> None:
+        buy_price = None
+        target_price = None
+        condition_met = False
+        tick_size = self._symbol_profile.tick_size if self._symbol_profile else None
+        if self._trade_executor and self._settings:
+            buy_price = self._trade_executor.get_buy_price()
+            if buy_price is not None and tick_size:
+                target_price = buy_price + self._settings.take_profit_ticks * tick_size
+                if mid is not None and mid >= target_price:
+                    condition_met = True
+
+        self.buy_price_label.setText(f"buy_price: {self._fmt_price(buy_price)}")
+        self.current_mid_label.setText(f"current mid: {self._fmt_price(mid)}")
+        self.target_price_label.setText(f"target_price: {self._fmt_price(target_price)}")
+        if condition_met:
+            self.target_price_label.setStyleSheet("color: #3ad07d; font-weight: 600;")
+        else:
+            self.target_price_label.setStyleSheet("")
 
     def _parse_symbol_profile(self, exchange_info: dict) -> SymbolProfile:
         symbols = exchange_info.get("symbols", [])
