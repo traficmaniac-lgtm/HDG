@@ -64,6 +64,7 @@ class TradeExecutor:
         self.sell_place_inflight = False
         self.sell_last_attempt_ts = 0.0
         self.sell_backoff_ms = 500
+        self._pending_sell_retry_reason: Optional[str] = None
         self._aggregate_sold_qty = 0.0
         self.position_qty_base: Optional[float] = None
         self._last_place_error_code: Optional[int] = None
@@ -75,6 +76,9 @@ class TradeExecutor:
         self.run_active = False
         self._next_cycle_ready_ts: Optional[float] = None
         self._cycle_cooldown_s = 0.3
+        self._exits_frozen = False
+        self._entry_price_wait_started_ts: Optional[float] = None
+        self._exit_price_wait_started_ts: Optional[float] = None
 
     def get_state_label(self) -> str:
         return self.state.value
@@ -383,13 +387,24 @@ class TradeExecutor:
             return 0
         return self._place_sell_order(reason="manual")
 
-    def evaluate_exit_conditions(self, mid: Optional[float], data_blind: bool) -> None:
+    def evaluate_exit_conditions(self) -> None:
         if self.state != TradeState.STATE_POSITION_OPEN:
             return
         if not self._settings.auto_exit_enabled:
             return
-        if mid is None:
+        snapshot = self._router.get_mid_snapshot(self._settings.mid_fresh_ms)
+        ok, mid, age_ms, source, reason = snapshot
+        if not ok:
+            self._exits_frozen = True
+            age_label = age_ms if age_ms is not None else "?"
+            window_s = max(self._settings.price_wait_log_every_ms, 1) / 1000.0
+            if not self._should_dedup_log(f"exits_frozen:{reason}", window_s):
+                self._logger(
+                    f"[EXITS_FROZEN] reason={reason} age_ms={age_label} source={source}"
+                )
             return
+        if self._exits_frozen:
+            self._exits_frozen = False
         if self.sell_place_inflight or self.sell_cancel_pending or self.sell_active_order_id:
             if self.sell_place_inflight:
                 reason = "sell_inflight"
@@ -432,6 +447,49 @@ class TradeExecutor:
                 f"reason=SL mid={mid:.8f} buy={buy_price:.8f} sl={sl_price:.8f}"
             )
             self._place_sell_order(reason="SL", mid_override=mid)
+
+    def _start_price_wait(self, stage: str) -> None:
+        now = time.monotonic()
+        if stage == "ENTRY":
+            if self._entry_price_wait_started_ts is None:
+                self._entry_price_wait_started_ts = now
+        elif stage == "EXIT":
+            if self._exit_price_wait_started_ts is None:
+                self._exit_price_wait_started_ts = now
+
+    def _clear_price_wait(self, stage: str) -> None:
+        if stage == "ENTRY":
+            self._entry_price_wait_started_ts = None
+        elif stage == "EXIT":
+            self._exit_price_wait_started_ts = None
+
+    def _price_wait_elapsed_ms(self, stage: str) -> Optional[int]:
+        ts = None
+        if stage == "ENTRY":
+            ts = self._entry_price_wait_started_ts
+        elif stage == "EXIT":
+            ts = self._exit_price_wait_started_ts
+        if ts is None:
+            return None
+        return int((time.monotonic() - ts) * 1000.0)
+
+    def _log_price_wait(self, stage: str, age_ms: Optional[int], source: str) -> None:
+        window_s = max(self._settings.price_wait_log_every_ms, 1) / 1000.0
+        if self._should_dedup_log(f"price_wait:{stage}", window_s):
+            return
+        age_label = age_ms if age_ms is not None else "?"
+        self._logger(f"[PRICE_WAIT] stage={stage} age_ms={age_label} source={source}")
+
+    def _maybe_abort_entry_wait(self) -> bool:
+        elapsed_ms = self._price_wait_elapsed_ms("ENTRY")
+        if elapsed_ms is None:
+            return False
+        if elapsed_ms < int(self._settings.max_wait_price_ms):
+            return False
+        self._logger(f"[PRICE_WAIT_TIMEOUT] stage=ENTRY waited_ms={elapsed_ms}")
+        self._clear_price_wait("ENTRY")
+        self.abort_cycle()
+        return True
 
     def get_buy_price(self) -> Optional[float]:
         if self.position is not None:
@@ -704,6 +762,8 @@ class TradeExecutor:
     def _reset_sell_retry(self) -> None:
         self._sell_wait_started_ts = None
         self._sell_retry_count = 0
+        self._clear_price_wait("EXIT")
+        self._pending_sell_retry_reason = None
 
     def _start_sell_wait(self) -> None:
         self._sell_wait_started_ts = time.monotonic()
@@ -711,6 +771,7 @@ class TradeExecutor:
     def _reset_buy_retry(self) -> None:
         self._buy_wait_started_ts = None
         self._buy_retry_count = 0
+        self._clear_price_wait("ENTRY")
 
     def _start_buy_wait(self) -> None:
         self._buy_wait_started_ts = time.monotonic()
@@ -776,6 +837,13 @@ class TradeExecutor:
             self._logger("[BUY_ABORT retries_exceeded]")
             self.abort_cycle()
             return
+        snapshot = self._router.get_mid_snapshot(self._settings.mid_fresh_ms)
+        if not snapshot[0]:
+            self._start_price_wait("ENTRY")
+            self._log_price_wait("ENTRY", snapshot[2], snapshot[3])
+            self._maybe_abort_entry_wait()
+            return
+        self._clear_price_wait("ENTRY")
         order_id = buy_order.get("orderId")
         if order_id and order_id in open_orders:
             is_isolated = "TRUE" if self._settings.margin_isolated else "FALSE"
@@ -791,26 +859,21 @@ class TradeExecutor:
             entry for entry in self.active_test_orders if entry.get("orderId") != order_id
         ]
         self.orders_count = len(self.active_test_orders)
-        self._buy_retry_count += 1
-        retry_index = self._buy_retry_count
-        price_state, health_state = self._router.build_price_state()
+        price_state, _ = self._router.build_price_state()
         mid = price_state.mid
         bid = price_state.bid
         if price_state.data_blind or mid is None or bid is None:
-            now = time.monotonic()
-            if now - self._last_no_price_log_ts >= 2.0:
-                self._last_no_price_log_ts = now
-                self._logger(
-                    "[TRADE] blocked: no_price "
-                    f"(ws_age={health_state.ws_age_ms} http_age={health_state.http_age_ms})"
-                )
-            self._logger("[BUY_ABORT retries_exceeded]")
-            self.abort_cycle()
+            self._start_price_wait("ENTRY")
+            self._log_price_wait("ENTRY", price_state.mid_age_ms, price_state.source)
+            self._maybe_abort_entry_wait()
             return
+        self._clear_price_wait("ENTRY")
         if not self._profile.tick_size or not self._profile.step_size or not self._profile.min_qty:
             self._logger("[BUY_ABORT retries_exceeded]")
             self.abort_cycle()
             return
+        self._buy_retry_count += 1
+        retry_index = self._buy_retry_count
         tick_offset = max(0, int(self._settings.entry_offset_ticks))
         buy_price = bid + tick_offset * self._profile.tick_size
         buy_price = self._round_to_step(buy_price, self._profile.tick_size)
@@ -879,6 +942,11 @@ class TradeExecutor:
         if sell_order and self.sell_active_order_id is None:
             self.sell_active_order_id = sell_order.get("orderId")
         if not sell_order:
+            if self._pending_sell_retry_reason:
+                self._retry_sell_after_cancel(
+                    {"reason": self._pending_sell_retry_reason}
+                )
+                return
             if self.sell_cancel_pending:
                 self._finalize_sell_cancel(self.sell_active_order_id)
             return
@@ -1390,9 +1458,15 @@ class TradeExecutor:
         if self._sell_retry_count >= max_retries:
             self._force_close_after_ttl()
             return
-        self._sell_retry_count += 1
-        retry_index = self._sell_retry_count
         reason = str(sell_order.get("reason") or "MANUAL").upper()
+        snapshot = self._router.get_mid_snapshot(self._settings.mid_fresh_ms)
+        if not snapshot[0]:
+            self._start_price_wait("EXIT")
+            self._log_price_wait("EXIT", snapshot[2], snapshot[3])
+            self._pending_sell_retry_reason = reason
+            return
+        self._clear_price_wait("EXIT")
+        self._pending_sell_retry_reason = None
         price_state, _ = self._router.build_price_state()
         exit_order_type = self._normalize_order_type(self._settings.exit_order_type)
         if exit_order_type == "LIMIT":
@@ -1406,6 +1480,8 @@ class TradeExecutor:
             retry_price = f"{sell_price:.8f}"
         else:
             retry_price = "MARKET"
+        self._sell_retry_count += 1
+        retry_index = self._sell_retry_count
         self._logger(
             f"[SELL_RETRY {retry_index}/{max_retries} price={retry_price}]"
         )
@@ -1419,7 +1495,9 @@ class TradeExecutor:
                 f"qty={remaining_qty:.8f} remaining={remaining_qty_raw:.8f} "
                 f"n={retry_index}/{max_retries}"
             )
-        self._place_sell_order(reason=reason, reset_retry=False)
+        placed = self._place_sell_order(reason=reason, reset_retry=False)
+        if placed:
+            self._pending_sell_retry_reason = None
 
     def abort_cycle(self) -> int:
         return self.abort_cycle_with_reason(reason="ABORT")

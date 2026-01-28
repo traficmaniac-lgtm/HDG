@@ -20,7 +20,23 @@ from src.core.models import Settings
 
 class TradeSettingsDialog(QDialog):
     saved = Signal(
-        float, int, int, int, int, str, int, int, int, str, bool, str, bool, float, float
+        float,
+        int,
+        int,
+        int,
+        int,
+        str,
+        int,
+        int,
+        int,
+        str,
+        bool,
+        str,
+        bool,
+        float,
+        float,
+        int,
+        int,
     )
 
     def __init__(
@@ -62,6 +78,28 @@ class TradeSettingsDialog(QDialog):
             int(getattr(settings, "max_buy_retries", 3) or 0) if settings else 3
         )
         form.addRow("Повторы входа BUY", self.buy_retry_input)
+
+        advanced_header = QLabel("ADVANCED")
+        advanced_header.setStyleSheet("font-weight: bold;")
+        form.addRow(advanced_header)
+
+        self.mid_fresh_input = QSpinBox()
+        self.mid_fresh_input.setRange(200, 5000)
+        self.mid_fresh_input.setSingleStep(50)
+        self.mid_fresh_input.setValue(
+            int(getattr(settings, "mid_fresh_ms", 800) or 800) if settings else 800
+        )
+        form.addRow("Fresh mid (ms)", self.mid_fresh_input)
+
+        self.max_wait_price_input = QSpinBox()
+        self.max_wait_price_input.setRange(1000, 30000)
+        self.max_wait_price_input.setSingleStep(500)
+        self.max_wait_price_input.setValue(
+            int(getattr(settings, "max_wait_price_ms", 5000) or 5000)
+            if settings
+            else 5000
+        )
+        form.addRow("Max wait price (ms)", self.max_wait_price_input)
 
         self.order_type_input = QComboBox()
         self.order_type_input.addItems(["LIMIT", "MARKET"])
@@ -203,6 +241,8 @@ class TradeSettingsDialog(QDialog):
         payload["order_type"] = str(self.order_type_input.currentText()).upper()
         payload["buy_ttl_ms"] = int(self.buy_ttl_input.value())
         payload["max_buy_retries"] = int(self.buy_retry_input.value())
+        payload["mid_fresh_ms"] = int(self.mid_fresh_input.value())
+        payload["max_wait_price_ms"] = int(self.max_wait_price_input.value())
         payload["exit_order_type"] = str(self.exit_order_type_input.currentText()).upper()
         payload["exit_offset_ticks"] = int(self.exit_offset_input.value())
         payload["allow_borrow"] = bool(self.allow_borrow_input.isChecked())
@@ -225,5 +265,7 @@ class TradeSettingsDialog(QDialog):
             bool(self.auto_exit_input.isChecked()),
             float(self.max_budget_input.value()),
             float(self.budget_reserve_input.value()),
+            int(self.mid_fresh_input.value()),
+            int(self.max_wait_price_input.value()),
         )
         self.accept()
