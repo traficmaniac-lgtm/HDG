@@ -8,5 +8,12 @@
   "max_leverage_hint": 3,
   "test_notional_usd": 10.0,
   "test_tick_offset": 1,
-  "margin_isolated": false
+  "margin_isolated": false,
+  "api": {
+    "key": "",
+    "secret": ""
+  },
+  "api_storage": {
+    "source": "settings.json"
+  }
 }

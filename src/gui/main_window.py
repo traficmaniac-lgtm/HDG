@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import json
 from importlib import import_module
 from importlib.util import find_spec
 from pathlib import Path
 from typing import Optional
 
 from PySide6.QtCore import Qt, QTimer, Slot
+from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QFileDialog,
     QFrame,
@@ -14,15 +14,19 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QMenu,
     QPlainTextEdit,
     QPushButton,
     QTabWidget,
     QVBoxLayout,
     QWidget,
+    QMessageBox,
 )
 
+from src.core.config_store import ApiCredentials, ConfigStore
 from src.core.models import Settings, SymbolProfile
 from src.core.version import VERSION
+from src.gui.api_settings_dialog import ApiSettingsDialog
 from src.services.binance_rest import BinanceRestClient
 from src.services.http_price import HttpPriceService
 from src.services.price_router import PriceRouter
@@ -46,7 +50,9 @@ class MainWindow(QMainWindow):
         self._symbol_profile = SymbolProfile()
         self._last_trade_action = "—"
         self._orders_count = 0
-        self._api_key_hint_logged = False
+        self._auth_warning_shown = False
+        self._api_credentials = ApiCredentials()
+        self._config_store = ConfigStore()
 
         self._ui_timer = QTimer(self)
         self._ui_timer.timeout.connect(self._refresh_ui)
@@ -57,11 +63,14 @@ class MainWindow(QMainWindow):
         self._ws_worker = None
 
         self._build_ui()
+        self._load_api_state()
         self._update_status(False)
 
     def _build_ui(self) -> None:
         central = QWidget()
         root = QVBoxLayout(central)
+
+        self._build_menu()
 
         header = QFrame()
         header_layout = QHBoxLayout(header)
@@ -152,17 +161,36 @@ class MainWindow(QMainWindow):
         log_actions = QHBoxLayout()
         self.clear_log_button = QPushButton("Clear")
         self.clear_log_button.clicked.connect(self._clear_log)
-        self.save_log_button = QPushButton("Save Log")
-        self.save_log_button.clicked.connect(self._save_log)
         log_actions.addStretch(1)
         log_actions.addWidget(self.clear_log_button)
-        log_actions.addWidget(self.save_log_button)
         logs_layout.addLayout(log_actions)
         tabs.addTab(logs_tab, "Logs")
 
         root.addWidget(tabs, stretch=1)
 
         self.setCentralWidget(central)
+
+    def _build_menu(self) -> None:
+        menu = QMenu("Меню", self)
+        self.menuBar().addMenu(menu)
+
+        api_action = QAction("Настройки API...", self)
+        api_action.triggered.connect(self._open_api_settings)
+        menu.addAction(api_action)
+
+        save_log_action = QAction("Сохранить лог", self)
+        save_log_action.triggered.connect(self._save_log)
+        menu.addAction(save_log_action)
+
+        auto_calc_action = QAction("Авто-расчёт параметров торговли", self)
+        auto_calc_action.setEnabled(False)
+        menu.addAction(auto_calc_action)
+
+        menu.addSeparator()
+
+        exit_action = QAction("Выход", self)
+        exit_action.triggered.connect(self.close)
+        menu.addAction(exit_action)
 
     @Slot()
     def _toggle_connection(self) -> None:
@@ -180,13 +208,14 @@ class MainWindow(QMainWindow):
             self._append_log(f"Failed to load settings: {exc}")
             return
 
+        self._append_log("Loaded settings")
         env = self._load_env()
-        self._append_log("Loaded settings and .env")
 
         self._router = PriceRouter(self._settings)
+        api_credentials = self._resolve_api_credentials(env)
         self._rest = BinanceRestClient(
-            api_key=env.get("BINANCE_KEY", ""),
-            api_secret=env.get("BINANCE_SECRET", ""),
+            api_key=api_credentials.key,
+            api_secret=api_credentials.secret,
         )
         self._http_service = HttpPriceService()
 
@@ -199,7 +228,12 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self._append_log(f"REST init error: {exc}")
 
-        if self._rest and self._router and self._settings:
+        if (
+            self._rest
+            and self._router
+            and self._settings
+            and self._has_valid_api_credentials(api_credentials)
+        ):
             self._trade_executor = TradeExecutor(
                 rest=self._rest,
                 router=self._router,
@@ -209,6 +243,11 @@ class MainWindow(QMainWindow):
             )
             self.start_button.setEnabled(True)
             self.stop_button.setEnabled(True)
+        else:
+            self.start_button.setEnabled(False)
+            self.stop_button.setEnabled(False)
+            if not self._has_valid_api_credentials(api_credentials):
+                self._append_log("[API] missing, trading disabled")
 
         self._start_ws()
         self._http_timer.start(self._settings.http_interval_ms)
@@ -356,7 +395,7 @@ class MainWindow(QMainWindow):
         try:
             with open(path, "w", encoding="utf-8") as handle:
                 handle.write(self.log.toPlainText())
-            self._append_log(f"Log saved: {path}")
+            self._append_log(f"[LOG] saved path={path}")
         except Exception as exc:
             self._append_log(f"Failed to save log: {exc}")
 
@@ -366,23 +405,28 @@ class MainWindow(QMainWindow):
 
     def _append_log(self, message: str) -> None:
         self.log.appendPlainText(message)
-        if self._should_log_api_key_hint(message):
-            self.log.appendPlainText(
-                "[HINT] check BINANCE_KEY/BINANCE_SECRET loaded from .env "
-                "(no quotes, no spaces), ensure Margin trading enabled on key."
-            )
-            self._api_key_hint_logged = True
+        if self._should_warn_invalid_api(message):
+            self._show_auth_warning_once()
 
-    def _should_log_api_key_hint(self, message: str) -> bool:
-        if self._api_key_hint_logged:
+    def _should_warn_invalid_api(self, message: str) -> bool:
+        if self._auth_warning_shown:
             return False
         lowered = message.lower()
-        return "code=-2014" in lowered or "api-key format invalid" in lowered
+        return "invalid api key format (-2014)" in lowered or "code=-2014" in lowered
+
+    def _show_auth_warning_once(self) -> None:
+        if self._auth_warning_shown:
+            return
+        self._auth_warning_shown = True
+        QMessageBox.warning(
+            self,
+            "API ключ недействителен",
+            "[AUTH] invalid api key format (-2014). "
+            "Check API settings in меню -> Настройки API.",
+        )
 
     def _load_settings(self) -> Settings:
-        settings_path = Path(__file__).resolve().parents[2] / "config" / "settings.json"
-        with settings_path.open("r", encoding="utf-8") as handle:
-            payload = json.load(handle)
+        payload = self._config_store.load_settings()
         return Settings(
             symbol=payload.get("symbol", "EURIUSDT"),
             ws_fresh_ms=int(payload.get("ws_fresh_ms", 700)),
@@ -395,6 +439,68 @@ class MainWindow(QMainWindow):
             test_tick_offset=int(payload.get("test_tick_offset", 1)),
             margin_isolated=bool(payload.get("margin_isolated", False)),
         )
+
+    def _load_api_state(self) -> None:
+        creds = self._config_store.load_api_credentials()
+        self._api_credentials = ApiCredentials(
+            key=self._sanitize_api_value(creds.key),
+            secret=self._sanitize_api_value(creds.secret),
+        )
+        if not self._has_valid_api_credentials(self._api_credentials):
+            self._append_log("[API] missing, trading disabled")
+
+    def _resolve_api_credentials(self, env: dict) -> ApiCredentials:
+        if self._has_valid_api_credentials(self._api_credentials):
+            return self._api_credentials
+        env_key = self._sanitize_api_value(env.get("BINANCE_KEY", ""))
+        env_secret = self._sanitize_api_value(env.get("BINANCE_SECRET", ""))
+        return ApiCredentials(key=env_key, secret=env_secret)
+
+    def _has_valid_api_credentials(self, creds: ApiCredentials) -> bool:
+        return self._is_valid_api_value(creds.key) and self._is_valid_api_value(
+            creds.secret
+        )
+
+    @staticmethod
+    def _is_valid_api_value(value: str) -> bool:
+        return len(value) > 20 and " " not in value
+
+    @staticmethod
+    def _sanitize_api_value(value: str) -> str:
+        return value.strip().strip("'\"")
+
+    def _open_api_settings(self) -> None:
+        dialog = ApiSettingsDialog(self, store=self._config_store)
+        dialog.saved.connect(self._on_api_saved)
+        dialog.exec()
+
+    def _on_api_saved(self, key: str, secret: str) -> None:
+        self._api_credentials = ApiCredentials(key=key, secret=secret)
+        if self._rest:
+            self._rest.api_key = key
+            self._rest.api_secret = secret
+        self._append_log("[API] saved ok")
+        self._configure_trading_state()
+
+    def _configure_trading_state(self) -> None:
+        if not self._connected or not self._settings or not self._router or not self._rest:
+            return
+        if not self._has_valid_api_credentials(self._api_credentials):
+            self._trade_executor = None
+            self.start_button.setEnabled(False)
+            self.stop_button.setEnabled(False)
+            self._append_log("[API] missing, trading disabled")
+            return
+        if not self._trade_executor:
+            self._trade_executor = TradeExecutor(
+                rest=self._rest,
+                router=self._router,
+                settings=self._settings,
+                profile=self._symbol_profile,
+                logger=self._append_log,
+            )
+        self.start_button.setEnabled(True)
+        self.stop_button.setEnabled(True)
 
     def _load_env(self) -> dict:
         env_path = Path(__file__).resolve().parents[2] / "config" / ".env"
