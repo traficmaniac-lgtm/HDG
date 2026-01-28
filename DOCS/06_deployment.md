@@ -13,3 +13,10 @@
 - Инструкции по развертыванию.
 - Runbook.
 - Чек-лист релиза.
+
+## Параметры конфигурации v0.7.2 (реальные данные)
+- `stop_loss_ticks=2`
+- `auto_exit_enabled=true`
+- `exit_order_type=LIMIT`
+- `exit_offset_ticks=1`
+- Эти значения хранятся в `config/settings.json` и доступны из GUI.

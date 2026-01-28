@@ -13,3 +13,10 @@
 - Тест-план.
 - Протокол приемочных испытаний.
 - Реестр дефектов.
+
+## Тестовые сценарии v0.7.2 (реальные данные)
+- BUY исполнился → `POSITION_OPEN` → цена ушла на `+take_profit_ticks` тиков → авто SELL (TP).
+- BUY исполнился → `POSITION_OPEN` → цена ушла на `-stop_loss_ticks` тиков → авто SELL (SL).
+- При активном SELL новые TP/SL не выставляются.
+- Логи: `[ALGO] exit_trigger ...`, `[ORDER] SELL placed ...`, `[ORDER] SELL filled ...`,
+  `[PNL] realized ...` присутствуют и содержат `reason=TP|SL`.

@@ -13,3 +13,11 @@
 - SLA/SLO.
 - План релизов.
 - Отчеты по инцидентам.
+
+## Наблюдаемость v0.7.2 (реальные данные)
+- Ключевые события для мониторинга:
+  - `[ALGO] exit_trigger reason=TP|SL ...`
+  - `[ORDER] SELL placed reason=TP|SL type=... price=... qty=... id=...`
+  - `[ORDER] SELL filled reason=TP|SL fill_price=... qty=...`
+  - `[PNL] realized reason=TP|SL pnl_quote=... pnl_bps=...`
+- Эти события фиксируют причину выхода и обеспечивают аудит цикла BUY → SELL.
