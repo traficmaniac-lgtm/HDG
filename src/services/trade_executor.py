@@ -12,7 +12,7 @@ from src.services.price_router import PriceRouter
 
 
 class TradeExecutor:
-    TAG = "TEST_V0.5.2"
+    TAG = "TEST_V0_5_2"
 
     def __init__(
         self,
