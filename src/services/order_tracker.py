@@ -10,6 +10,7 @@ from src.services.binance_rest import BinanceRestClient
 
 class OrderTracker(QObject):
     order_filled = Signal(int, str, float, float, "qint64")
+    order_partial = Signal(int, str, float, float, "qint64")
     order_done = Signal(int, str, "qint64")
 
     def __init__(
@@ -51,6 +52,9 @@ class OrderTracker(QObject):
                     "price": float(order.get("price", 0.0) or 0.0),
                     "qty": float(order.get("qty", 0.0) or 0.0),
                     "status": str(order.get("status", "NEW")).upper(),
+                    "cum_qty": float(order.get("executedQty", 0.0) or 0.0),
+                    "avg_fill_price": 0.0,
+                    "last_status": str(order.get("status", "NEW")).upper(),
                 }
             else:
                 state["side"] = str(order.get("side", state["side"])).upper()
@@ -73,19 +77,49 @@ class OrderTracker(QObject):
                     self._logger(f"[ORDER_TRACKER] poll error: {exc}")
                 continue
             status = str(payload.get("status", entry.get("status", "NEW"))).upper()
+            prev_cum_qty = float(entry.get("cum_qty", 0.0) or 0.0)
+            executed_qty = float(payload.get("executedQty", prev_cum_qty) or prev_cum_qty)
+            cumulative_quote = payload.get("cumulativeQuoteQty", payload.get("cummulativeQuoteQty"))
+            cumulative_quote_qty = (
+                float(cumulative_quote)
+                if cumulative_quote is not None
+                else float(payload.get("cumulativeQuoteQty", 0.0) or 0.0)
+            )
+            avg_fill_price = float(entry.get("avg_fill_price", 0.0) or 0.0)
+            avg_price_payload = float(payload.get("avgPrice", 0.0) or 0.0)
+            if executed_qty > 0:
+                if cumulative_quote_qty > 0:
+                    avg_fill_price = cumulative_quote_qty / executed_qty
+                elif avg_price_payload > 0:
+                    avg_fill_price = avg_price_payload
+            entry["cum_qty"] = executed_qty
+            entry["avg_fill_price"] = avg_fill_price
+            entry["last_status"] = status
             if status != entry.get("status"):
                 entry["status"] = status
                 self._logger(
                     f"[ORDER_TRACKER] status change id={order_id} "
                     f"side={entry.get('side')} status={status}"
                 )
+            if status == "PARTIALLY_FILLED":
+                if executed_qty > 0 and (executed_qty != prev_cum_qty or avg_fill_price):
+                    ts_ms = int(time.time() * 1000)
+                    self.order_partial.emit(
+                        order_id,
+                        entry.get("side", "UNKNOWN"),
+                        executed_qty,
+                        avg_fill_price,
+                        ts_ms,
+                    )
             if status == "FILLED":
                 ts_ms = int(time.time() * 1000)
+                fill_qty = executed_qty if executed_qty > 0 else float(entry.get("qty", 0.0))
+                fill_price = avg_fill_price if avg_fill_price > 0 else float(entry.get("price", 0.0))
                 self.order_filled.emit(
                     order_id,
                     entry.get("side", "UNKNOWN"),
-                    float(entry.get("price", 0.0)),
-                    float(entry.get("qty", 0.0)),
+                    fill_price,
+                    fill_qty,
                     ts_ms,
                 )
                 self._active_orders.pop(order_id, None)
