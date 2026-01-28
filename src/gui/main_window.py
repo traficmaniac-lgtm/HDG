@@ -70,11 +70,12 @@ class MainWindow(QMainWindow):
     request_on_tick = Signal(dict)
     request_set_data_mode = Signal(str)
     request_set_ws_status = Signal(str)
+    request_set_symbol = Signal(str)
 
     def __init__(self) -> None:
         super().__init__()
         self.version = VERSION
-        self.setWindowTitle(f"Хедж-скальпер Directional v{self.version} — BTCUSDT")
+        self.setWindowTitle(f"Хедж-скальпер Directional v{self.version}")
         self.setMinimumSize(1200, 720)
 
         self.settings_store = SettingsStore()
@@ -83,6 +84,7 @@ class MainWindow(QMainWindow):
         self.strategy_params = StrategyParams()
         self.state_machine = BotStateMachine()
         self.market_tick = MarketTick()
+        self.current_symbol = ""
         self.connected = False
         self.data_source = "WS"
         self.data_mode = MarketDataMode.HYBRID
@@ -133,11 +135,7 @@ class MainWindow(QMainWindow):
         self.log_bus.log("INFO", "INFO", "APP start", version=self.version)
 
         self.market_data = MarketDataService()
-        self.ws_thread = MarketDataThread("btcusdt", market_data=self.market_data)
-        self.ws_thread.price_update.connect(self.on_price_update)
-        self.ws_thread.price_update.connect(self.request_on_tick)
-        self.ws_thread.depth_update.connect(self.on_depth_update)
-        self.ws_thread.status_update.connect(self.on_ws_status)
+        self.ws_thread: Optional[MarketDataThread] = None
 
         self.engine_thread = QThread(self)
         self.trade_engine = TradeEngine(market_data=self.market_data)
@@ -165,8 +163,8 @@ class MainWindow(QMainWindow):
         self.margin_usdt_borrowed = 0.0
         self.margin_usdt_interest = 0.0
         self.margin_usdt_net = 0.0
-        self.margin_btc_free = 0.0
-        self.margin_btc_borrowed = 0.0
+        self.margin_base_free = 0.0
+        self.margin_base_borrowed = 0.0
         self.spot_usdt_free = 0.0
 
         self._build_ui()
@@ -260,7 +258,7 @@ class MainWindow(QMainWindow):
         layout.setSpacing(6)
 
         self.symbol_combo = QComboBox()
-        self.symbol_combo.addItems(["BTCUSDT"])
+        self.symbol_combo.addItems(["BTCUSDT", "EURIUSDT"])
         layout.addWidget(QLabel("Символ"))
         layout.addWidget(self.symbol_combo)
 
@@ -373,6 +371,7 @@ class MainWindow(QMainWindow):
         state_layout = QGridLayout(self.state_panel)
         state_layout.setContentsMargins(10, 10, 10, 10)
 
+        self.symbol_label = QLabel("symbol: —")
         self.state_label = QLabel("Состояние: IDLE")
         self.active_cycle_label = QLabel("активный цикл: false")
         self.cycle_id_label = QLabel("цикл_id: 0")
@@ -386,9 +385,10 @@ class MainWindow(QMainWindow):
         self.last_action_label = QLabel("last_action: —")
         self.phase_seq_label = QLabel("phase_seq: 0")
 
-        state_layout.addWidget(self.state_label, 0, 0)
-        state_layout.addWidget(self.active_cycle_label, 0, 1)
-        state_layout.addWidget(self.cycle_id_label, 0, 2)
+        state_layout.addWidget(self.symbol_label, 0, 0)
+        state_layout.addWidget(self.state_label, 0, 1)
+        state_layout.addWidget(self.active_cycle_label, 0, 2)
+        state_layout.addWidget(self.cycle_id_label, 0, 3)
         state_layout.addWidget(self.cycle_start_label, 1, 0)
         state_layout.addWidget(self.cycle_elapsed_label, 1, 1)
         state_layout.addWidget(self.inflight_entry_label, 2, 0)
@@ -461,7 +461,7 @@ class MainWindow(QMainWindow):
         self.sim_exit_label = QLabel("выход_mid: —")
         self.sim_reason_label = QLabel("reason: —")
         self.sim_ws_age_label = QLabel("ws_age_ms: —")
-        self.sim_source_label = QLabel("source: —")
+        self.sim_source_label = QLabel("effective_source: —")
         self.sim_condition_label = QLabel("условие: —")
         self.sim_tick_label = QLabel("tick_rate: —")
         self.sim_impulse_label = QLabel("impulse_bps: —")
@@ -568,6 +568,7 @@ class MainWindow(QMainWindow):
         self.parameters_tab.apply_params_button.clicked.connect(self.apply_params)
         self.parameters_tab.reset_params_button.clicked.connect(self.reset_params)
         self.source_mode_combo.currentIndexChanged.connect(self.on_source_mode_changed)
+        self.symbol_combo.currentTextChanged.connect(self.on_symbol_changed)
         if DEBUG:
             self.add_test_trade_button.clicked.connect(self.add_test_trade)
         self.save_logs_button.clicked.connect(self.save_logs_to_file)
@@ -591,6 +592,7 @@ class MainWindow(QMainWindow):
         self.request_end_cooldown.connect(self.trade_engine.end_cooldown)
         self.request_set_data_mode.connect(self.trade_engine.set_data_mode)
         self.request_set_ws_status.connect(self.trade_engine.set_ws_status)
+        self.request_set_symbol.connect(self.trade_engine.set_symbol)
         self.request_ui_heartbeat.connect(
             self.trade_engine.update_ui_heartbeat, Qt.ConnectionType.DirectConnection
         )
@@ -637,6 +639,9 @@ class MainWindow(QMainWindow):
         self._auto_connect()
 
     def on_start_cycle(self) -> None:
+        if not self.current_symbol:
+            QMessageBox.warning(self, "Символ", "Выберите торговую пару.")
+            return
         if not self._can_run():
             QMessageBox.warning(self, "Защита", "Нет доступа для старта авто-торговли.")
             return
@@ -787,6 +792,10 @@ class MainWindow(QMainWindow):
         self.parameters_tab.max_cycles_spin.setValue(self.strategy_params.max_cycles)
 
     def on_price_update(self, payload: dict) -> None:
+        payload_symbol = payload.get("symbol")
+        if payload_symbol and self.current_symbol:
+            if str(payload_symbol).upper() != self.current_symbol:
+                return
         self.market_tick.bid = payload["bid"]
         self.market_tick.ask = payload["ask"]
         self.market_tick.mid = payload["mid"]
@@ -803,6 +812,10 @@ class MainWindow(QMainWindow):
         self._update_ui_state()
 
     def on_depth_update(self, payload: dict) -> None:
+        payload_symbol = payload.get("symbol")
+        if payload_symbol and self.current_symbol:
+            if str(payload_symbol).upper() != self.current_symbol:
+                return
         self.orderbook.apply_snapshot(payload["bids"], payload["asks"])
         self.orderbook_ready = self.orderbook.is_ready()
         self._update_ui_state()
@@ -822,6 +835,13 @@ class MainWindow(QMainWindow):
         self.request_set_data_mode.emit(self.data_mode.value)
         self._update_http_timer()
         self._update_ui_state()
+
+    def on_symbol_changed(self, symbol: str) -> None:
+        if self.run_mode or self.state_machine.active_cycle:
+            QMessageBox.warning(self, "Символ", "Нельзя менять символ во время цикла.")
+            self._restore_symbol_selection()
+            return
+        self._apply_symbol(symbol, refresh=True)
 
     def _update_http_timer(self) -> None:
         if self.data_mode == MarketDataMode.WS_ONLY:
@@ -1019,12 +1039,76 @@ class MainWindow(QMainWindow):
         if self.connected and self.margin_permission_ok:
             self.request_attempt_entry.emit()
 
+    def _restore_symbol_selection(self) -> None:
+        if not self.current_symbol:
+            return
+        index = self.symbol_combo.findText(self.current_symbol)
+        if index >= 0:
+            self.symbol_combo.blockSignals(True)
+            self.symbol_combo.setCurrentIndex(index)
+            self.symbol_combo.blockSignals(False)
+
+    def _apply_symbol(self, symbol: str, refresh: bool) -> None:
+        normalized = symbol.upper().strip()
+        if not normalized:
+            return
+        if normalized == self.current_symbol and self.ws_thread:
+            return
+        self.current_symbol = normalized
+        self.market_data.set_symbol(normalized)
+        self.request_set_symbol.emit(normalized)
+        self._reset_market_state()
+        self._update_http_timer()
+        self._create_ws_thread(normalized)
+        if self.connected:
+            self.start_ws_thread()
+            if refresh:
+                self.request_exchange_info.emit()
+                self.request_orderbook_snapshot.emit()
+        self._update_window_title()
+        self.log_bus.log("INFO", "INFO", "Symbol selected", symbol=normalized)
+        self._update_ui_state()
+
+    def _reset_market_state(self) -> None:
+        self.market_tick = MarketTick()
+        self.orderbook = OrderBook()
+        self.orderbook_ready = False
+        self.effective_source = "NONE"
+        self.effective_age_ms = None
+        self.ws_age_ms = None
+        self.http_age_ms = None
+        self.data_stale = True
+        self.waiting_for_data = False
+        self.ws_status = "DISCONNECTED"
+
+    def _update_window_title(self) -> None:
+        suffix = f" — {self.current_symbol}" if self.current_symbol else ""
+        self.setWindowTitle(f"Хедж-скальпер Directional v{self.version}{suffix}")
+
+    def _create_ws_thread(self, symbol: str) -> None:
+        if self.ws_thread:
+            if self.ws_thread.isRunning():
+                self.ws_thread.stop()
+                self.ws_thread.wait(2000)
+            self.ws_thread.deleteLater()
+        self.ws_thread = MarketDataThread(symbol, market_data=self.market_data)
+        self.ws_thread.price_update.connect(self.on_price_update)
+        self.ws_thread.price_update.connect(self.request_on_tick)
+        self.ws_thread.depth_update.connect(self.on_depth_update)
+        self.ws_thread.status_update.connect(self.on_ws_status)
+
     def start_ws_thread(self) -> None:
+        if not self.ws_thread:
+            if not self.current_symbol:
+                return
+            self._create_ws_thread(self.current_symbol)
         if self.ws_thread.isRunning():
             return
         self.ws_thread.start()
 
     def stop_ws_thread(self) -> None:
+        if not self.ws_thread:
+            return
         if self.ws_thread.isRunning():
             self.ws_thread.stop()
             self.ws_thread.wait(2000)
@@ -1038,10 +1122,21 @@ class MainWindow(QMainWindow):
             self.spot_usdt_free = free
             self.spot_balance_label.setText(f"USDT (Spot): свободно={free:,.2f}")
 
+    def _base_asset(self) -> str:
+        symbol = self.current_symbol
+        if symbol.endswith("USDT"):
+            return symbol[: -len("USDT")]
+        return symbol
+
     def _update_balance_from_margin_account(self, account: dict) -> None:
         assets = account.get("userAssets", [])
         usdt = next((item for item in assets if item.get("asset") == "USDT"), None)
-        btc = next((item for item in assets if item.get("asset") == "BTC"), None)
+        base_asset = self._base_asset()
+        base_entry = (
+            next((item for item in assets if item.get("asset") == base_asset), None)
+            if base_asset
+            else None
+        )
         if usdt:
             self.margin_usdt_free = float(usdt.get("free", 0.0))
             self.margin_usdt_borrowed = float(usdt.get("borrowed", 0.0))
@@ -1053,9 +1148,9 @@ class MainWindow(QMainWindow):
                 f"долг={self.margin_usdt_borrowed:,.2f} "
                 f"net={self.margin_usdt_net:,.2f}"
             )
-        if btc:
-            self.margin_btc_free = float(btc.get("free", 0.0))
-            self.margin_btc_borrowed = float(btc.get("borrowed", 0.0))
+        if base_entry:
+            self.margin_base_free = float(base_entry.get("free", 0.0))
+            self.margin_base_borrowed = float(base_entry.get("borrowed", 0.0))
 
     def _update_market_labels(self) -> None:
         self.mid_display.display(f"{self.market_tick.mid:.2f}")
@@ -1124,7 +1219,7 @@ class MainWindow(QMainWindow):
         )
         self.sim_reason_label.setText(f"reason: {reason}")
         self.sim_ws_age_label.setText(f"ws_age_ms: {ws_age}")
-        self.sim_source_label.setText(f"source: {self.effective_source}")
+        self.sim_source_label.setText(f"effective_source: {self.effective_source}")
         tick_rate = "—" if self.sim_tick_rate is None else f"{self.sim_tick_rate:.0f}"
         impulse = "—" if self.sim_impulse_bps is None else f"{self.sim_impulse_bps:.4f}"
         spread = "—" if self.sim_spread_bps is None else f"{self.sim_spread_bps:.2f}"
@@ -1152,6 +1247,8 @@ class MainWindow(QMainWindow):
         state_value = self.state_machine.state.value
         if self.run_mode and self.waiting_for_data:
             state_value = "WAIT_DATA"
+        symbol_text = self.current_symbol or "—"
+        self.symbol_label.setText(f"symbol: {symbol_text}")
         self.state_label.setText(
             f"Режим: {mode} | Состояние: {state_value}"
         )
@@ -1202,6 +1299,9 @@ class MainWindow(QMainWindow):
         self.data_label.setStyleSheet(color)
         self.account_data_label.setText(f"Данные: {data_status}")
         self.account_data_label.setStyleSheet(color)
+
+        can_change_symbol = not self.run_mode and not self.state_machine.active_cycle
+        self.symbol_combo.setEnabled(can_change_symbol)
 
         self.start_cycle_button.setEnabled(self._can_run() and not self.run_mode)
         self.stop_button.setEnabled(
@@ -1373,6 +1473,7 @@ class MainWindow(QMainWindow):
     def _initialize_defaults(self) -> None:
         self._load_strategy_params()
         self._sync_params_to_form()
+        self._apply_symbol(self.symbol_combo.currentText(), refresh=False)
         self.source_mode_combo.setCurrentIndex(
             self.source_mode_combo.findData(self.data_mode.value)
         )

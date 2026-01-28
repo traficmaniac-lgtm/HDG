@@ -18,6 +18,7 @@ class MarketDataService:
         http_hold_ms: int = 1500,
         ws_recovery_ticks: int = 3,
     ) -> None:
+        self._symbol: Optional[str] = None
         self.ws_fresh_ms = ws_fresh_ms
         self.http_fresh_ms = http_fresh_ms
         self.http_hold_ms = http_hold_ms
@@ -38,6 +39,30 @@ class MarketDataService:
         self._prev_ws_mid_raw: Optional[Decimal] = None
         self._last_ws_mid_raw: Optional[Decimal] = None
 
+    def set_symbol(self, symbol: str) -> None:
+        normalized = symbol.upper().strip()
+        with self._lock:
+            if self._symbol == normalized:
+                return
+            self._symbol = normalized
+            self._snapshot = MarketSnapshot()
+            self._last_ws_tick = None
+            self._last_http_tick = None
+            self._last_effective_tick = None
+            self._last_effective_source = "NONE"
+            self._last_source_change_ms = time.monotonic() * 1000
+            self._ws_fresh_streak = 0
+            self._http_hold_until_ms = 0.0
+            self._ws_connected = False
+            self._ws_rx_times.clear()
+            self._ws_mid_buffer.clear()
+            self._prev_ws_mid_raw = None
+            self._last_ws_mid_raw = None
+
+    def get_symbol(self) -> Optional[str]:
+        with self._lock:
+            return self._symbol
+
     def update_tick(self, payload: dict[str, Any]) -> None:
         source = str(payload.get("source", "WS"))
         rx_time_ms = payload.get("rx_time_ms")
@@ -46,6 +71,9 @@ class MarketDataService:
             rx_time_ms = now_ms
             payload["rx_time_ms"] = rx_time_ms
         with self._lock:
+            payload_symbol = payload.get("symbol")
+            if self._symbol and payload_symbol and str(payload_symbol).upper() != self._symbol:
+                return
             if source == "WS":
                 self._last_ws_tick = dict(payload)
                 self._snapshot.last_ws_tick_ms = float(rx_time_ms)
