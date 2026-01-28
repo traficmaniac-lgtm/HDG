@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -23,8 +24,27 @@ class ConfigStore:
         return self._settings_path
 
     def load_settings(self) -> dict:
-        with self._settings_path.open("r", encoding="utf-8") as handle:
-            return json.load(handle)
+        try:
+            with self._settings_path.open("r", encoding="utf-8") as handle:
+                return json.load(handle)
+        except FileNotFoundError:
+            return {}
+        except json.JSONDecodeError:
+            self._backup_corrupt_settings()
+            return {}
+
+    def _backup_corrupt_settings(self) -> None:
+        if not self._settings_path.exists():
+            return
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        backup_path = self._settings_path.with_name(
+            f"{self._settings_path.stem}.invalid-{timestamp}{self._settings_path.suffix}"
+        )
+        try:
+            content = self._settings_path.read_text(encoding="utf-8", errors="replace")
+            backup_path.write_text(content, encoding="utf-8")
+        except OSError:
+            return
 
     def save_settings(self, payload: dict) -> None:
         with self._settings_path.open("w", encoding="utf-8") as handle:
