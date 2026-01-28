@@ -1,23 +1,17 @@
 # Architecture
 
 ## Общая архитектура модулей
-- **GUI**: `MainWindow`, диалоги настроек, управление кнопками CONNECT/START/STOP.
-- **Core**: модели данных (`Settings`, `PriceState`, `HealthState`, `SymbolProfile`), версия.
-- **Services**:
-  - `WsPriceWorker` — WS поток `bookTicker`.
-  - `HttpPriceService` — HTTP `bookTicker` fallback.
-  - `PriceRouter` — выбор лучшей котировки и расчёт метрик свежести.
-  - `BinanceRestClient` — REST/SAPI доступ к Binance.
-  - `TradeExecutor` — размещение/закрытие ордеров, позиция, PnL.
-- **Binance**: внешние API (WS/HTTP/SAPI).
+- **MarketData**: поток котировок из WS/HTTP, метрики свежести, выбор источника.
+- **TradeEngine**: жизненный цикл ордеров BUY/SELL, позиция, базовый PnL.
+- **Margin**: настройки режима, sideEffectType, проверки доступности borrow.
+- **GUI**: пользовательское управление (CONNECT/START/STOP) и отображение состояния.
 
-## Потоки данных
-- **WS**: Binance WS → `WsPriceWorker` → `PriceRouter` → `PriceState`/`HealthState` → GUI.
-- **HTTP**: GUI таймер → `HttpPriceService` → `PriceRouter` → `PriceState`/`HealthState` → GUI.
-- **Orders**: GUI → `TradeExecutor` → `BinanceRestClient` → Binance SAPI → `sync_open_orders()` → GUI.
+## Границы ответственности модулей
+- **MarketData** отвечает только за получение/валидацию котировок и возраст данных.
+- **TradeEngine** отвечает за торговые действия и локальные статусы ордеров/позиции.
+- **Margin** отвечает за правила работы с Cross Margin и sideEffectType.
+- **GUI** инициирует действия и отображает данные, но не принимает решений.
 
-## Границы ответственности
-- GUI инициирует действия и отображает состояние, но не принимает торговые решения.
-- `PriceRouter` отвечает только за источник котировок и метрики свежести.
-- `TradeExecutor` отвечает за торговые действия и расчёты PnL.
-- `BinanceRestClient` — транспортный слой для REST/SAPI без бизнес-логики.
+## Core vs вспомогательное
+- **Core**: MarketData, TradeEngine, Margin — это источник истины для логики и статусов.
+- **Вспомогательное**: GUI, внешние API (Binance WS/HTTP/SAPI), конфиг/логирование.

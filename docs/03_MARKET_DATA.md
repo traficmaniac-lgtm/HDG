@@ -1,24 +1,25 @@
 # Market Data
 
-## Источники
-- **WS**: `wss://stream.binance.com:9443/ws/{symbol}@bookTicker`.
-- **HTTP fallback**: `https://api.binance.com/api/v3/ticker/bookTicker`.
+## WS vs HTTP fallback
+- Основной источник: WS `bookTicker`.
+- Резервный источник: HTTP `bookTicker`.
 
-## Возраст и источник
-- `ws_age_ms` и `http_age_ms` — возраст последнего апдейта для каждого источника.
-- `source`: `WS`, `HTTP`, `NONE`.
-- `mid_age_ms` — возраст последней рассчитанной mid цены.
-- `last_switch_reason`: `WS fresh`, `HTTP fallback`, `No fresh data`.
+## Метрики возраста
+- `ws_age_ms` — возраст последнего WS-апдейта.
+- `http_age_ms` — возраст последнего HTTP-апдейта.
+- `mid_age_ms` — возраст последней рассчитанной mid-цены.
 
-## Правила валидности котировок
-Котировка валидна, если:
-- **WS**: `ws_age_ms <= ws_fresh_ms` и есть bid/ask.
-- **HTTP**: `http_age_ms <= http_fresh_ms` и есть bid/ask.
-- иначе `source = NONE`.
+## Правила валидности цены
+Котировка считается валидной, если:
+- **WS**: `ws_age_ms <= ws_fresh_ms` и есть `bid/ask`.
+- **HTTP**: `http_age_ms <= http_fresh_ms` и есть `bid/ask`.
+- Если нет валидных источников, источник = `NONE`.
 
-## Mid price
-- `mid = (bid + ask) / 2`, если выбранный источник валиден и есть bid/ask.
-- `mid = None`, если нет свежих данных или bid/ask отсутствуют.
+## Когда mid считается None
+- Нет валидной котировки (оба источника не свежие).
+- Отсутствует `bid` или `ask` у выбранного источника.
 
-## Дополнительно
-- `ws_connected` — статус WS-соединения из воркера, отображается отдельно от свежести данных.
+## Причины HTTP fallback
+- WS не подключён или потеря соединения.
+- WS-данные устарели (`ws_age_ms > ws_fresh_ms`).
+- WS-данные неполные (нет `bid/ask`).
