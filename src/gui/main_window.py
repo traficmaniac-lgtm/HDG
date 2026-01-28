@@ -1087,10 +1087,14 @@ class MainWindow(QMainWindow):
 
     def _create_ws_thread(self, symbol: str) -> None:
         if self.ws_thread:
-            if self.ws_thread.isRunning():
-                self.ws_thread.stop()
-                self.ws_thread.wait(2000)
-            self.ws_thread.deleteLater()
+            old_thread = self.ws_thread
+            if old_thread.isRunning():
+                old_thread.stop()
+                old_thread.wait(2000)
+            if old_thread.isRunning():
+                old_thread.finished.connect(old_thread.deleteLater)
+            else:
+                old_thread.deleteLater()
         self.ws_thread = MarketDataThread(symbol, market_data=self.market_data)
         self.ws_thread.price_update.connect(self.on_price_update)
         self.ws_thread.price_update.connect(self.request_on_tick)
