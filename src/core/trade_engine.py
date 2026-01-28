@@ -4,8 +4,9 @@ import sys
 import threading
 import time
 import traceback
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Optional
 
 from PySide6.QtCore import QObject, Signal, Slot
@@ -37,7 +38,8 @@ class TradeEngine(QObject):
         self._http_fallback = HttpFallback()
         self._market_data = market_data or MarketDataService()
         self._state_machine = BotStateMachine()
-        self._strategy = StrategyParams()
+        self._base_strategy = StrategyParams()
+        self._strategy = replace(self._base_strategy)
         self._symbol = ""
         self._base_asset = ""
         self._symbol_filters = SymbolFilters()
@@ -97,7 +99,9 @@ class TradeEngine(QObject):
 
     @Slot(dict)
     def set_strategy(self, payload: dict) -> None:
-        self._strategy = StrategyParams(**payload)
+        self._base_strategy = StrategyParams(**payload)
+        self._strategy = replace(self._base_strategy)
+        self._apply_symbol_defaults()
         self._cycle.update_strategy(self._strategy)
         self._max_cycles = self._strategy.max_cycles
         self._emit_cycle_state()
@@ -150,6 +154,9 @@ class TradeEngine(QObject):
         self._symbol_filters = SymbolFilters()
         self._cycle.update_filters(self._symbol_filters)
         self._market_data.set_symbol(self._symbol)
+        self._strategy = replace(self._base_strategy)
+        self._apply_symbol_defaults()
+        self._cycle.update_strategy(self._strategy)
         self._emit_cycle_state(force=True)
 
     @Slot(bool)
@@ -235,8 +242,27 @@ class TradeEngine(QObject):
                 self._symbol_filters.tick_size = float(price_filter.get("tickSize", 0.0))
             except ValueError:
                 self._symbol_filters.tick_size = 0.0
+        self._symbol_filters.bps_per_tick = self._compute_bps_per_tick()
         self._cycle.update_filters(self._symbol_filters)
         self.status_update.emit({"exchange_info": info})
+
+    def _compute_bps_per_tick(self) -> float:
+        tick_size = self._symbol_filters.tick_size
+        if tick_size <= 0:
+            return 0.0
+        mid_raw = self._market_data.get_mid_raw()
+        if mid_raw is None or mid_raw <= 0:
+            return 0.0
+        return float((Decimal(str(tick_size)) / mid_raw) * Decimal("10000"))
+
+    def _apply_symbol_defaults(self) -> None:
+        if self._symbol != "EURIUSDT":
+            return
+        self._strategy.noise_ticks = 1
+        self._strategy.max_spread_ticks = 2
+        self._strategy.detect_window_ticks = 4
+        self._strategy.min_tick_rate = 1
+        self._strategy.use_impulse_filter = False
 
     @Slot()
     def load_orderbook_snapshot(self) -> None:

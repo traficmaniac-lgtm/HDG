@@ -63,7 +63,7 @@ class DirectionalCycle:
         self._market_data = market_data
         self._last_tick: Optional[dict[str, Any]] = None
         self._detect_mid_buffer: Deque[Decimal] = deque(maxlen=5)
-        self._detect_window_ticks = max(5, int(self._strategy.detect_window_ticks))
+        self._detect_window_ticks = max(1, int(self._strategy.detect_window_ticks))
         self._cycle_start: Optional[datetime] = None
         self._entry_mid: Optional[Decimal] = None
         self._entry_qty: Optional[float] = None
@@ -287,7 +287,7 @@ class DirectionalCycle:
 
     def update_strategy(self, strategy: StrategyParams) -> None:
         self._strategy = strategy
-        self._detect_window_ticks = max(5, int(self._strategy.detect_window_ticks))
+        self._detect_window_ticks = max(1, int(self._strategy.detect_window_ticks))
         self._market_data.set_detect_window_ticks(self._detect_window_ticks)
         self._detect_mid_buffer = deque(
             list(self._detect_mid_buffer)[-self._detect_window_ticks :],
@@ -344,15 +344,21 @@ class DirectionalCycle:
             )
             return
         if self._state_machine.state == BotState.COOLDOWN:
-            self._log_skip("cooldown")
+            self._emit_log(
+                "GUARD",
+                "INFO",
+                "[GUARD] entry_blocked",
+                reason="cooldown",
+                state=self._state_machine.state.value,
+            )
             return
         if self._state_machine.state != BotState.DETECT:
             return
         if not self._market_data.get_last_ws_tick() and not self._market_data.get_last_http_tick():
-            self._log_skip("no_tick")
+            self._log_skip("data_stale")
             return
         if not self._filters.step_size or not self._filters.min_qty:
-            self._log_skip("filters_missing")
+            self._log_skip("data_stale")
             return
         if not self._is_flat(force=True):
             self._emit_log(
@@ -742,14 +748,11 @@ class DirectionalCycle:
         if elapsed > detect_timeout_ms and len(self._detect_mid_buffer) >= self._detect_window_ticks:
             self._handle_detect_timeout()
             return
-        delta_mid_bps = None
+        delta_window_ticks = None
         if len(self._detect_mid_buffer) >= self._detect_window_ticks:
             mid_first = self._detect_mid_buffer[0]
             mid_last = self._detect_mid_buffer[-1]
-            if self._entry_mid and self._entry_mid > 0:
-                delta_mid_bps = float(
-                    (mid_last - mid_first) / self._entry_mid * Decimal("10000")
-                )
+            delta_window_ticks = self._round_ticks(mid_last - mid_first)
         now = time.monotonic()
         if now - self._last_detect_sample_log_ts > 0.3:
             mid_disp = self._format_decimal(mid_now)
@@ -761,7 +764,7 @@ class DirectionalCycle:
                 mid_disp=mid_disp,
                 long_raw=f"{long_raw:.4f}",
                 short_raw=f"{short_raw:.4f}",
-                delta_window_bps=f"{delta_mid_bps:.4f}" if delta_mid_bps is not None else None,
+                delta_window_ticks=delta_window_ticks,
             )
             self._last_detect_sample_log_ts = now
         if len(self._detect_mid_buffer) < self._detect_window_ticks:
@@ -1591,37 +1594,12 @@ class DirectionalCycle:
 
     def _entry_filter_reason(self) -> Optional[str]:
         metrics = self._compute_entry_metrics()
-        commission_bps = float(self._strategy.fee_total_bps)
-        raw_bps = float(metrics["impulse_bps"])
-        raw_bps_min_enter = commission_bps * 1.5
-        if commission_bps == 7:
-            raw_bps_min_enter = max(raw_bps_min_enter, 11.0)
-        expected_net_bps = raw_bps - commission_bps
-        if abs(raw_bps) <= commission_bps:
-            return "noise_zone"
-        if raw_bps < raw_bps_min_enter:
-            return "raw_bps_min"
-        if expected_net_bps <= 0:
-            return "no_edge"
         if metrics["data_stale"]:
             return "data_stale"
-        if metrics["spread_bps"] > self._strategy.max_spread_bps:
+        if metrics["blocked_by_noise"]:
+            return "noise_zone"
+        if metrics["spread_ticks"] > self._max_spread_ticks(metrics["bps_per_tick"]):
             return "spread"
-        if metrics["tick_rate"] < self._strategy.min_tick_rate:
-            return "tick_rate"
-        if self._strategy.use_impulse_filter and self._strategy.impulse_min_bps > 0:
-            impulse_reason: Optional[str] = None
-            if not metrics["impulse_ready"]:
-                impulse_reason = "wait_ticks"
-            elif metrics["impulse_bps"] < self._strategy.impulse_min_bps:
-                impulse_reason = "impulse"
-            if impulse_reason:
-                if self._should_degrade_impulse(metrics):
-                    self._maybe_log_impulse_degraded(metrics)
-                else:
-                    return impulse_reason
-        if metrics["mid"] > 0 and not self._leverage_ok(metrics["mid"]):
-            return "leverage_limit"
         return None
 
     def _should_degrade_impulse(self, metrics: dict[str, float | bool]) -> bool:
@@ -1636,7 +1614,7 @@ class DirectionalCycle:
             return False
         if metrics["data_stale"]:
             return False
-        if metrics["spread_bps"] > self._strategy.max_spread_bps:
+        if metrics["spread_ticks"] > self._max_spread_ticks(metrics["bps_per_tick"]):
             return False
         if metrics["tick_rate"] < self._strategy.min_tick_rate:
             return False
@@ -1668,26 +1646,24 @@ class DirectionalCycle:
         bid = float(tick.get("bid", 0.0))
         ask = float(tick.get("ask", 0.0))
         mid = float(tick.get("mid", 0.0))
-        spread = float(tick.get("spread_bps", 0.0))
+        spread = 0.0
+        spread_ticks = 0
+        tick_size = self._filters.tick_size
+        bps_per_tick = float(self._filters.bps_per_tick)
+        if bid > 0 and ask > 0 and tick_size > 0:
+            spread_ticks = self._round_ticks(self._to_decimal(ask) - self._to_decimal(bid))
+            spread = spread_ticks * bps_per_tick
         now_ms = time.monotonic() * 1000
         rx_count_1s = self._market_data.get_ws_rx_count_1s(now_ms=now_ms)
         tick_rate = rx_count_1s
         impulse_bps = 0.0
-        ref_mid = 0.0
-        delta_mid = 0.0
+        delta_ticks = 0
         impulse_ready = False
         prev_mid_raw, last_mid_raw = self._market_data.get_ws_mid_raws()
-        if prev_mid_raw is not None and last_mid_raw is not None:
+        if prev_mid_raw is not None and last_mid_raw is not None and tick_size > 0:
             impulse_ready = True
-            ref_mid_raw = prev_mid_raw
-            mid_now_raw = last_mid_raw
-            if ref_mid_raw > 0:
-                delta_raw = mid_now_raw - ref_mid_raw
-                impulse_bps = float(
-                    (abs(delta_raw) / ref_mid_raw) * Decimal("10000")
-                )
-                ref_mid = float(ref_mid_raw)
-                delta_mid = float(delta_raw)
+            delta_ticks = self._round_ticks(last_mid_raw - prev_mid_raw)
+            impulse_bps = delta_ticks * bps_per_tick
         snapshot = self._market_data.get_snapshot()
         ws_age_ms = snapshot.ws_age_ms
         http_age_ms = snapshot.http_age_ms
@@ -1710,17 +1686,21 @@ class DirectionalCycle:
                     "[TICKRATE] forced_alive",
                     ws_age_ms=ws_age_ms,
                 )
+        noise_ticks = max(0, int(self._strategy.noise_ticks))
         return {
             "spread_bps": spread,
+            "spread_ticks": spread_ticks,
             "tick_rate": tick_rate,
             "rx_count_1s": rx_count_1s,
             "impulse_bps": impulse_bps,
             "impulse_ready": impulse_ready,
-            "ref_mid": ref_mid,
-            "delta_mid": delta_mid,
+            "delta_ticks": delta_ticks,
             "mid": mid,
             "bid": bid,
             "ask": ask,
+            "bps_per_tick": bps_per_tick,
+            "noise_ticks": noise_ticks,
+            "blocked_by_noise": abs(delta_ticks) <= noise_ticks,
             "ws_age_ms": ws_age_ms,
             "http_age_ms": http_age_ms,
             "effective_source": effective_source,
@@ -1732,6 +1712,18 @@ class DirectionalCycle:
         if isinstance(value, Decimal):
             return value
         return Decimal(str(value))
+
+    def _round_ticks(self, delta: Decimal) -> int:
+        tick_dec = self._tick_size_decimal()
+        if tick_dec is None:
+            return 0
+        return int(round(delta / tick_dec))
+
+    def _tick_size_decimal(self) -> Optional[Decimal]:
+        tick_size = self._filters.tick_size
+        if tick_size <= 0:
+            return None
+        return Decimal(str(tick_size))
 
     def _float_from_decimal(self, value: Optional[Decimal]) -> Optional[float]:
         if value is None:
@@ -1817,11 +1809,26 @@ class DirectionalCycle:
         to_value = self._to_decimal(to_mid)
         if from_value <= 0 or to_value <= 0:
             return 0.0
+        bps_per_tick = float(self._filters.bps_per_tick)
+        if bps_per_tick <= 0:
+            return 0.0
+        delta_ticks = self._round_ticks(to_value - from_value)
         if side == "LONG":
-            return float((to_value - from_value) / from_value * Decimal("10000"))
+            return delta_ticks * bps_per_tick
         if side == "SHORT":
-            return float((from_value - to_value) / from_value * Decimal("10000"))
+            return -delta_ticks * bps_per_tick
         return 0.0
+
+    def _max_spread_ticks(self, bps_per_tick: float) -> int:
+        max_ticks = max(0, int(self._strategy.max_spread_ticks))
+        if max_ticks > 0:
+            return max_ticks
+        if bps_per_tick <= 0:
+            return 0
+        max_spread_bps = float(self._strategy.max_spread_bps)
+        if max_spread_bps <= 0:
+            return 0
+        return int(round(max_spread_bps / bps_per_tick))
 
     def _order_params(
         self, side: str, bid: Optional[float] = None, ask: Optional[float] = None
@@ -2406,44 +2413,16 @@ class DirectionalCycle:
         if reason == "data_stale":
             self._log_wait_data(metrics)
         self._maybe_warn_impulse_block(now, reason)
-        skip_flags = []
-        if metrics["data_stale"]:
-            skip_flags.append("data")
-        if metrics["spread_bps"] > self._strategy.max_spread_bps:
-            skip_flags.append("spread")
-        if metrics["tick_rate"] < self._strategy.min_tick_rate:
-            skip_flags.append("tick")
-        if self._strategy.use_impulse_filter and self._strategy.impulse_min_bps > 0:
-            if not metrics["impulse_ready"] or metrics["impulse_bps"] < self._strategy.impulse_min_bps:
-                skip_flags.append("impulse")
-        if reason == "leverage_limit":
-            skip_flags.append("leverage")
         self._emit_log(
             "TRADE",
             "INFO",
             "SKIP entry",
             reason=reason,
             blocked_by=reason,
-            skip_flags=skip_flags,
-            spread_bps=f"{metrics['spread_bps']:.2f}",
-            spread_limit=self._strategy.max_spread_bps,
-            tick_rate=metrics["tick_rate"],
-            tick_rate_limit=self._strategy.min_tick_rate,
-            impulse_bps=f"{metrics['impulse_bps']:.2f}",
-            impulse_limit=self._strategy.impulse_min_bps,
-            ref_mid=f"{metrics['ref_mid']:.2f}",
-            delta_mid=f"{metrics['delta_mid']:.6f}",
-            mid=f"{metrics['mid']:.2f}",
-            bid=f"{metrics['bid']:.2f}",
-            ask=f"{metrics['ask']:.2f}",
-            ws_age_ms=metrics["ws_age_ms"],
-            ws_connected=metrics["ws_connected"],
-            rx_count_1s=metrics["rx_count_1s"],
-            http_age_ms=metrics["http_age_ms"],
-            effective_source=metrics["effective_source"],
-            ws_fresh_ms=self._market_data.ws_fresh_ms,
-            http_fresh_ms=self._market_data.http_fresh_ms,
-            data_stale=metrics["data_stale"],
+            ticks_delta=metrics["delta_ticks"],
+            spread_ticks=metrics["spread_ticks"],
+            noise_ticks=metrics["noise_ticks"],
+            bps_per_tick=metrics["bps_per_tick"],
         )
 
     def _maybe_warn_impulse_block(self, now: float, reason: str) -> None:

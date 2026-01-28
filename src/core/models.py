@@ -66,6 +66,7 @@ class StrategyParams:
     fee_total_bps: float = 7.0
     target_net_bps: int = 10
     max_spread_bps: float = 8.0
+    max_spread_ticks: int = 0
     min_tick_rate: int = 5
     detect_timeout_ms: int = 6000
     use_impulse_filter: bool = True
@@ -76,6 +77,7 @@ class StrategyParams:
     emergency_stop_bps: int = 10
     cooldown_s: int = 3
     detect_window_ticks: int = 8
+    noise_ticks: int = 0
     allow_no_winner_flatten: bool = True
     no_winner_policy: str = "NO_LOSS"
     burst_volume_threshold: float = 0.0
@@ -198,6 +200,7 @@ class SymbolFilters:
     min_qty: float = 0.0
     min_notional: float = 0.0
     tick_size: float = 0.0
+    bps_per_tick: float = 0.0
 
 
 @dataclass
