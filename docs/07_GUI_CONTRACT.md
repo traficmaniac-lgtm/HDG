@@ -1,19 +1,23 @@
 # GUI Contract
 
-## Какие данные GUI получает
-- PriceState: bid/ask/mid, source, mid_age_ms.
-- HealthState: ws_connected, ws_age_ms, http_age_ms, last_switch_reason.
-- SymbolProfile: tickSize, stepSize, minQty, minNotional.
-- Orders snapshot: orderId, side, price, qty, status, clientOrderId, timestamps.
-- Trading state: last_action, orders_count, pnl_cycle, pnl_session.
-- Margin state: MARGIN_AUTH, BORROW (OK/FAIL).
+## Что GUI МОЖЕТ делать
+- Подключать/отключать сервисы данных (CONNECT/DISCONNECT).
+- Инициировать торговые действия: START (BUY), STOP (SELL).
+- Открывать/сохранять настройки API и параметров торговли.
+- Отображать котировки, статусы и PnL.
 
-## Какие события GUI только отображает
-- Статус соединений (WS/HTTP), ошибки REST, лог-сообщения.
-- Состояние ордеров и позиции, PnL.
-- Текущее состояние API (валидность ключей, разрешения).
+## Что GUI НЕ МОЖЕТ делать
+- Принимать решения о входе/выходе или стратегии.
+- Изменять правила маршрутизации котировок.
+- Выполнять ручные borrow/repay вне `TradeExecutor`.
+- Обходить проверки доступа к Margin API.
 
-## Что GUI НЕ ДОЛЖЕН делать
-- Не принимать торговые решения (когда входить/выходить) — это зона TradeExecutor.
-- Не менять логику маршрутизации цен (только отображение состояния).
-- Не выполнять ручные borrow/repay операции вне TradeExecutor.
+## Какие данные GUI только отображает
+- `PriceState`, `HealthState`, `SymbolProfile`.
+- Снимок активных ордеров и статусы исполнения.
+- `pnl_cycle`, `pnl_session`, `unrealized`.
+- `MARGIN_AUTH` и `BORROW` статусы.
+
+## Какие действия GUI лишь инициирует
+- START/STOP — только запуск функций `TradeExecutor`.
+- CONNECT/DISCONNECT — только запуск/остановка сервисов.
