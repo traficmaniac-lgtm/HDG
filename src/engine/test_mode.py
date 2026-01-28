@@ -190,7 +190,13 @@ def main() -> None:
         detect_window_ticks=1,
         auto_loop=True,
     )
-    filters = SymbolFilters(step_size=0.000001, min_qty=0.000001, min_notional=5.0, tick_size=0.1)
+    filters = SymbolFilters(
+        step_size=0.000001,
+        min_qty=0.000001,
+        min_notional=5.0,
+        tick_size=0.1,
+        bps_per_tick=0.1 / tick_state.mid * 10_000,
+    )
     cycle = DirectionalCycle(
         execution=execution,
         state_machine=state_machine,
