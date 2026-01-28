@@ -69,13 +69,13 @@ class StrategyParamsStore:
 
     def load_strategy_params(self) -> tuple[StrategyParams, str]:
         if not self.path.exists():
-            return StrategyParams(), "BTCUSDT"
+            return StrategyParams(), ""
         data = json.loads(self.path.read_text(encoding="utf-8"))
         if "strategy_params" in data:
             params = StrategyParams(**data.get("strategy_params", {}))
-            symbol = str(data.get("symbol", "BTCUSDT"))
+            symbol = str(data.get("symbol", ""))
             return params, symbol
-        symbol = str(data.get("last_symbol", "BTCUSDT"))
+        symbol = str(data.get("last_symbol", ""))
         default_payload = data.get("default", {})
         by_symbol = data.get("by_symbol", {})
         symbol_payload = by_symbol.get(symbol, default_payload)

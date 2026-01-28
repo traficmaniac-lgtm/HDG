@@ -28,6 +28,7 @@ class HttpFallback:
             now = datetime.now(timezone.utc)
             rx_time_ms = time.monotonic() * 1000
             return {
+                "symbol": symbol,
                 "bid": bid,
                 "ask": ask,
                 "mid": mid,

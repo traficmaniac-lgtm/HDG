@@ -17,9 +17,10 @@ class MarketDataThread(QThread):
     depth_update = Signal(dict)
     status_update = Signal(str)
 
-    def __init__(self, symbol: str = "btcusdt", market_data: MarketDataService | None = None) -> None:
+    def __init__(self, symbol: str, market_data: MarketDataService | None = None) -> None:
         super().__init__()
         self.symbol = symbol.lower()
+        self.symbol_upper = symbol.upper()
         self._stop_event = threading.Event()
         self._status = "DISCONNECTED"
         self._market_data = market_data
@@ -86,6 +87,7 @@ class MarketDataThread(QThread):
         )
         self.price_update.emit(
             {
+                "symbol": self.symbol_upper,
                 "bid": bid,
                 "ask": ask,
                 "mid": mid,
@@ -103,6 +105,7 @@ class MarketDataThread(QThread):
         if self._market_data:
             self._market_data.update_tick(
                 {
+                    "symbol": self.symbol_upper,
                     "bid": bid,
                     "ask": ask,
                     "mid": mid,
@@ -124,6 +127,7 @@ class MarketDataThread(QThread):
         now = datetime.now(timezone.utc)
         self.depth_update.emit(
             {
+                "symbol": self.symbol_upper,
                 "bids": bids,
                 "asks": asks,
                 "event_time": now,

@@ -15,7 +15,7 @@ class BinanceMarginExecution:
         "AUTO_BORROW_REPAY",
     }
 
-    def __init__(self, client: BinanceRestClient, symbol: str = "BTCUSDT") -> None:
+    def __init__(self, client: BinanceRestClient, symbol: str = "") -> None:
         self._client = client
         self.symbol = symbol
         self._logger = logging.getLogger("dhs")

@@ -38,14 +38,16 @@ class TradeEngine(QObject):
         self._market_data = market_data or MarketDataService()
         self._state_machine = BotStateMachine()
         self._strategy = StrategyParams()
+        self._symbol = ""
+        self._base_asset = ""
         self._symbol_filters = SymbolFilters()
         self._data_mode = MarketDataMode.HYBRID
         self._ws_status = "DISCONNECTED"
         self._connected = False
         self._margin_permission_ok = False
-        self._margin_btc_free = 0.0
-        self._margin_btc_borrowed = 0.0
-        self._margin_exec = BinanceMarginExecution(self._rest_client)
+        self._margin_base_free = 0.0
+        self._margin_base_borrowed = 0.0
+        self._margin_exec = BinanceMarginExecution(self._rest_client, symbol=self._symbol)
         self._trade_gate: Optional[str] = None
         self._not_authorized_abort_done = False
         self._cycle = DirectionalCycle(
@@ -106,7 +108,7 @@ class TradeEngine(QObject):
         api_secret = payload.get("api_secret", "")
         self._rest_client.close()
         self._rest_client = BinanceRestClient(api_key=api_key, api_secret=api_secret)
-        self._margin_exec = BinanceMarginExecution(self._rest_client)
+        self._margin_exec = BinanceMarginExecution(self._rest_client, symbol=self._symbol)
         self._trade_gate = None
         self._not_authorized_abort_done = False
         self._last_cycle_telemetry = None
@@ -130,6 +132,25 @@ class TradeEngine(QObject):
         else:
             self._state_machine.disconnect()
         self._emit_cycle_state()
+
+    @Slot(str)
+    def set_symbol(self, symbol: str) -> None:
+        normalized = symbol.upper().strip()
+        if not normalized:
+            return
+        if normalized == self._symbol:
+            return
+        self._symbol = normalized
+        self._base_asset = (
+            normalized.removesuffix("USDT")
+            if normalized.endswith("USDT")
+            else normalized
+        )
+        self._margin_exec.symbol = self._symbol
+        self._symbol_filters = SymbolFilters()
+        self._cycle.update_filters(self._symbol_filters)
+        self._market_data.set_symbol(self._symbol)
+        self._emit_cycle_state(force=True)
 
     @Slot(bool)
     def validate_access(self, test_only: bool = False) -> None:
@@ -161,16 +182,24 @@ class TradeEngine(QObject):
         }
         if margin_account:
             assets = margin_account.get("userAssets", [])
-            btc = next((item for item in assets if item.get("asset") == "BTC"), None)
-            if btc:
-                self._margin_btc_free = float(btc.get("free", 0.0))
-                self._margin_btc_borrowed = float(btc.get("borrowed", 0.0))
+            base_asset = self._base_asset
+            base_asset_entry = (
+                next((item for item in assets if item.get("asset") == base_asset), None)
+                if base_asset
+                else None
+            )
+            if base_asset_entry:
+                self._margin_base_free = float(base_asset_entry.get("free", 0.0))
+                self._margin_base_borrowed = float(base_asset_entry.get("borrowed", 0.0))
         self.balance_update.emit(payload)
         self._emit_exposure_status(self._cycle.exposure_open)
 
     @Slot()
     def load_exchange_info(self) -> None:
-        info = self._rest_client.get_exchange_info("BTCUSDT")
+        if not self._symbol:
+            self._emit_log("ERROR", "ERROR", "Не задан символ для exchange info")
+            return
+        info = self._rest_client.get_exchange_info(self._symbol)
         if not info:
             self._emit_log("ERROR", "ERROR", "Не удалось загрузить информацию биржи")
             return
@@ -211,7 +240,10 @@ class TradeEngine(QObject):
 
     @Slot()
     def load_orderbook_snapshot(self) -> None:
-        depth = self._rest_client.get_depth("BTCUSDT", limit=20)
+        if not self._symbol:
+            self._emit_log("ERROR", "ERROR", "Не задан символ для стакана")
+            return
+        depth = self._rest_client.get_depth(self._symbol, limit=20)
         if not depth:
             self._emit_log("ERROR", "ERROR", "Не удалось загрузить стакан")
             return
@@ -238,7 +270,9 @@ class TradeEngine(QObject):
 
     @Slot()
     def fetch_http_fallback(self) -> None:
-        data = self._http_fallback.get_book_ticker("BTCUSDT")
+        if not self._symbol:
+            return
+        data = self._http_fallback.get_book_ticker(self._symbol)
         if data:
             self._market_data.update_tick(data)
             self.on_tick(data)
@@ -402,7 +436,11 @@ class TradeEngine(QObject):
         self._last_active_cycle = active_cycle
 
     def _emit_exposure_status(self, exposure_open: bool) -> None:
-        exposure = exposure_open or self._margin_btc_free > 0 or self._margin_btc_borrowed > 0
+        exposure = (
+            exposure_open
+            or self._margin_base_free > 0
+            or self._margin_base_borrowed > 0
+        )
         self.exposure_update.emit({"open_exposure": exposure})
 
     def _abort_not_authorized(self, context: str) -> None:
@@ -482,6 +520,8 @@ class TradeEngine(QObject):
         return "\n".join(buffer_lines)
 
     def _emit_log(self, category: str, level: str, message: str, **fields: object) -> None:
+        if self._symbol:
+            fields.setdefault("symbol", self._symbol)
         self.log.emit(
             {
                 "category": category,
