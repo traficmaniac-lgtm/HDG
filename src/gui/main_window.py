@@ -8,6 +8,7 @@ from typing import Optional
 
 from PySide6.QtCore import Qt, QTimer, Slot
 from PySide6.QtWidgets import (
+    QFileDialog,
     QFrame,
     QGroupBox,
     QHBoxLayout,
@@ -15,7 +16,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QPlainTextEdit,
     QPushButton,
-    QFileDialog,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -45,6 +46,7 @@ class MainWindow(QMainWindow):
         self._symbol_profile = SymbolProfile()
         self._last_trade_action = "—"
         self._orders_count = 0
+        self._api_key_hint_logged = False
 
         self._ui_timer = QTimer(self)
         self._ui_timer.timeout.connect(self._refresh_ui)
@@ -78,7 +80,7 @@ class MainWindow(QMainWindow):
         root.addWidget(header)
 
         blocks = QHBoxLayout()
-        root.addLayout(blocks)
+        tabs = QTabWidget()
 
         self.market_box = QGroupBox("Market (EURIUSDT)")
         market_layout = QVBoxLayout(self.market_box)
@@ -134,17 +136,31 @@ class MainWindow(QMainWindow):
         trade_layout.addWidget(self.last_action_label)
         blocks.addWidget(self.trade_box)
 
+        terminal_tab = QWidget()
+        terminal_layout = QVBoxLayout(terminal_tab)
+        terminal_layout.addLayout(blocks)
+        terminal_layout.addStretch(1)
+        tabs.addTab(terminal_tab, "Terminal")
+
+        logs_tab = QWidget()
+        logs_layout = QVBoxLayout(logs_tab)
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
         self.log.setMaximumBlockCount(500)
-        root.addWidget(self.log, stretch=1)
+        logs_layout.addWidget(self.log, stretch=1)
 
         log_actions = QHBoxLayout()
+        self.clear_log_button = QPushButton("Clear")
+        self.clear_log_button.clicked.connect(self._clear_log)
         self.save_log_button = QPushButton("Save Log")
         self.save_log_button.clicked.connect(self._save_log)
         log_actions.addStretch(1)
+        log_actions.addWidget(self.clear_log_button)
         log_actions.addWidget(self.save_log_button)
-        root.addLayout(log_actions)
+        logs_layout.addLayout(log_actions)
+        tabs.addTab(logs_tab, "Logs")
+
+        root.addWidget(tabs, stretch=1)
 
         self.setCentralWidget(central)
 
@@ -256,6 +272,8 @@ class MainWindow(QMainWindow):
 
     @Slot(bool)
     def _on_ws_status(self, status: bool) -> None:
+        if status == self._ws_connected:
+            return
         self._ws_connected = status
         self._append_log(f"WS connected: {status}")
 
@@ -342,8 +360,24 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self._append_log(f"Failed to save log: {exc}")
 
+    @Slot()
+    def _clear_log(self) -> None:
+        self.log.clear()
+
     def _append_log(self, message: str) -> None:
         self.log.appendPlainText(message)
+        if self._should_log_api_key_hint(message):
+            self.log.appendPlainText(
+                "[HINT] check BINANCE_KEY/BINANCE_SECRET loaded from .env "
+                "(no quotes, no spaces), ensure Margin trading enabled on key."
+            )
+            self._api_key_hint_logged = True
+
+    def _should_log_api_key_hint(self, message: str) -> bool:
+        if self._api_key_hint_logged:
+            return False
+        lowered = message.lower()
+        return "code=-2014" in lowered or "api-key format invalid" in lowered
 
     def _load_settings(self) -> Settings:
         settings_path = Path(__file__).resolve().parents[2] / "config" / "settings.json"
