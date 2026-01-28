@@ -229,9 +229,42 @@ class TradeExecutor:
             )
             self.last_action = "state_blocked"
             return 0
-        return self._place_sell_order()
+        return self._place_sell_order(reason="manual")
 
-    def _place_sell_order(self) -> int:
+    def evaluate_take_profit(self, mid: Optional[float]) -> None:
+        if self.state != TradeState.STATE_POSITION_OPEN:
+            return
+        if not self._settings.auto_close:
+            return
+        if mid is None:
+            return
+        if self._has_active_order("SELL"):
+            return
+        if not self._profile.tick_size:
+            return
+        take_profit_ticks = int(self._settings.take_profit_ticks)
+        if take_profit_ticks <= 0:
+            return
+        buy_price = self.get_buy_price()
+        if buy_price is None:
+            return
+        target_price = buy_price + take_profit_ticks * self._profile.tick_size
+        if mid - buy_price < take_profit_ticks * self._profile.tick_size:
+            return
+        self._logger("[ALGO] take_profit condition met")
+        self._place_sell_order(reason="tp", price_override=target_price, mid_override=mid)
+
+    def get_buy_price(self) -> Optional[float]:
+        if self.position is not None:
+            return self.position.get("buy_price")
+        return self._last_buy_price
+
+    def _place_sell_order(
+        self,
+        reason: str = "manual",
+        price_override: Optional[float] = None,
+        mid_override: Optional[float] = None,
+    ) -> int:
         if self._has_active_order("SELL"):
             self._logger("[TRADE] close_position | SELL already active")
             self.last_action = "sell_active"
@@ -242,8 +275,10 @@ class TradeExecutor:
             return 0
         self._inflight_trade_action = True
         try:
-            price_state, health_state = self._router.build_price_state()
-            mid = price_state.mid
+            mid = mid_override
+            if mid is None:
+                price_state, health_state = self._router.build_price_state()
+                mid = price_state.mid
             if mid is None:
                 now = time.monotonic()
                 if now - self._last_no_price_log_ts >= 2.0:
@@ -265,9 +300,12 @@ class TradeExecutor:
                 self.last_action = "precheck_failed"
                 return 0
 
-            tick_offset = self._settings.offset_ticks
-            sell_price = mid + tick_offset * self._profile.tick_size
-            sell_price = self._round_to_step(sell_price, self._profile.tick_size)
+            if price_override is not None:
+                sell_price = self._round_to_step(price_override, self._profile.tick_size)
+            else:
+                tick_offset = self._settings.offset_ticks
+                sell_price = mid + tick_offset * self._profile.tick_size
+                sell_price = self._round_to_step(sell_price, self._profile.tick_size)
 
             is_isolated = "TRUE" if self._settings.margin_isolated else "FALSE"
             timestamp = int(time.time() * 1000)
@@ -280,7 +318,7 @@ class TradeExecutor:
             order_type = "LIMIT"
 
             self._transition_state(TradeState.STATE_PLACE_SELL)
-            self.last_action = "placing_sell"
+            self.last_action = "placing_sell_tp" if reason == "tp" else "placing_sell"
             sell_order = self._place_margin_order(
                 symbol=self._settings.symbol,
                 side="SELL",
@@ -296,10 +334,16 @@ class TradeExecutor:
                 self.last_action = "place_failed"
                 self._transition_state(TradeState.STATE_ERROR)
                 return 0
-            self._logger(
-                f"[ORDER] SELL placed qty={qty:.8f} price={sell_price:.8f} "
-                f"id={sell_order.get('orderId')}"
-            )
+            if reason == "tp":
+                self._logger(
+                    f"[ORDER] SELL placed (tp) qty={qty:.8f} price={sell_price:.8f} "
+                    f"id={sell_order.get('orderId')}"
+                )
+            else:
+                self._logger(
+                    f"[ORDER] SELL placed qty={qty:.8f} price={sell_price:.8f} "
+                    f"id={sell_order.get('orderId')}"
+                )
             self._transition_state(TradeState.STATE_WAIT_SELL)
             now_ms = int(time.time() * 1000)
             self.active_test_orders.append(
@@ -313,6 +357,7 @@ class TradeExecutor:
                     "status": "NEW",
                     "tag": self.TAG,
                     "clientOrderId": sell_order.get("clientOrderId", sell_client_id),
+                    "reason": reason,
                 }
             )
             self.orders_count = len(self.active_test_orders)
@@ -351,13 +396,17 @@ class TradeExecutor:
                         "opened_ts": now_ms,
                     }
                 self._transition_state(TradeState.STATE_POSITION_OPEN)
-                if self._settings.auto_close:
-                    self._place_sell_order()
             elif side == "SELL":
-                self._logger(
-                    f"[ORDER] SELL filled qty={order.get('qty'):.8f} "
-                    f"price={order.get('price'):.8f}"
-                )
+                if order.get("reason") == "tp":
+                    self._logger(
+                        f"[ORDER] SELL filled (tp) qty={order.get('qty'):.8f} "
+                        f"price={order.get('price'):.8f}"
+                    )
+                else:
+                    self._logger(
+                        f"[ORDER] SELL filled qty={order.get('qty'):.8f} "
+                        f"price={order.get('price'):.8f}"
+                    )
                 pnl = self._finalize_close(order)
                 realized = "—" if pnl is None else f"{pnl:.8f}"
                 self._logger(f"[PNL] realized={realized}")

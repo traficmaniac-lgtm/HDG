@@ -15,6 +15,7 @@ class Settings:
     leverage_hint: int
     nominal_usd: float
     offset_ticks: int
+    take_profit_ticks: int
     order_type: str
     allow_borrow: bool
     side_effect_type: str
