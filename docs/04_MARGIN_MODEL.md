@@ -9,7 +9,7 @@
   - `AUTO_BORROW_REPAY`
   - `MARGIN_BUY`
   - `NONE`
-- **SELL** использует `AUTO_REPAY`, когда разрешён borrow и это поддерживается API.
+- **SELL** использует `AUTO_REPAY`, когда разрешён borrow и это поддерживается API (независимо от LIMIT/MARKET выхода).
 
 ## BORROW: OK / FAIL
 - `BORROW = OK|FAIL` отражает результат `probe_margin_borrow_access`.

@@ -13,3 +13,13 @@
 - Архитектурный документ.
 - Диаграммы компонентов и потоков.
 - Прототипы и гайды по UI.
+
+## Дизайн v0.7.2 (реальные данные)
+- Логика TP/SL реализована в `TradeExecutor` и активна только в `POSITION_OPEN`.
+- Формулы триггеров:
+  - `tp_trigger_price = buy_price + take_profit_ticks * tickSize`
+  - `sl_trigger_price = buy_price - stop_loss_ticks * tickSize`
+- Приоритет: TP выше SL при одновременном выполнении.
+- Ордер выхода: `exit_order_type` = `LIMIT`/`MARKET`;
+  для LIMIT используется `sell_price = mid + exit_offset_ticks * tickSize`
+  (округление по `tickSize`).

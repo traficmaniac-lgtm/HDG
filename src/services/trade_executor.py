@@ -53,6 +53,7 @@ class TradeExecutor:
         self.position: Optional[dict] = None
         self.pnl_cycle: Optional[float] = None
         self.pnl_session: float = 0.0
+        self.last_exit_reason: Optional[str] = None
         self._last_buy_price: Optional[float] = None
         self.state = TradeState.STATE_IDLE
 
@@ -214,6 +215,7 @@ class TradeExecutor:
             ]
             self.orders_count = len(self.active_test_orders)
             self.pnl_cycle = None
+            self.last_exit_reason = None
             self._last_buy_price = buy_price
             return self.orders_count
         finally:
@@ -231,10 +233,10 @@ class TradeExecutor:
             return 0
         return self._place_sell_order(reason="manual")
 
-    def evaluate_take_profit(self, mid: Optional[float]) -> None:
+    def evaluate_exit_conditions(self, mid: Optional[float]) -> None:
         if self.state != TradeState.STATE_POSITION_OPEN:
             return
-        if not self._settings.auto_close:
+        if not self._settings.auto_exit_enabled:
             return
         if mid is None:
             return
@@ -242,17 +244,34 @@ class TradeExecutor:
             return
         if not self._profile.tick_size:
             return
-        take_profit_ticks = int(self._settings.take_profit_ticks)
-        if take_profit_ticks <= 0:
-            return
         buy_price = self.get_buy_price()
         if buy_price is None:
             return
-        target_price = buy_price + take_profit_ticks * self._profile.tick_size
-        if mid - buy_price < take_profit_ticks * self._profile.tick_size:
-            return
-        self._logger("[ALGO] take_profit condition met")
-        self._place_sell_order(reason="tp", price_override=target_price, mid_override=mid)
+        tick_size = self._profile.tick_size
+        take_profit_ticks = int(self._settings.take_profit_ticks)
+        stop_loss_ticks = int(self._settings.stop_loss_ticks)
+        tp_price = (
+            buy_price + take_profit_ticks * tick_size
+            if take_profit_ticks > 0
+            else None
+        )
+        sl_price = (
+            buy_price - stop_loss_ticks * tick_size if stop_loss_ticks > 0 else None
+        )
+        tp_ready = tp_price is not None and mid >= tp_price
+        sl_ready = sl_price is not None and mid <= sl_price
+        if tp_ready:
+            self._logger(
+                "[ALGO] exit_trigger "
+                f"reason=TP mid={mid:.8f} buy={buy_price:.8f} tp={tp_price:.8f}"
+            )
+            self._place_sell_order(reason="TP", mid_override=mid)
+        elif sl_ready:
+            self._logger(
+                "[ALGO] exit_trigger "
+                f"reason=SL mid={mid:.8f} buy={buy_price:.8f} sl={sl_price:.8f}"
+            )
+            self._place_sell_order(reason="SL", mid_override=mid)
 
     def get_buy_price(self) -> Optional[float]:
         if self.position is not None:
@@ -262,7 +281,6 @@ class TradeExecutor:
     def _place_sell_order(
         self,
         reason: str = "manual",
-        price_override: Optional[float] = None,
         mid_override: Optional[float] = None,
     ) -> int:
         if self._has_active_order("SELL"):
@@ -300,10 +318,12 @@ class TradeExecutor:
                 self.last_action = "precheck_failed"
                 return 0
 
-            if price_override is not None:
-                sell_price = self._round_to_step(price_override, self._profile.tick_size)
-            else:
-                tick_offset = self._settings.offset_ticks
+            exit_order_type = self._normalize_order_type(
+                self._settings.exit_order_type
+            )
+            sell_price = None
+            if exit_order_type == "LIMIT":
+                tick_offset = int(self._settings.exit_offset_ticks)
                 sell_price = mid + tick_offset * self._profile.tick_size
                 sell_price = self._round_to_step(sell_price, self._profile.tick_size)
 
@@ -315,10 +335,11 @@ class TradeExecutor:
                 if self._settings.allow_borrow and self._borrow_allowed_by_api is not False
                 else None
             )
-            order_type = "LIMIT"
+            order_type = exit_order_type
 
             self._transition_state(TradeState.STATE_PLACE_SELL)
-            self.last_action = "placing_sell_tp" if reason == "tp" else "placing_sell"
+            reason_upper = reason.upper()
+            self.last_action = "placing_sell_tp" if reason_upper == "TP" else "placing_sell"
             sell_order = self._place_margin_order(
                 symbol=self._settings.symbol,
                 side="SELL",
@@ -334,14 +355,18 @@ class TradeExecutor:
                 self.last_action = "place_failed"
                 self._transition_state(TradeState.STATE_ERROR)
                 return 0
-            if reason == "tp":
+            price_label = (
+                f"{mid:.8f}" if sell_price is None else f"{sell_price:.8f}"
+            )
+            if reason_upper in {"TP", "SL"}:
                 self._logger(
-                    f"[ORDER] SELL placed (tp) qty={qty:.8f} price={sell_price:.8f} "
-                    f"id={sell_order.get('orderId')}"
+                    "[ORDER] SELL placed "
+                    f"reason={reason_upper} type={order_type} price={price_label} "
+                    f"qty={qty:.8f} id={sell_order.get('orderId')}"
                 )
             else:
                 self._logger(
-                    f"[ORDER] SELL placed qty={qty:.8f} price={sell_price:.8f} "
+                    f"[ORDER] SELL placed qty={qty:.8f} price={price_label} "
                     f"id={sell_order.get('orderId')}"
                 )
             self._transition_state(TradeState.STATE_WAIT_SELL)
@@ -357,7 +382,7 @@ class TradeExecutor:
                     "status": "NEW",
                     "tag": self.TAG,
                     "clientOrderId": sell_order.get("clientOrderId", sell_client_id),
-                    "reason": reason,
+                    "reason": reason_upper,
                 }
             )
             self.orders_count = len(self.active_test_orders)
@@ -438,19 +463,39 @@ class TradeExecutor:
                 }
             self._transition_state(TradeState.STATE_POSITION_OPEN)
         elif side == "SELL":
-            if order.get("reason") == "tp":
+            reason = str(order.get("reason") or "MANUAL").upper()
+            fill_price = order.get("price")
+            qty = order.get("qty")
+            buy_price = self.position.get("buy_price") if self.position else self._last_buy_price
+            if reason in {"TP", "SL"}:
+                fill_price_label = "—" if fill_price is None else f"{fill_price:.8f}"
+                qty_label = "—" if qty is None else f"{qty:.8f}"
                 self._logger(
-                    f"[ORDER] SELL filled (tp) qty={order.get('qty'):.8f} "
-                    f"price={order.get('price'):.8f}"
+                    "[ORDER] SELL filled "
+                    f"reason={reason} fill_price={fill_price_label} qty={qty_label}"
                 )
             else:
+                fill_price_label = "—" if fill_price is None else f"{fill_price:.8f}"
+                qty_label = "—" if qty is None else f"{qty:.8f}"
                 self._logger(
-                    f"[ORDER] SELL filled qty={order.get('qty'):.8f} "
-                    f"price={order.get('price'):.8f}"
+                    f"[ORDER] SELL filled qty={qty_label} "
+                    f"price={fill_price_label}"
                 )
             pnl = self._finalize_close(order)
-            realized = "—" if pnl is None else f"{pnl:.8f}"
-            self._logger(f"[PNL] realized={realized}")
+            self.last_exit_reason = reason if reason in {"TP", "SL"} else "MANUAL"
+            if reason in {"TP", "SL"}:
+                pnl_quote = "—" if pnl is None else f"{pnl:.8f}"
+                pnl_bps = "—"
+                if pnl is not None and buy_price and qty:
+                    notion = buy_price * qty
+                    if notion > 0:
+                        pnl_bps = f"{(pnl / notion) * 10000:.2f}"
+                self._logger(
+                    f"[PNL] realized reason={reason} pnl_quote={pnl_quote} pnl_bps={pnl_bps}"
+                )
+            else:
+                realized = "—" if pnl is None else f"{pnl:.8f}"
+                self._logger(f"[PNL] realized={realized}")
             self._transition_state(TradeState.STATE_CLOSED)
             self.active_test_orders = []
             self.orders_count = 0
@@ -574,7 +619,7 @@ class TradeExecutor:
         symbol: str,
         side: str,
         quantity: float,
-        price: float,
+        price: Optional[float],
         is_isolated: str,
         client_order_id: Optional[str],
         side_effect: Optional[str],
@@ -589,6 +634,9 @@ class TradeExecutor:
         }
         if order_type == "LIMIT":
             params["timeInForce"] = "GTC"
+            if price is None:
+                self._logger("[TRADE] place_order error: missing price for LIMIT")
+                return None
             params["price"] = f"{price:.8f}"
         if side_effect:
             params["sideEffectType"] = side_effect

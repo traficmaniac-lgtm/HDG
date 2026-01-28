@@ -20,11 +20,14 @@ class Settings:
     nominal_usd: float
     offset_ticks: int
     take_profit_ticks: int
+    stop_loss_ticks: int
     order_type: str
+    exit_order_type: str
+    exit_offset_ticks: int
     allow_borrow: bool
     side_effect_type: str
     margin_isolated: bool
-    auto_close: bool
+    auto_exit_enabled: bool
 
 
 @dataclass

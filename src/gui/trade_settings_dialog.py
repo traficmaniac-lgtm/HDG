@@ -19,7 +19,7 @@ from src.core.models import Settings
 
 
 class TradeSettingsDialog(QDialog):
-    saved = Signal(float, int, int, str, bool, str, bool)
+    saved = Signal(float, int, int, int, str, int, bool, str, bool)
 
     def __init__(
         self, parent=None, store: ConfigStore | None = None, settings: Settings | None = None
@@ -58,6 +58,13 @@ class TradeSettingsDialog(QDialog):
         )
         form.addRow("Take-profit (тики)", self.take_profit_input)
 
+        self.stop_loss_input = QSpinBox()
+        self.stop_loss_input.setRange(1, 1000)
+        self.stop_loss_input.setValue(
+            int(getattr(settings, "stop_loss_ticks", 2) or 2) if settings else 2
+        )
+        form.addRow("Stop-loss (тики)", self.stop_loss_input)
+
         self.order_type_input = QComboBox()
         self.order_type_input.addItems(["LIMIT", "MARKET"])
         current_order_type = str(getattr(settings, "order_type", "LIMIT") or "LIMIT").upper()
@@ -66,13 +73,34 @@ class TradeSettingsDialog(QDialog):
             self.order_type_input.setCurrentIndex(index)
         form.addRow("Тип ордера", self.order_type_input)
 
+        self.exit_order_type_input = QComboBox()
+        self.exit_order_type_input.addItems(["LIMIT", "MARKET"])
+        current_exit_order_type = str(
+            getattr(settings, "exit_order_type", "LIMIT") or "LIMIT"
+        ).upper()
+        index = self.exit_order_type_input.findText(current_exit_order_type)
+        if index >= 0:
+            self.exit_order_type_input.setCurrentIndex(index)
+        form.addRow("Тип выхода", self.exit_order_type_input)
+
+        self.exit_offset_input = QSpinBox()
+        self.exit_offset_input.setRange(0, 1000)
+        self.exit_offset_input.setValue(
+            int(getattr(settings, "exit_offset_ticks", 1) or 1) if settings else 1
+        )
+        form.addRow("Смещение выхода (тики)", self.exit_offset_input)
+
         self.allow_borrow_input = QCheckBox("Разрешить заём (borrow)")
         self.allow_borrow_input.setChecked(bool(getattr(settings, "allow_borrow", True)))
         form.addRow("", self.allow_borrow_input)
 
-        self.auto_close_input = QCheckBox("Авто-выход по тейку")
-        self.auto_close_input.setChecked(bool(getattr(settings, "auto_close", False)))
-        form.addRow("", self.auto_close_input)
+        self.auto_exit_input = QCheckBox("Авто-выход по TP/SL")
+        self.auto_exit_input.setChecked(
+            bool(
+                getattr(settings, "auto_exit_enabled", getattr(settings, "auto_close", True))
+            )
+        )
+        form.addRow("", self.auto_exit_input)
 
         self.side_effect_input = QComboBox()
         self.side_effect_input.addItems(["AUTO_BORROW_REPAY", "MARGIN_BUY", "NONE"])
@@ -115,18 +143,24 @@ class TradeSettingsDialog(QDialog):
         payload["nominal_usd"] = float(self.notional_input.value())
         payload["offset_ticks"] = int(self.tick_offset_input.value())
         payload["take_profit_ticks"] = int(self.take_profit_input.value())
+        payload["stop_loss_ticks"] = int(self.stop_loss_input.value())
         payload["order_type"] = str(self.order_type_input.currentText()).upper()
+        payload["exit_order_type"] = str(self.exit_order_type_input.currentText()).upper()
+        payload["exit_offset_ticks"] = int(self.exit_offset_input.value())
         payload["allow_borrow"] = bool(self.allow_borrow_input.isChecked())
         payload["side_effect_type"] = str(self.side_effect_input.currentText()).upper()
-        payload["auto_close"] = bool(self.auto_close_input.isChecked())
+        payload["auto_exit_enabled"] = bool(self.auto_exit_input.isChecked())
         self._store.save_settings(payload)
         self.saved.emit(
             float(self.notional_input.value()),
             int(self.tick_offset_input.value()),
             int(self.take_profit_input.value()),
+            int(self.stop_loss_input.value()),
             str(self.order_type_input.currentText()).upper(),
+            int(self.exit_offset_input.value()),
+            str(self.exit_order_type_input.currentText()).upper(),
             bool(self.allow_borrow_input.isChecked()),
             str(self.side_effect_input.currentText()).upper(),
-            bool(self.auto_close_input.isChecked()),
+            bool(self.auto_exit_input.isChecked()),
         )
         self.accept()

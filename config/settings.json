@@ -14,11 +14,14 @@
   "nominal_usd": 10.0,
   "offset_ticks": 1,
   "take_profit_ticks": 1,
+  "stop_loss_ticks": 2,
   "order_type": "LIMIT",
+  "exit_order_type": "LIMIT",
+  "exit_offset_ticks": 1,
   "allow_borrow": true,
   "side_effect_type": "AUTO_BORROW_REPAY",
   "margin_isolated": false,
-  "auto_close": false,
+  "auto_exit_enabled": true,
   "api": {
     "key": "",
     "secret": ""

@@ -16,6 +16,7 @@
 - `PriceState`, `HealthState`, `SymbolProfile`.
 - Снимок активных ордеров и статусы исполнения.
 - `pnl_cycle`, `pnl_session`, `unrealized`.
+- `buy_price`, `tp_trigger_price`, `sl_trigger_price`, `mid`, `last_exit_reason`.
 - `MARGIN_AUTH` и `BORROW` статусы.
 
 ## Какие действия GUI лишь инициирует
