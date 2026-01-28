@@ -232,6 +232,9 @@ class TradeExecutor:
                     "side": "BUY",
                     "price": buy_price,
                     "qty": qty,
+                    "cum_qty": 0.0,
+                    "avg_fill_price": 0.0,
+                    "last_fill_price": None,
                     "created_ts": now_ms,
                     "updated_ts": now_ms,
                     "status": "NEW",
@@ -258,6 +261,12 @@ class TradeExecutor:
         self.run_active = False
         self._next_cycle_ready_ts = None
         self.cancel_test_orders_margin(reason="stopped")
+        if self.position is not None and self._settings.auto_exit_enabled:
+            self._transition_state(TradeState.STATE_POSITION_OPEN)
+            self._logger("[STOP] auto_exit closing position")
+            self._place_sell_order(reason="STOP")
+            self._logger(f"[CYCLE_STOPPED_BY_USER] reason={reason}")
+            return
         self._transition_state(TradeState.STATE_CLOSED)
         self._transition_state(TradeState.STATE_IDLE)
         self._logger(f"[CYCLE_STOPPED_BY_USER] reason={reason}")
@@ -395,7 +404,8 @@ class TradeExecutor:
             exit_order_type = self._normalize_order_type(
                 self._settings.exit_order_type
             )
-            if exit_order_type == "MARKET":
+            reason_upper = reason.upper()
+            if exit_order_type == "MARKET" and reason_upper != "EMERGENCY":
                 self._logger("[TRADE] SELL rejected: MARKET disabled")
                 self.last_action = "market_sell_rejected"
                 return 0
@@ -415,9 +425,19 @@ class TradeExecutor:
                 )
                 return 0
             qty = self._resolve_close_qty()
+            if qty > 0:
+                qty = self._round_down(qty, self._profile.step_size)
             if qty <= 0:
                 self._logger("[TRADE] close_position | qty <= 0")
                 self.last_action = "precheck_failed"
+                return 0
+            if self._profile.min_qty and qty < self._profile.min_qty:
+                self._logger(
+                    f"[PARTIAL_TOO_SMALL] qty={qty:.8f} minQty={self._profile.min_qty}"
+                )
+                if exit_order_type == "MARKET":
+                    return self._place_emergency_market_sell(qty)
+                self.last_action = "partial_too_small"
                 return 0
 
             sell_price = None
@@ -437,8 +457,9 @@ class TradeExecutor:
             order_type = exit_order_type
 
             self._transition_state(TradeState.STATE_PLACE_SELL)
-            reason_upper = reason.upper()
             self.last_action = "placing_sell_tp" if reason_upper == "TP" else "placing_sell"
+            if self.position is not None and self.position.get("partial"):
+                self._logger(f"[SELL_FOR_PARTIAL] qty={qty:.8f}")
             sell_order = self._place_margin_order(
                 symbol=self._settings.symbol,
                 side="SELL",
@@ -495,6 +516,65 @@ class TradeExecutor:
         finally:
             self._inflight_trade_action = False
 
+    def _place_emergency_market_sell(self, qty: float) -> int:
+        if self._has_active_order("SELL"):
+            self.last_action = "sell_active"
+            return 0
+        if self.position is None:
+            self.last_action = "no_position"
+            return 0
+        self._transition_state(TradeState.STATE_PLACE_SELL)
+        self.last_action = "placing_sell"
+        if self.position.get("partial"):
+            self._logger(f"[SELL_FOR_PARTIAL] qty={qty:.8f}")
+        is_isolated = "TRUE" if self._settings.margin_isolated else "FALSE"
+        timestamp = int(time.time() * 1000)
+        sell_client_id = self._build_client_order_id("SELL", timestamp + 1)
+        side_effect_type = (
+            "AUTO_REPAY"
+            if self._settings.allow_borrow and self._borrow_allowed_by_api is not False
+            else None
+        )
+        sell_order = self._place_margin_order(
+            symbol=self._settings.symbol,
+            side="SELL",
+            quantity=qty,
+            price=None,
+            is_isolated=is_isolated,
+            client_order_id=sell_client_id,
+            side_effect=side_effect_type,
+            order_type="MARKET",
+        )
+        if not sell_order:
+            self._logger("[ORDER] SELL rejected")
+            self.last_action = "place_failed"
+            self._transition_state(TradeState.STATE_POSITION_OPEN)
+            return 0
+        self._logger(
+            f"[ORDER] SELL placed reason=EMERGENCY type=MARKET qty={qty:.8f} "
+            f"id={sell_order.get('orderId')}"
+        )
+        self._transition_state(TradeState.STATE_WAIT_SELL)
+        self._reset_sell_retry()
+        self._start_sell_wait()
+        now_ms = int(time.time() * 1000)
+        self.active_test_orders.append(
+            {
+                "orderId": sell_order.get("orderId"),
+                "side": "SELL",
+                "price": None,
+                "qty": qty,
+                "created_ts": now_ms,
+                "updated_ts": now_ms,
+                "status": "NEW",
+                "tag": self.TAG,
+                "clientOrderId": sell_order.get("clientOrderId", sell_client_id),
+                "reason": "EMERGENCY",
+            }
+        )
+        self.orders_count = len(self.active_test_orders)
+        return 1
+
     def _reset_sell_retry(self) -> None:
         self._sell_wait_started_ts = None
         self._sell_retry_count = 0
@@ -525,6 +605,44 @@ class TradeExecutor:
         if elapsed_ms < ttl_ms:
             return
         self._logger("[BUY_TTL_EXPIRED]")
+        cum_qty = float(buy_order.get("cum_qty", 0.0) or 0.0)
+        avg_fill_price = float(buy_order.get("avg_fill_price", 0.0) or 0.0)
+        last_fill_price = buy_order.get("last_fill_price")
+        if cum_qty > 0:
+            order_id = buy_order.get("orderId")
+            if order_id and order_id in open_orders:
+                is_isolated = "TRUE" if self._settings.margin_isolated else "FALSE"
+                self._cancel_margin_order(
+                    symbol=self._settings.symbol,
+                    order_id=order_id,
+                    is_isolated=is_isolated,
+                    tag=buy_order.get("tag", self.TAG),
+                )
+            self.active_test_orders = [
+                entry for entry in self.active_test_orders if entry.get("orderId") != order_id
+            ]
+            self.orders_count = len(self.active_test_orders)
+            price_fallback = (
+                avg_fill_price
+                if avg_fill_price > 0
+                else float(last_fill_price or buy_order.get("price") or 0.0)
+            )
+            avg_label = avg_fill_price if avg_fill_price > 0 else price_fallback
+            self.position = {
+                "buy_price": price_fallback if price_fallback > 0 else None,
+                "qty": cum_qty,
+                "opened_ts": int(time.time() * 1000),
+                "partial": True,
+            }
+            self._last_buy_price = self.position.get("buy_price") or self._last_buy_price
+            self._reset_buy_retry()
+            self._transition_state(TradeState.STATE_POSITION_OPEN)
+            self._logger(
+                f"[BUY_PARTIAL_COMMIT] qty={cum_qty:.8f} avg={avg_label:.8f}"
+            )
+            if not self._settings.auto_exit_enabled:
+                self._logger("[PARTIAL_HELD_NO_AUTO_EXIT]")
+            return
         max_retries = int(self._settings.max_buy_retries)
         if self._buy_retry_count >= max_retries:
             self._logger("[BUY_ABORT retries_exceeded]")
@@ -612,6 +730,9 @@ class TradeExecutor:
                 "side": "BUY",
                 "price": buy_price,
                 "qty": qty,
+                "cum_qty": 0.0,
+                "avg_fill_price": 0.0,
+                "last_fill_price": None,
                 "created_ts": now_ms,
                 "updated_ts": now_ms,
                 "status": "NEW",
@@ -785,6 +906,31 @@ class TradeExecutor:
         self._apply_order_filled(order)
         self.orders_count = len(self.active_test_orders)
 
+    def handle_order_partial(
+        self,
+        order_id: int,
+        side: str,
+        cum_qty: float,
+        avg_price: float,
+        ts_ms: int,
+    ) -> None:
+        order = next(
+            (entry for entry in self.active_test_orders if entry.get("orderId") == order_id),
+            None,
+        )
+        if order is None:
+            return
+        if str(side).upper() != "BUY":
+            return
+        order["cum_qty"] = cum_qty
+        if avg_price > 0:
+            order["avg_fill_price"] = avg_price
+            order["last_fill_price"] = avg_price
+        order["updated_ts"] = ts_ms
+        self._logger(
+            f"[BUY_PARTIAL] cum_qty={cum_qty:.8f} avg={avg_price:.8f}"
+        )
+
     def handle_order_done(self, order_id: int, status: str, ts_ms: int) -> None:
         order = next(
             (entry for entry in self.active_test_orders if entry.get("orderId") == order_id),
@@ -826,6 +972,7 @@ class TradeExecutor:
                     "buy_price": order.get("price"),
                     "qty": order.get("qty"),
                     "opened_ts": order.get("updated_ts"),
+                    "partial": False,
                 }
             self._transition_state(TradeState.STATE_POSITION_OPEN)
         elif side == "SELL":
@@ -905,9 +1052,6 @@ class TradeExecutor:
     def _resolve_close_qty(self) -> float:
         if self.position is not None:
             return self.position.get("qty", 0.0)
-        buy_order = self._find_order("BUY")
-        if buy_order:
-            return buy_order.get("qty", 0.0)
         return 0.0
 
     def _find_order(self, side: str) -> Optional[dict]:

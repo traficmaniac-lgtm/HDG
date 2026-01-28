@@ -361,6 +361,7 @@ class MainWindow(QMainWindow):
                 parent=self,
             )
             self._order_tracker.order_filled.connect(self._on_order_filled)
+            self._order_tracker.order_partial.connect(self._on_order_partial)
             self._order_tracker.order_done.connect(self._on_order_done)
             self._order_tracker.start()
             self._update_trading_controls()
@@ -468,6 +469,20 @@ class MainWindow(QMainWindow):
                 side=side,
                 price=price,
                 qty=qty,
+                ts_ms=ts_ms,
+            )
+        self._refresh_orders()
+
+    @Slot(int, str, float, float, "qint64")
+    def _on_order_partial(
+        self, order_id: int, side: str, cum_qty: float, avg_price: float, ts_ms: int
+    ) -> None:
+        if self._trade_executor:
+            self._trade_executor.handle_order_partial(
+                order_id=order_id,
+                side=side,
+                cum_qty=cum_qty,
+                avg_price=avg_price,
                 ts_ms=ts_ms,
             )
         self._refresh_orders()
