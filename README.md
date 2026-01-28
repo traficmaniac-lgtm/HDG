@@ -22,7 +22,7 @@ pip install -r requirements.txt
 ## Run
 
 ```bash
-python -m src.app.main
+python -m src.app
 ```
 
 ## 10 cycles smoke test (v0.3.9)
