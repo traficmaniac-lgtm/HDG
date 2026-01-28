@@ -22,11 +22,14 @@ class Settings:
     leverage_hint: int
     nominal_usd: float
     offset_ticks: int
+    entry_offset_ticks: int
     take_profit_ticks: int
     stop_loss_ticks: int
     order_type: str
     exit_order_type: str
     exit_offset_ticks: int
+    buy_ttl_ms: int
+    max_buy_retries: int
     allow_borrow: bool
     side_effect_type: str
     margin_isolated: bool
