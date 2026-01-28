@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QTabWidget,
     QVBoxLayout,
     QWidget,
+    QTableView,
     QMessageBox,
 )
 
