@@ -88,7 +88,8 @@ class TradeExecutor:
         )
 
         is_isolated = "TRUE" if self._settings.margin_isolated else "FALSE"
-        side_effect = "MARGIN_BUY"
+        buy_side_effect = "MARGIN_BUY"
+        sell_side_effect = "AUTO_BORROW_REPAY"
         timestamp = int(time.time() * 1000)
         buy_client_id = self._build_client_order_id("BUY", timestamp)
         sell_client_id = self._build_client_order_id("SELL", timestamp + 1)
@@ -100,7 +101,7 @@ class TradeExecutor:
             price=buy_price,
             is_isolated=is_isolated,
             client_order_id=buy_client_id,
-            side_effect=side_effect,
+            side_effect=buy_side_effect,
         )
         if not buy_order:
             return 0
@@ -112,7 +113,7 @@ class TradeExecutor:
             price=sell_price,
             is_isolated=is_isolated,
             client_order_id=sell_client_id,
-            side_effect=side_effect,
+            side_effect=sell_side_effect,
         )
         if not sell_order:
             self._cancel_margin_order(
