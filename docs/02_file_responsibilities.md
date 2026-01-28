@@ -18,6 +18,7 @@
 - `03_calculation_algorithms.md` — формулы и вычисления метрик/фильтров.
 - `04_trading_algorithm_cycle.md` — описание торгового цикла и состояний.
 - `05_technical_characteristics.md` — технические детали, режимы и параметры.
+- `06_configuration_and_operations.md` — конфигурация, UI, рабочие сценарии.
 
 ## `src/`
 
@@ -29,9 +30,9 @@
 ### `src/core/`
 
 - `__init__.py` — пакет ядра.
-- `config_store.py` — сохранение/загрузка настроек (локально).
-- `logger.py` — настройка логирования и ротации.
-- `models.py` — dataclass-модели: параметры стратегии, snapshots, телеметрия.
+- `config_store.py` — сохранение/загрузка настроек (`config/`, `.env.local`).
+- `logger.py` — настройка логирования и ротации (`logs/bot.log`).
+- `models.py` — dataclass-модели: параметры стратегии, снимки рынка, телеметрия.
 - `state_machine.py` — конечный автомат состояний торгового цикла.
 - `trade_engine.py` — оркестратор цикла, автоцикла, подключения и сигналов.
 - `version.py` — версия/метаданные приложения.
@@ -53,12 +54,12 @@
 
 - `__init__.py` — пакет сервисов.
 - `binance_rest.py` — REST клиент Binance: подпись запросов, обработка ошибок,
-  обменное инфо, аккаунт, ордера, depth.
+  exchange info, аккаунт, ордера, depth.
 - `time_sync.py` — синхронизация времени с Binance (offset, timestamp).
-- `ws_market.py` — WebSocket поток для `bookTicker` и `depth`.
+- `ws_market.py` — WebSocket поток для `bookTicker` и `depth10@100ms`.
 - `http_fallback.py` — HTTP fallback тикер `bookTicker`.
 - `market_data.py` — агрегатор тиков и выбор «effective tick».
-- `orderbook.py` — хранение/обновление стакана и вычисление VWAP.
+- `orderbook.py` — хранение/обновление стакана и расчёт VWAP.
 
 ### `src/gui/`
 

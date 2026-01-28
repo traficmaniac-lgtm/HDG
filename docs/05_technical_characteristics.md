@@ -3,21 +3,20 @@
 ## Режим торговли и рынок
 
 - Режим: **Cross Margin** (Binance).
-- Инструмент: `BTCUSDT` (по умолчанию в `BinanceMarginExecution`).
+- Инструмент: `BTCUSDT` по умолчанию (можно менять через UI).
 - Стратегия: **Directional Hedge Scalping**.
 - Вход: одновременный BUY и SELL одинакового объёма.
 
 ## Состояния конечного автомата
 
 - `IDLE` → ожидание.
-- `ARMED` → готов к запуску цикла.
-- `ENTERING` → вход и открытие хеджа.
-- `DETECTING` → поиск победителя.
-- `CUTTING` → закрытие проигравшей ноги.
-- `RIDING` → сопровождение победителя.
-- `EXITING` → выход победителя.
-- `CONTROLLED_FLATTEN` → управляемое выравнивание.
-- `COOLDOWN` → пауза перед следующим циклом.
+- `DETECT` → готов к запуску цикла (armed).
+- `ENTERED_LONG` → заполнена длинная нога.
+- `ENTERED_SHORT` → заполнена короткая нога.
+- `WAIT_WINNER` → детект + ride победителя.
+- `EXIT` → выход победителя.
+- `FLATTEN` → управляемое/аварийное выравнивание.
+- `COOLDOWN` → пауза между циклами.
 - `ERROR` → ошибка и остановка цикла.
 
 ## Источники данных и выбор effective tick
@@ -43,17 +42,14 @@
 ## Ордерная логика
 
 - Типы ордеров:
-  - `market` — немедленное исполнение (ожидание до 3s).
-  - `aggressive_limit` — лимит с `slip_bps`, ожидание 0.4s, затем cancel + market.
+  - `market` — немедленное исполнение (ожидание до `wait_fill_timeout_ms`).
+  - `aggressive_limit` — лимит с `slip_bps`, ожидание `0.4s`, затем cancel + market.
 - Вход:
   - SELL с `AUTO_BORROW_REPAY`.
   - BUY без side-effect.
 - Закрытие:
   - Для шорта — `AUTO_REPAY`.
   - Для лонга — обычный SELL.
-- No-winner:
-  - `NO_LOSS` → IOC лимитные заявки, fallback на market.
-  - `FLATTEN` → controlled flatten.
 
 ## Параметры стратегии (ключевые)
 
@@ -61,7 +57,7 @@
 - `max_spread_bps` — лимит спреда.
 - `min_tick_rate` — минимальная скорость тиков.
 - `use_impulse_filter` / `impulse_min_bps` — импульсный фильтр.
-- `impulse_grace_ms` — время, после которого импульс может деградировать.
+- `impulse_grace_ms` / `impulse_degrade_mode` — деградация импульса.
 - `winner_threshold_bps` — порог определения победителя.
 - `target_net_bps` — целевая прибыль после комиссий.
 - `emergency_stop_bps` — экстренный стоп.
@@ -72,6 +68,10 @@
 - `order_mode` / `slip_bps` — режим и проскальзывание.
 - `allow_no_winner_flatten` / `no_winner_policy` — политика no-winner.
 - `max_cycles` / `auto_loop` — автоцикл и лимит циклов.
+- `wait_fill_timeout_ms` / `wait_exit_timeout_ms` — ожидания заполнения.
+- `wait_positions_timeout_ms` — ожидание флет-позиции.
+- `max_ride_ms` — лимит ride фазы.
+- `data_stale_exit_ms` — выход при устаревании данных.
 
 ## Контроль риска и безопасности
 
@@ -79,7 +79,8 @@
 - Проверка минимального лота и ноционала по фильтрам биржи.
 - Ограничение по `leverage_max` относительно equity.
 - Controlled/emergency flatten при сбоях исполнения.
-- Выход при устаревании данных (`effective_age_ms > 1500`).
+- Выход при устаревании данных (`effective_age_ms > data_stale_exit_ms`).
+- Защита от повторного входа при активном цикле.
 
 ## Производительность и надёжность
 
