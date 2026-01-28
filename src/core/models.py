@@ -42,6 +42,8 @@ class Settings:
     sell_ttl_ms: int
     max_sell_retries: int
     force_close_on_ttl: bool
+    max_wait_sell_ms: int
+    allow_force_close: bool
     cycle_count: int
     order_quote: float
     max_budget: float

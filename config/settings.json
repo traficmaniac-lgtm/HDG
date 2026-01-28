@@ -39,6 +39,8 @@
   "sell_ttl_ms": 8000,
   "max_sell_retries": 3,
   "force_close_on_ttl": true,
+  "max_wait_sell_ms": 15000,
+  "allow_force_close": false,
   "api": {
     "key": "",
     "secret": ""

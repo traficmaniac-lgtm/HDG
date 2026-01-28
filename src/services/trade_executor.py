@@ -66,6 +66,7 @@ class TradeExecutor:
         self.sell_last_attempt_ts = 0.0
         self.sell_backoff_ms = 500
         self._pending_sell_retry_reason: Optional[str] = None
+        self.sell_retry_pending = False
         self._aggregate_sold_qty = 0.0
         self.position_qty_base: Optional[float] = None
         self.exit_intent: Optional[str] = None
@@ -546,6 +547,7 @@ class TradeExecutor:
         self,
         reason: str = "manual",
         mid_override: Optional[float] = None,
+        price_override: Optional[float] = None,
         reset_retry: bool = True,
     ) -> int:
         if self.sell_place_inflight:
@@ -586,7 +588,7 @@ class TradeExecutor:
                 self._logger("[TRADE] SELL rejected: MARKET disabled")
                 self.last_action = "market_sell_rejected"
                 return 0
-            if exit_order_type == "LIMIT" and ask is None:
+            if exit_order_type == "LIMIT" and ask is None and price_override is None:
                 now = time.monotonic()
                 if now - self._last_no_price_log_ts >= 2.0:
                     self._last_no_price_log_ts = now
@@ -654,8 +656,13 @@ class TradeExecutor:
             sell_price = None
             if exit_order_type == "LIMIT":
                 tick_offset = max(0, int(self._settings.exit_offset_ticks))
-                sell_price = ask - tick_offset * self._profile.tick_size
-                sell_price = self._round_to_step(sell_price, self._profile.tick_size)
+                if price_override is None:
+                    sell_price = ask - tick_offset * self._profile.tick_size
+                    sell_price = self._round_to_step(
+                        sell_price, self._profile.tick_size
+                    )
+                else:
+                    sell_price = price_override
 
             is_isolated = "TRUE" if self._settings.margin_isolated else "FALSE"
             timestamp = int(time.time() * 1000)
@@ -813,6 +820,7 @@ class TradeExecutor:
         self._sell_retry_count = 0
         self._clear_price_wait("EXIT")
         self._pending_sell_retry_reason = None
+        self.sell_retry_pending = False
 
     def _start_sell_wait(self) -> None:
         self._sell_wait_started_ts = time.monotonic()
@@ -1112,13 +1120,11 @@ class TradeExecutor:
         if sell_order and self.sell_active_order_id is None:
             self.sell_active_order_id = sell_order.get("orderId")
         if not sell_order:
-            if self._pending_sell_retry_reason:
-                self._retry_sell_after_cancel(
-                    {"reason": self._pending_sell_retry_reason}
-                )
+            if self.sell_retry_pending or self._pending_sell_retry_reason:
+                self._maybe_place_sell_retry()
                 return
             if self.sell_cancel_pending:
-                self._finalize_sell_cancel(self.sell_active_order_id)
+                self._handle_sell_cancel_confirmed(None, self.sell_active_order_id)
             return
         if sell_order.get("status") == "FILLED":
             return
@@ -1137,6 +1143,50 @@ class TradeExecutor:
         if self._sell_retry_count >= max_retries:
             self._force_close_after_ttl()
             return
+        if order_id:
+            live_order = self._get_margin_order_snapshot(order_id)
+            if live_order:
+                status = str(live_order.get("status") or "").upper()
+                executed_qty = float(
+                    live_order.get("executedQty", 0.0)
+                    or live_order.get("executedQuantity", 0.0)
+                    or 0.0
+                )
+                cum_quote = float(live_order.get("cummulativeQuoteQty", 0.0) or 0.0)
+                avg_price = 0.0
+                if executed_qty > 0 and cum_quote > 0:
+                    avg_price = cum_quote / executed_qty
+                else:
+                    avg_price = float(
+                        live_order.get("avgPrice", 0.0)
+                        or live_order.get("price", 0.0)
+                        or 0.0
+                    )
+                if status:
+                    sell_order["status"] = status
+                    sell_order["sell_status"] = status
+                if executed_qty > 0:
+                    self._update_sell_execution(sell_order, executed_qty)
+                if avg_price > 0:
+                    sell_order["avg_fill_price"] = avg_price
+                    sell_order["last_fill_price"] = avg_price
+                if status == "FILLED":
+                    sell_order["qty"] = (
+                        executed_qty if executed_qty > 0 else sell_order.get("qty")
+                    )
+                    if avg_price > 0:
+                        sell_order["price"] = avg_price
+                    self._apply_order_filled(sell_order)
+                    self.active_test_orders = [
+                        entry
+                        for entry in self.active_test_orders
+                        if entry.get("orderId") != order_id
+                    ]
+                    self.orders_count = len(self.active_test_orders)
+                    return
+                if status in {"CANCELED", "REJECTED", "EXPIRED"}:
+                    self._handle_sell_cancel_confirmed(sell_order, order_id)
+                    return
         if order_id and order_id in open_orders:
             if not self._should_dedup_log(f"sell_cancel_request:{order_id}", 2.0):
                 self._logger(f"[SELL_CANCEL_REQUEST] id={order_id}")
@@ -1152,16 +1202,167 @@ class TradeExecutor:
                 return
             if error_code == -2011:
                 if order_id not in open_orders:
-                    self._finalize_sell_cancel(order_id)
-                    self._retry_sell_after_cancel(sell_order)
+                    self._handle_sell_cancel_confirmed(sell_order, order_id)
                 else:
                     self.sell_cancel_pending = True
                     if not self._should_dedup_log(f"sell_cancel_wait:{order_id}", 2.0):
                         self._logger(f"[SELL_CANCEL_WAIT] id={order_id}")
                 return
             return
-        self._finalize_sell_cancel(order_id)
-        self._retry_sell_after_cancel(sell_order)
+        self._handle_sell_cancel_confirmed(sell_order, order_id)
+
+    def _maybe_handle_sell_watchdog(self, open_orders: dict[int, dict]) -> bool:
+        if self.state != TradeState.STATE_WAIT_SELL:
+            return False
+        max_wait_ms = int(getattr(self._settings, "max_wait_sell_ms", 0) or 0)
+        if max_wait_ms <= 0:
+            return False
+        if self._sell_wait_started_ts is None:
+            self._start_sell_wait()
+            return False
+        elapsed_ms = int((time.monotonic() - self._sell_wait_started_ts) * 1000.0)
+        if elapsed_ms <= max_wait_ms:
+            return False
+        action = "close_timeout"
+        if getattr(self._settings, "allow_force_close", False):
+            action = "force_close_market"
+        self._logger(f"[SELL_STUCK_TIMEOUT] waited_ms={elapsed_ms} action={action}")
+        is_isolated = "TRUE" if self._settings.margin_isolated else "FALSE"
+        for order in list(self.active_test_orders):
+            if order.get("side") != "SELL":
+                continue
+            self._cancel_margin_order(
+                symbol=self._settings.symbol,
+                order_id=order.get("orderId"),
+                is_isolated=is_isolated,
+                tag=order.get("tag", self.TAG),
+            )
+        if getattr(self._settings, "allow_force_close", False):
+            qty = self._round_down(
+                self._resolve_remaining_qty_raw(), self._profile.step_size
+            )
+            if qty > 0:
+                self._place_emergency_market_sell(qty)
+                return True
+            self._finalize_sell_timeout()
+            return True
+        self._finalize_sell_timeout()
+        return True
+
+    def _finalize_sell_timeout(self) -> None:
+        self._sell_wait_started_ts = None
+        self._sell_retry_count = 0
+        self.sell_active_order_id = None
+        self.sell_cancel_pending = False
+        self.sell_retry_pending = False
+        self._pending_sell_retry_reason = None
+        self.active_test_orders = [
+            entry for entry in self.active_test_orders if entry.get("side") != "SELL"
+        ]
+        self.orders_count = len(self.active_test_orders)
+        self.last_exit_reason = "SELL_TIMEOUT"
+        self.position = None
+        self._reset_position_tracking()
+        self._transition_state(TradeState.STATE_CLOSED)
+        self._transition_state(TradeState.STATE_IDLE)
+        self._handle_cycle_completion(reason="SELL_TIMEOUT")
+
+    def _schedule_sell_retry(self, reason: str) -> None:
+        remaining_qty_raw = self._resolve_remaining_qty_raw()
+        remaining_qty = self._round_down(
+            remaining_qty_raw, self._profile.step_size
+        )
+        self._logger(
+            "[SELL_RETRY_PENDING] "
+            f"intent={reason} remaining={remaining_qty:.8f}"
+        )
+        self.sell_retry_pending = True
+        self._pending_sell_retry_reason = reason
+        if self.state != TradeState.STATE_PLACE_SELL:
+            self._transition_state(TradeState.STATE_PLACE_SELL)
+
+    def _maybe_place_sell_retry(self) -> bool:
+        if not self.sell_retry_pending and not self._pending_sell_retry_reason:
+            return False
+        if self.sell_place_inflight or self.sell_cancel_pending:
+            return False
+        if self._has_active_order("SELL"):
+            return False
+        if self.state not in {
+            TradeState.STATE_WAIT_SELL,
+            TradeState.STATE_PLACE_SELL,
+        }:
+            return False
+        snapshot = self._router.get_mid_snapshot(int(self._settings.mid_fresh_ms))
+        ok, mid, age_ms, source, status = snapshot
+        if not ok:
+            self._start_price_wait("EXIT")
+            self._log_price_wait("EXIT", age_ms, source)
+            if self.state != TradeState.STATE_WAIT_SELL:
+                self._transition_state(TradeState.STATE_WAIT_SELL)
+                self._start_sell_wait()
+            return False
+        self._clear_price_wait("EXIT")
+        price_state, _ = self._router.build_price_state()
+        bid = price_state.bid
+        ask = price_state.ask
+        exit_order_type = self._normalize_order_type(self._settings.exit_order_type)
+        if exit_order_type == "LIMIT" and (ask is None or not self._profile.tick_size):
+            self._start_price_wait("EXIT")
+            self._log_price_wait("EXIT", age_ms, source)
+            if self.state != TradeState.STATE_WAIT_SELL:
+                self._transition_state(TradeState.STATE_WAIT_SELL)
+                self._start_sell_wait()
+            return False
+        tick_offset = max(0, int(self._settings.exit_offset_ticks))
+        new_price = None
+        if exit_order_type == "LIMIT":
+            new_price = ask - tick_offset * self._profile.tick_size
+            new_price = self._round_to_step(new_price, self._profile.tick_size)
+        price_label = "MARKET" if new_price is None else f"{new_price:.8f}"
+        mid_label = "—" if mid is None else f"{mid:.8f}"
+        bid_label = "—" if bid is None else f"{bid:.8f}"
+        ask_label = "—" if ask is None else f"{ask:.8f}"
+        self._logger(
+            "[SELL_REPRICE] "
+            f"mid={mid_label} bid={bid_label} ask={ask_label} new_price={price_label}"
+        )
+        max_retries = int(self._settings.max_sell_retries)
+        if self._sell_retry_count >= max_retries:
+            self._force_close_after_ttl()
+            return True
+        self._sell_retry_count += 1
+        retry_index = self._sell_retry_count
+        self._logger(
+            f"[SELL_RETRY {retry_index}/{max_retries} price={price_label}]"
+        )
+        remaining_qty_raw = self._resolve_remaining_qty_raw()
+        remaining_qty = self._round_down(
+            remaining_qty_raw, self._profile.step_size
+        )
+        if remaining_qty > 0:
+            self._logger(
+                "[SELL_RETRY_REMAINING] "
+                f"qty={remaining_qty:.8f} remaining={remaining_qty_raw:.8f} "
+                f"n={retry_index}/{max_retries}"
+            )
+        self.sell_retry_pending = False
+        reason = str(self._pending_sell_retry_reason or self.exit_intent or "MANUAL").upper()
+        self._pending_sell_retry_reason = None
+        placed = self._place_sell_order(
+            reason=reason,
+            reset_retry=False,
+            mid_override=mid,
+            price_override=new_price,
+        )
+        if placed:
+            return True
+        self.sell_retry_pending = True
+        self._pending_sell_retry_reason = reason
+        if self.state != TradeState.STATE_WAIT_SELL:
+            self._transition_state(TradeState.STATE_WAIT_SELL)
+            self._start_sell_wait()
+        return False
 
     def _force_close_after_ttl(self, reason: str = "TTL_EXCEEDED") -> None:
         self._logger(f"[SELL_FORCE_CLOSE reason={reason}]")
@@ -1169,6 +1370,8 @@ class TradeExecutor:
         self._sell_retry_count = 0
         self.sell_active_order_id = None
         self.sell_cancel_pending = False
+        self.sell_retry_pending = False
+        self._pending_sell_retry_reason = None
         is_isolated = "TRUE" if self._settings.margin_isolated else "FALSE"
         for order in list(self.active_test_orders):
             if order.get("side") != "SELL":
@@ -1259,7 +1462,10 @@ class TradeExecutor:
             if sell_order:
                 self.sell_active_order_id = sell_order.get("orderId")
         self._maybe_handle_buy_ttl(open_map)
+        if self._maybe_handle_sell_watchdog(open_map):
+            return
         self._maybe_handle_sell_ttl(open_map)
+        self._maybe_place_sell_retry()
 
     def handle_order_filled(
         self, order_id: int, side: str, price: float, qty: float, ts_ms: int
@@ -1622,10 +1828,10 @@ class TradeExecutor:
             return
         status = str(sell_order.get("status") or "").upper()
         if status in {"CANCELED", "REJECTED", "EXPIRED"}:
-            self._finalize_sell_cancel(order_id)
+            self._handle_sell_cancel_confirmed(sell_order, order_id)
             return
         if order_id not in open_orders:
-            self._finalize_sell_cancel(order_id)
+            self._handle_sell_cancel_confirmed(sell_order, order_id)
             return
         if not self._should_dedup_log(f"sell_cancel_wait:{order_id}", 2.0):
             self._logger(f"[SELL_CANCEL_WAIT] id={order_id}")
@@ -1635,6 +1841,7 @@ class TradeExecutor:
             self._logger(f"[SELL_CANCEL_CONFIRMED] id={order_id}")
         self.sell_cancel_pending = False
         self.sell_active_order_id = None
+        self.sell_retry_pending = False
         if order_id is not None:
             self.active_test_orders = [
                 entry
@@ -1644,51 +1851,77 @@ class TradeExecutor:
             self.orders_count = len(self.active_test_orders)
         self._sell_wait_started_ts = None
 
+    def _handle_sell_cancel_confirmed(
+        self, sell_order: Optional[dict], order_id: Optional[int]
+    ) -> None:
+        if order_id is None:
+            self._finalize_sell_cancel(order_id)
+            return
+        if sell_order is None:
+            sell_order = next(
+                (
+                    entry
+                    for entry in self.active_test_orders
+                    if entry.get("orderId") == order_id
+                ),
+                None,
+            )
+        live_order = self._get_margin_order_snapshot(order_id)
+        if live_order:
+            status = str(live_order.get("status") or "").upper()
+            executed_qty = float(
+                live_order.get("executedQty", 0.0)
+                or live_order.get("executedQuantity", 0.0)
+                or 0.0
+            )
+            cum_quote = float(live_order.get("cummulativeQuoteQty", 0.0) or 0.0)
+            avg_price = 0.0
+            if executed_qty > 0 and cum_quote > 0:
+                avg_price = cum_quote / executed_qty
+            else:
+                avg_price = float(
+                    live_order.get("avgPrice", 0.0)
+                    or live_order.get("price", 0.0)
+                    or 0.0
+                )
+            if sell_order is not None:
+                if status:
+                    sell_order["status"] = status
+                    sell_order["sell_status"] = status
+                if executed_qty > 0:
+                    self._update_sell_execution(sell_order, executed_qty)
+                if avg_price > 0:
+                    sell_order["avg_fill_price"] = avg_price
+                    sell_order["last_fill_price"] = avg_price
+                if status == "FILLED":
+                    sell_order["qty"] = (
+                        executed_qty if executed_qty > 0 else sell_order.get("qty")
+                    )
+                    if avg_price > 0:
+                        sell_order["price"] = avg_price
+                    self._apply_order_filled(sell_order)
+                    self.active_test_orders = [
+                        entry
+                        for entry in self.active_test_orders
+                        if entry.get("orderId") != order_id
+                    ]
+                    self.orders_count = len(self.active_test_orders)
+                    return
+        if sell_order is not None:
+            reason = str(sell_order.get("reason") or "MANUAL").upper()
+        else:
+            reason = str(self.exit_intent or "MANUAL").upper()
+        self._finalize_sell_cancel(order_id)
+        self._schedule_sell_retry(reason)
+
     def _retry_sell_after_cancel(self, sell_order: dict) -> None:
         max_retries = int(self._settings.max_sell_retries)
         if self._sell_retry_count >= max_retries:
             self._force_close_after_ttl()
             return
         reason = str(sell_order.get("reason") or "MANUAL").upper()
-        snapshot = self._router.get_mid_snapshot(self._settings.mid_fresh_ms)
-        if not snapshot[0]:
-            self._start_price_wait("EXIT")
-            self._log_price_wait("EXIT", snapshot[2], snapshot[3])
-            self._pending_sell_retry_reason = reason
-            return
-        self._clear_price_wait("EXIT")
-        self._pending_sell_retry_reason = None
-        price_state, _ = self._router.build_price_state()
-        exit_order_type = self._normalize_order_type(self._settings.exit_order_type)
-        if exit_order_type == "LIMIT":
-            ask = price_state.ask
-            if ask is None or not self._profile.tick_size:
-                self._force_close_after_ttl(reason="NO_PRICE")
-                return
-            tick_offset = max(0, int(self._settings.exit_offset_ticks))
-            sell_price = ask - tick_offset * self._profile.tick_size
-            sell_price = self._round_to_step(sell_price, self._profile.tick_size)
-            retry_price = f"{sell_price:.8f}"
-        else:
-            retry_price = "MARKET"
-        self._sell_retry_count += 1
-        retry_index = self._sell_retry_count
-        self._logger(
-            f"[SELL_RETRY {retry_index}/{max_retries} price={retry_price}]"
-        )
-        remaining_qty_raw = self._resolve_remaining_qty_raw()
-        remaining_qty = self._round_down(
-            remaining_qty_raw, self._profile.step_size
-        )
-        if remaining_qty > 0:
-            self._logger(
-                "[SELL_RETRY_REMAINING] "
-                f"qty={remaining_qty:.8f} remaining={remaining_qty_raw:.8f} "
-                f"n={retry_index}/{max_retries}"
-            )
-        placed = self._place_sell_order(reason=reason, reset_retry=False)
-        if placed:
-            self._pending_sell_retry_reason = None
+        self._schedule_sell_retry(reason)
+        self._maybe_place_sell_retry()
 
     def abort_cycle(self) -> int:
         return self.abort_cycle_with_reason(reason="ABORT")
