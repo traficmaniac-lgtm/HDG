@@ -28,6 +28,8 @@ class Settings:
     leverage_hint: int
     offset_ticks: int
     entry_offset_ticks: int
+    entry_reprice_min_ticks: int
+    entry_reprice_cooldown_ms: int
     take_profit_ticks: int
     stop_loss_ticks: int
     order_type: str

@@ -741,7 +741,13 @@ class MainWindow(QMainWindow):
                 payload.get("leverage_hint", payload.get("max_leverage_hint", 3))
             ),
             offset_ticks=int(payload.get("offset_ticks", payload.get("test_tick_offset", 1))),
-            entry_offset_ticks=int(payload.get("entry_offset_ticks", payload.get("offset_ticks", 0))),
+            entry_offset_ticks=int(payload.get("entry_offset_ticks", payload.get("offset_ticks", 1))),
+            entry_reprice_min_ticks=self._bounded_int(
+                payload.get("entry_reprice_min_ticks", 1), 1, 10, 1
+            ),
+            entry_reprice_cooldown_ms=self._bounded_int(
+                payload.get("entry_reprice_cooldown_ms", 800), 100, 5000, 800
+            ),
             take_profit_ticks=int(payload.get("take_profit_ticks", 1)),
             stop_loss_ticks=int(payload.get("stop_loss_ticks", 2)),
             order_type=str(payload.get("order_type", "LIMIT")).upper(),
@@ -859,55 +865,42 @@ class MainWindow(QMainWindow):
     def _on_trade_settings_saved(
         self,
         order_quote: float,
-        tick_offset: int,
-        take_profit_ticks: int,
-        stop_loss_ticks: int,
-        cycle_count: int,
-        order_type: str,
-        buy_ttl_ms: int,
-        max_buy_retries: int,
-        entry_mode: str,
-        aggressive_offset_ticks: int,
-        max_entry_total_ms: int,
-        exit_offset_ticks: int,
-        exit_order_type: str,
-        allow_borrow: bool,
-        side_effect_type: str,
-        auto_exit_enabled: bool,
         max_budget: float,
         budget_reserve: float,
+        cycle_count: int,
+        take_profit_ticks: int,
+        stop_loss_ticks: int,
+        entry_offset_ticks: int,
+        exit_offset_ticks: int,
         mid_fresh_ms: int,
-        max_wait_price_ms: int,
+        http_fresh_ms: int,
+        max_entry_total_ms: int,
+        allow_borrow: bool,
+        auto_exit_enabled: bool,
     ) -> None:
         if self._settings:
             self._settings.order_quote = order_quote
-            self._settings.offset_ticks = tick_offset
+            self._settings.max_budget = max_budget
+            self._settings.budget_reserve = budget_reserve
+            self._settings.cycle_count = cycle_count
             self._settings.take_profit_ticks = take_profit_ticks
             self._settings.stop_loss_ticks = stop_loss_ticks
-            self._settings.cycle_count = cycle_count
-            self._settings.order_type = order_type
-            self._settings.buy_ttl_ms = buy_ttl_ms
-            self._settings.max_buy_retries = max_buy_retries
-            self._settings.entry_mode = entry_mode
-            self._settings.aggressive_offset_ticks = self._bounded_int(
-                aggressive_offset_ticks, 0, 2, 0
+            self._settings.entry_offset_ticks = self._bounded_int(
+                entry_offset_ticks, 0, 1000, 1
+            )
+            self._settings.offset_ticks = self._settings.entry_offset_ticks
+            self._settings.exit_offset_ticks = exit_offset_ticks
+            self._settings.mid_fresh_ms = self._bounded_int(
+                mid_fresh_ms, 200, 5000, 800
+            )
+            self._settings.http_fresh_ms = self._bounded_int(
+                http_fresh_ms, 200, 10000, 1500
             )
             self._settings.max_entry_total_ms = self._bounded_int(
                 max_entry_total_ms, 1000, 120000, 30000
             )
-            self._settings.exit_offset_ticks = exit_offset_ticks
-            self._settings.exit_order_type = exit_order_type
             self._settings.allow_borrow = allow_borrow
-            self._settings.side_effect_type = side_effect_type
             self._settings.auto_exit_enabled = auto_exit_enabled
-            self._settings.max_budget = max_budget
-            self._settings.budget_reserve = budget_reserve
-            self._settings.mid_fresh_ms = self._bounded_int(
-                mid_fresh_ms, 200, 5000, 800
-            )
-            self._settings.max_wait_price_ms = self._bounded_int(
-                max_wait_price_ms, 1000, 30000, 5000
-            )
         self._append_log("[SETTINGS] saved")
 
     def _on_api_saved(self, key: str, secret: str) -> None:
