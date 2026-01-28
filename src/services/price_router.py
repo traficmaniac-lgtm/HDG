@@ -24,6 +24,9 @@ class PriceRouter:
         self._last_switch_reason = ""
         self._ws_fresh_streak = 0
         self._ws_stable_since: Optional[float] = None
+        self._ws_connected = False
+        self._ws_no_first_tick_count = 0
+        self._ws_stale_ticks_count = 0
         self._last_good_bid: Optional[float] = None
         self._last_good_ask: Optional[float] = None
         self._last_good_mid: Optional[float] = None
@@ -59,6 +62,19 @@ class PriceRouter:
 
     def set_tick_size(self, tick_size: Optional[float]) -> None:
         self._tick_size = tick_size
+
+    def set_ws_connected(self, value: bool) -> None:
+        self._ws_connected = value
+
+    def record_ws_issue(self, reason: str) -> None:
+        reason_lower = reason.lower()
+        if "no first tick" in reason_lower:
+            self._ws_no_first_tick_count += 1
+        elif "stale ticks" in reason_lower:
+            self._ws_stale_ticks_count += 1
+
+    def get_ws_issue_counts(self) -> tuple[int, int]:
+        return self._ws_no_first_tick_count, self._ws_stale_ticks_count
 
     def consume_logs(self) -> list[str]:
         if not self._log_queue:
@@ -248,12 +264,29 @@ class PriceRouter:
             ttl_expired=ttl_expired,
         )
         health_state = HealthState(
-            ws_connected=False,
+            ws_connected=self._ws_connected,
             ws_age_ms=ws_age_ms,
             http_age_ms=http_age_ms,
             last_switch_reason=self._last_switch_reason,
         )
         return price_state, health_state
+
+    def get_http_snapshot(
+        self, required_fresh_ms: int
+    ) -> tuple[bool, Optional[float], Optional[float], Optional[float], Optional[int], str]:
+        if self._last_http_ts is None:
+            return False, self._http_bid, self._http_ask, None, None, "no_http"
+        age_ms = int((time.monotonic() - self._last_http_ts) * 1000.0)
+        bid = self._http_bid
+        ask = self._http_ask
+        if bid is None or ask is None:
+            return False, bid, ask, None, age_ms, "no_quote"
+        if age_ms > required_fresh_ms:
+            return False, bid, ask, None, age_ms, "stale"
+        mid = (bid + ask) / 2.0
+        if self._tick_size:
+            mid = round(mid / self._tick_size) * self._tick_size
+        return True, bid, ask, mid, age_ms, "fresh"
 
     def get_mid_snapshot(
         self, required_fresh_ms: int

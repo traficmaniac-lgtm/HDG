@@ -21,6 +21,9 @@ class Settings:
     max_wait_price_ms: int
     price_wait_log_every_ms: int
     position_guard_http: bool
+    entry_mode: str
+    aggressive_offset_ticks: int
+    max_entry_total_ms: int
     account_mode: str
     leverage_hint: int
     offset_ticks: int
