@@ -7,6 +7,7 @@ from typing import Optional
 
 from datetime import datetime
 
+import httpx
 from PySide6.QtCore import Qt, QTimer, Slot
 from PySide6.QtGui import QAction, QStandardItem, QStandardItemModel
 from PySide6.QtWidgets import (
@@ -58,6 +59,8 @@ class MainWindow(QMainWindow):
         self._config_store = ConfigStore()
         self._last_mid: Optional[float] = None
         self._orders_error_logged = False
+        self._margin_enabled = False
+        self._margin_checked = False
 
         self._ui_timer = QTimer(self)
         self._ui_timer.timeout.connect(self._refresh_ui)
@@ -290,6 +293,11 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self._append_log(f"REST init error: {exc}")
 
+        self._margin_enabled = False
+        self._margin_checked = False
+        if self._rest and self._has_valid_api_credentials(api_credentials):
+            self._check_margin_permissions()
+
         if (
             self._rest
             and self._router
@@ -303,8 +311,7 @@ class MainWindow(QMainWindow):
                 profile=self._symbol_profile,
                 logger=self._append_log,
             )
-            self.start_button.setEnabled(True)
-            self.stop_button.setEnabled(True)
+            self._update_trading_controls()
         else:
             self.start_button.setEnabled(False)
             self.stop_button.setEnabled(False)
@@ -349,6 +356,8 @@ class MainWindow(QMainWindow):
 
         self._connected = False
         self._ws_connected = False
+        self._margin_enabled = False
+        self._margin_checked = False
         self._update_status(False)
         self._append_log("DISCONNECT: data services stopped")
 
@@ -410,10 +419,11 @@ class MainWindow(QMainWindow):
         if self._trade_executor:
             last_action = self._trade_executor.last_action
             orders_count = str(self._trade_executor.orders_count)
+        margin_auth = "OK" if self._margin_enabled else "NO"
         self.summary_label.setText(
             f"{self._settings.symbol if self._settings else 'EURIUSDT'} | "
             f"SRC: {price_state.source} | AGE: {summary_age} ms | "
-            f"last_action: {last_action} | orders: {orders_count}"
+            f"MARGIN_AUTH: {margin_auth} | last_action: {last_action} | orders: {orders_count}"
         )
 
         self.ws_connected_label.setText(f"ws_connected: {health_state.ws_connected}")
@@ -424,6 +434,7 @@ class MainWindow(QMainWindow):
         self.switch_reason_label.setText(
             f"last_switch_reason: {health_state.last_switch_reason or '—'}"
         )
+        self._update_trading_controls(price_state)
 
     def _update_status(self, connected: bool) -> None:
         if connected:
@@ -435,9 +446,56 @@ class MainWindow(QMainWindow):
             self.status_label.setStyleSheet("color: #ff5f57; font-weight: 600;")
             self.connect_button.setText("CONNECT")
 
+    def _update_trading_controls(self, price_state: Optional[object] = None) -> None:
+        if price_state is not None:
+            self._last_mid = price_state.mid
+        mid_available = self._last_mid is not None
+        can_trade = (
+            self._connected
+            and self._trade_executor is not None
+            and self._has_valid_api_credentials(self._api_credentials)
+        )
+        self.start_button.setEnabled(can_trade and self._margin_enabled and mid_available)
+        self.stop_button.setEnabled(can_trade)
+
+    def _check_margin_permissions(self) -> None:
+        if not self._rest:
+            return
+        try:
+            self._rest.get_margin_account()
+            self._margin_enabled = True
+            self._margin_checked = True
+            self._append_log("[MARGIN_CHECK] ok")
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code if exc.response else "?"
+            code = None
+            msg = None
+            path = "?"
+            try:
+                payload = exc.response.json() if exc.response else {}
+                code = payload.get("code")
+                msg = payload.get("msg")
+            except Exception:
+                pass
+            if exc.request and exc.request.url:
+                path = exc.request.url.path
+            self._margin_enabled = False
+            self._margin_checked = True
+            self._append_log(
+                f"[MARGIN_CHECK] fail http={status} code={code} msg={msg} path={path}"
+            )
+        except Exception as exc:
+            self._margin_enabled = False
+            self._margin_checked = True
+            self._append_log(f"[MARGIN_CHECK] error: {exc}")
+
     @Slot()
     def _start_trading(self) -> None:
         if not self._trade_executor:
+            return
+        if not self._margin_enabled:
+            self._append_log("[TRADE] blocked: margin_not_authorized")
+            self._trade_executor.last_action = "margin_not_authorized"
             return
         placed = self._trade_executor.place_test_orders_margin()
         if placed:
@@ -561,6 +619,8 @@ class MainWindow(QMainWindow):
             self._rest.api_secret = secret
         self._append_log("[API] saved ok")
         self._configure_trading_state()
+        if self._connected and self._rest:
+            self._check_margin_permissions()
 
     def _configure_trading_state(self) -> None:
         if not self._connected or not self._settings or not self._router or not self._rest:
@@ -579,8 +639,7 @@ class MainWindow(QMainWindow):
                 profile=self._symbol_profile,
                 logger=self._append_log,
             )
-        self.start_button.setEnabled(True)
-        self.stop_button.setEnabled(True)
+        self._update_trading_controls()
 
     def _load_env(self) -> dict:
         env_path = Path(__file__).resolve().parents[2] / "config" / ".env"
