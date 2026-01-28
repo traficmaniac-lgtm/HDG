@@ -1,21 +1,28 @@
 # State Machine
 
 ## Состояния
-- **IDLE**: нет активных ордеров, позиция отсутствует.
-- **BUY_PLACED**: BUY ордер создан, статус `NEW`.
-- **POSITION_OPEN**: BUY FILLED, `position` заполнена.
-- **CLOSING**: SELL ордер создан для закрытия.
-- **CLOSED**: SELL FILLED, позиция очищена, PnL зафиксирован.
+- **IDLE**: приложение запущено, подключения нет.
+- **CONNECTED**: сервисы данных активны, торговля не запущена.
+- **RUNNING**: активный торговый поток (есть BUY/SELL ордера или позиция).
+- **STOPPING**: инициировано закрытие позиции/ордеров (STOP нажат).
+- **ERROR**: критическая ошибка (например, REST/WS сбой), требует вмешательства оператора.
 
-## Допустимые переходы
-- `IDLE → BUY_PLACED` (START).
-- `BUY_PLACED → POSITION_OPEN` (BUY FILLED).
-- `BUY_PLACED → CLOSING` (STOP до заполнения BUY).
-- `POSITION_OPEN → CLOSING` (STOP).
-- `CLOSING → CLOSED` (SELL FILLED).
-- `CLOSED → IDLE` (очистка активных ордеров, ожидание следующего цикла).
+## Что разрешено в каждом состоянии
+- **IDLE**: только CONNECT.
+- **CONNECTED**: START, изменение настроек, наблюдение данных.
+- **RUNNING**: только STOP, наблюдение данных.
+- **STOPPING**: ожидание завершения закрытия и возврат в CONNECTED.
+- **ERROR**: только DISCONNECT/CONNECT (ручная попытка восстановления).
 
-## Чего делать нельзя
-- START при активном BUY или открытой позиции.
-- STOP при отсутствии BUY/позиции.
-- Параллельные торговые действия (enforced single-flight).
+## Переходы
+- `IDLE → CONNECTED`: успешный CONNECT.
+- `CONNECTED → RUNNING`: START и успешное размещение BUY.
+- `RUNNING → STOPPING`: STOP.
+- `STOPPING → CONNECTED`: SELL завершён и ордера очищены.
+- `CONNECTED → IDLE`: DISCONNECT.
+- `ANY → ERROR`: критическая ошибка при работе сервисов/REST.
+- `ERROR → CONNECTED/IDLE`: ручной DISCONNECT/CONNECT.
+
+## Ограничения
+- Параллельные торговые действия запрещены (single-flight).
+- START недоступен без валидных API ключей и доступа к Margin API.

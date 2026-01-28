@@ -1,20 +1,18 @@
 # Order Lifecycle
 
-## BUY / SELL
-- START в GUI вызывает `place_test_orders_margin()` и размещает **BUY**.
-- STOP вызывает `close_position()` и размещает **SELL** для закрытия.
+## Жизненный цикл ордера
+1. **Intention**: GUI вызывает `place_test_orders_margin()` или `close_position()`.
+2. **NEW**: ордер добавляется в `active_test_orders` со статусом `NEW`.
+3. **FILLED / CANCELED / EXPIRED**:
+   - `sync_open_orders()` сравнивает локальный список с `openOrders` Binance.
+   - Если ордера нет в `openOrders`, он помечается как `FILLED` локально.
 
-## NEW / FILLED / CANCELED
-- После размещения ордер создаётся как `NEW` в `active_test_orders`.
-- `sync_open_orders()` сверяет с Binance openOrders:
-  - если ордер отсутствует → помечается как `FILLED`.
-- Отмена возможна через `cancel_test_orders_margin()` (отменяет открытые ордера и чистит список).
+## Разница между intention и фактом на бирже
+- Intention — это локальное действие (кнопка START/STOP).
+- Факт — статус на бирже (`openOrders`/SAPI ответ).
+- В текущей реализации отсутствует отдельная обработка `CANCELED`/`EXPIRED` от биржи.
 
-## Что считается «открытой позицией»
-- Позиция считается открытой, когда `position` заполнена (после BUY FILLED).
-- Пока BUY в статусе `NEW`, позиция ещё не открыта.
-
-## Правила закрытия
-- Закрытие возможно, если есть BUY в списке или `position` уже открыта.
-- SELL размещается по цене `mid + offset_ticks * tick_size` и количеству позиции/BUY.
-- После SELL FILLED позиция очищается, `pnl_cycle` фиксируется.
+## Ограничения текущей реализации
+- Нет явной обработки частичных исполнений.
+- Нет подтверждения статуса `CANCELED`/`EXPIRED` от биржи — отсутствие в `openOrders` трактуется как `FILLED`.
+- Один активный тестовый поток (single-flight): параллельные торговые действия запрещены.
