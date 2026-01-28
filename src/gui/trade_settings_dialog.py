@@ -19,7 +19,7 @@ from src.core.models import Settings
 
 
 class TradeSettingsDialog(QDialog):
-    saved = Signal(float, int, str, bool, str)
+    saved = Signal(float, int, str, bool, str, bool)
 
     def __init__(
         self, parent=None, store: ConfigStore | None = None, settings: Settings | None = None
@@ -62,6 +62,10 @@ class TradeSettingsDialog(QDialog):
         self.allow_borrow_input = QCheckBox("Разрешить заём (borrow)")
         self.allow_borrow_input.setChecked(bool(getattr(settings, "allow_borrow", True)))
         form.addRow("", self.allow_borrow_input)
+
+        self.auto_close_input = QCheckBox("Авто-закрытие после BUY")
+        self.auto_close_input.setChecked(bool(getattr(settings, "auto_close", False)))
+        form.addRow("", self.auto_close_input)
 
         self.side_effect_input = QComboBox()
         self.side_effect_input.addItems(["AUTO_BORROW_REPAY", "MARGIN_BUY", "NONE"])
@@ -106,6 +110,7 @@ class TradeSettingsDialog(QDialog):
         payload["order_type"] = str(self.order_type_input.currentText()).upper()
         payload["allow_borrow"] = bool(self.allow_borrow_input.isChecked())
         payload["side_effect_type"] = str(self.side_effect_input.currentText()).upper()
+        payload["auto_close"] = bool(self.auto_close_input.isChecked())
         self._store.save_settings(payload)
         self.saved.emit(
             float(self.notional_input.value()),
@@ -113,5 +118,6 @@ class TradeSettingsDialog(QDialog):
             str(self.order_type_input.currentText()).upper(),
             bool(self.allow_borrow_input.isChecked()),
             str(self.side_effect_input.currentText()).upper(),
+            bool(self.auto_close_input.isChecked()),
         )
         self.accept()

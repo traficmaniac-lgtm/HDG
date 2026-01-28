@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import re
 import time
+from enum import Enum
 from typing import Callable, Optional
 
 import httpx
@@ -10,6 +11,17 @@ import httpx
 from src.core.models import Settings, SymbolProfile
 from src.services.binance_rest import BinanceRestClient
 from src.services.price_router import PriceRouter
+
+
+class TradeState(Enum):
+    STATE_IDLE = "IDLE"
+    STATE_PLACE_BUY = "PLACE_BUY"
+    STATE_WAIT_BUY = "WAIT_BUY"
+    STATE_POSITION_OPEN = "POSITION_OPEN"
+    STATE_PLACE_SELL = "PLACE_SELL"
+    STATE_WAIT_SELL = "WAIT_SELL"
+    STATE_CLOSED = "CLOSED"
+    STATE_ERROR = "ERROR"
 
 
 class TradeExecutor:
@@ -42,6 +54,17 @@ class TradeExecutor:
         self.pnl_cycle: Optional[float] = None
         self.pnl_session: float = 0.0
         self._last_buy_price: Optional[float] = None
+        self.state = TradeState.STATE_IDLE
+
+    def get_state_label(self) -> str:
+        return self.state.value
+
+    def _transition_state(self, next_state: TradeState) -> None:
+        if self.state == next_state:
+            return
+        previous = self.state
+        self.state = next_state
+        self._logger(f"[STATE] {previous.value} → {next_state.value}")
 
     def set_margin_capabilities(
         self, margin_api_access: bool, borrow_allowed_by_api: Optional[bool]
@@ -54,6 +77,12 @@ class TradeExecutor:
             return 0
         self._inflight_trade_action = True
         try:
+            if self.state != TradeState.STATE_IDLE:
+                self._logger(
+                    f"[TRADE] START ignored: state={self.state.value}"
+                )
+                self.last_action = "state_blocked"
+                return 0
             if self._has_active_order("BUY") or self.position is not None:
                 self._logger("[TRADE] place_test_orders | BUY already active")
                 self.last_action = "buy_active"
@@ -147,6 +176,7 @@ class TradeExecutor:
                 self._settings.side_effect_type
             )
 
+            self._transition_state(TradeState.STATE_PLACE_BUY)
             self.last_action = "placing_buy"
             buy_order = self._place_margin_order(
                 symbol=self._settings.symbol,
@@ -160,12 +190,14 @@ class TradeExecutor:
             )
             if not buy_order:
                 self.last_action = "place_failed"
+                self._transition_state(TradeState.STATE_ERROR)
                 self.orders_count = 0
                 return 0
             self._logger(
                 f"[ORDER] BUY placed qty={qty:.8f} price={buy_price:.8f} "
                 f"id={buy_order.get('orderId')}"
             )
+            self._transition_state(TradeState.STATE_WAIT_BUY)
             now_ms = int(time.time() * 1000)
             self.active_test_orders = [
                 {
@@ -191,6 +223,15 @@ class TradeExecutor:
         if self._inflight_trade_action:
             self.last_action = "inflight"
             return 0
+        if self.state != TradeState.STATE_POSITION_OPEN:
+            self._logger(
+                f"[TRADE] close_position | blocked state={self.state.value}"
+            )
+            self.last_action = "state_blocked"
+            return 0
+        return self._place_sell_order()
+
+    def _place_sell_order(self) -> int:
         if self._has_active_order("SELL"):
             self._logger("[TRADE] close_position | SELL already active")
             self.last_action = "sell_active"
@@ -238,6 +279,7 @@ class TradeExecutor:
             )
             order_type = "LIMIT"
 
+            self._transition_state(TradeState.STATE_PLACE_SELL)
             self.last_action = "placing_sell"
             sell_order = self._place_margin_order(
                 symbol=self._settings.symbol,
@@ -252,11 +294,13 @@ class TradeExecutor:
             if not sell_order:
                 self._logger("[ORDER] SELL rejected")
                 self.last_action = "place_failed"
+                self._transition_state(TradeState.STATE_ERROR)
                 return 0
             self._logger(
                 f"[ORDER] SELL placed qty={qty:.8f} price={sell_price:.8f} "
                 f"id={sell_order.get('orderId')}"
             )
+            self._transition_state(TradeState.STATE_WAIT_SELL)
             now_ms = int(time.time() * 1000)
             self.active_test_orders.append(
                 {
@@ -306,17 +350,23 @@ class TradeExecutor:
                         "qty": order.get("qty"),
                         "opened_ts": now_ms,
                     }
-                    self._logger("[POSITION] opened")
+                self._transition_state(TradeState.STATE_POSITION_OPEN)
+                if self._settings.auto_close:
+                    self._place_sell_order()
             elif side == "SELL":
                 self._logger(
                     f"[ORDER] SELL filled qty={order.get('qty'):.8f} "
                     f"price={order.get('price'):.8f}"
                 )
-                self._finalize_close(order)
+                pnl = self._finalize_close(order)
+                realized = "—" if pnl is None else f"{pnl:.8f}"
+                self._logger(f"[PNL] realized={realized}")
+                self._transition_state(TradeState.STATE_CLOSED)
                 close_filled = True
         if close_filled:
             self.active_test_orders = []
             self.orders_count = 0
+            self._transition_state(TradeState.STATE_IDLE)
         else:
             self.orders_count = len(self.active_test_orders)
 
@@ -335,7 +385,7 @@ class TradeExecutor:
             return (mid - buy_order.get("price", mid)) * buy_order.get("qty", 0.0)
         return None
 
-    def _finalize_close(self, sell_order: dict) -> None:
+    def _finalize_close(self, sell_order: dict) -> Optional[float]:
         sell_price = sell_order.get("price")
         qty = sell_order.get("qty")
         buy_price = None
@@ -351,7 +401,7 @@ class TradeExecutor:
             self.pnl_session += pnl
         self.position = None
         self.last_action = "closed"
-        self._logger("[POSITION] closed")
+        return pnl
 
     def _resolve_close_qty(self) -> float:
         if self.position is not None:
@@ -363,14 +413,26 @@ class TradeExecutor:
 
     def _find_order(self, side: str) -> Optional[dict]:
         for order in self.active_test_orders:
+            if order.get("side") == side and order.get("status") != "FILLED":
+                return order
+        for order in self.active_test_orders:
             if order.get("side") == side:
                 return order
         return None
 
     def _has_active_order(self, side: str) -> bool:
-        return any(order.get("side") == side for order in self.active_test_orders)
+        return any(
+            order.get("side") == side and order.get("status") != "FILLED"
+            for order in self.active_test_orders
+        )
 
-    def cancel_test_orders_margin(self) -> int:
+    def abort_cycle(self) -> int:
+        cancelled = self.cancel_test_orders_margin(reason="aborted")
+        self._transition_state(TradeState.STATE_IDLE)
+        self.last_action = "aborted"
+        return cancelled
+
+    def cancel_test_orders_margin(self, reason: str = "cancelled") -> int:
         is_isolated = "TRUE" if self._settings.margin_isolated else "FALSE"
         cancelled = 0
         for order in list(self.active_test_orders):
@@ -389,7 +451,7 @@ class TradeExecutor:
 
         self.active_test_orders = []
         self._repay_borrowed_assets()
-        self.last_action = "cancelled"
+        self.last_action = reason
         self.orders_count = 0
         self._logger(f"[TRADE] cancel_test_orders | cancelled={cancelled} tag={self.TAG}")
         return cancelled

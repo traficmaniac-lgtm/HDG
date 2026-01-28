@@ -88,7 +88,8 @@ class MainWindow(QMainWindow):
         header_layout.setContentsMargins(8, 6, 8, 6)
         header_layout.setSpacing(8)
         self.summary_label = QLabel(
-            "EURIUSDT | SRC: NONE | MARGIN_AUTH: — | BORROW: — | last_action: — | orders: —"
+            "EURIUSDT | SRC: NONE | MARGIN_AUTH: — | BORROW: — | state: — | "
+            "last_action: — | orders: —"
         )
         self.summary_label.setStyleSheet("font-weight: 600;")
         self.connect_button = QPushButton("CONNECT")
@@ -99,6 +100,8 @@ class MainWindow(QMainWindow):
         self.status_label.setStyleSheet("color: #ff5f57; font-weight: 600;")
         self.start_button = QPushButton("START")
         self.start_button.clicked.connect(self._start_trading)
+        self.close_button = QPushButton("CLOSE")
+        self.close_button.clicked.connect(self._close_position)
         self.stop_button = QPushButton("STOP")
         self.stop_button.clicked.connect(self._stop_trading)
         self.settings_button = QPushButton("⚙ Настройки")
@@ -106,17 +109,20 @@ class MainWindow(QMainWindow):
         for button in (
             self.connect_button,
             self.start_button,
+            self.close_button,
             self.stop_button,
             self.settings_button,
         ):
             button.setFixedHeight(28)
         self.start_button.setEnabled(False)
+        self.close_button.setEnabled(False)
         self.stop_button.setEnabled(False)
 
         buttons_layout = QHBoxLayout()
         buttons_layout.setSpacing(6)
         buttons_layout.addWidget(self.connect_button)
         buttons_layout.addWidget(self.start_button)
+        buttons_layout.addWidget(self.close_button)
         buttons_layout.addWidget(self.stop_button)
         buttons_layout.addWidget(self.settings_button)
 
@@ -425,9 +431,11 @@ class MainWindow(QMainWindow):
         self.ask_label.setText(f"Ask: {self._fmt_price(price_state.ask)}")
         last_action = "—"
         orders_count = "—"
+        state_label = "—"
         if self._trade_executor:
             last_action = self._trade_executor.last_action
             orders_count = str(self._trade_executor.orders_count)
+            state_label = self._trade_executor.get_state_label()
         margin_auth = "OK" if self._margin_api_access else "FAIL"
         borrow_status = "—"
         if self._borrow_allowed_by_api is not None:
@@ -436,7 +444,7 @@ class MainWindow(QMainWindow):
             f"{self._settings.symbol if self._settings else 'EURIUSDT'} | "
             f"SRC: {price_state.source} | "
             f"MARGIN_AUTH: {margin_auth} | BORROW: {borrow_status} | "
-            f"last_action: {last_action} | orders: {orders_count}"
+            f"state: {state_label} | last_action: {last_action} | orders: {orders_count}"
         )
         self.ws_connected_label.setText(f"ws_connected: {health_state.ws_connected}")
         self.ws_age_label.setText(f"ws_age_ms: {self._fmt_int(health_state.ws_age_ms)}")
@@ -466,7 +474,11 @@ class MainWindow(QMainWindow):
             and self._trade_executor is not None
             and self._has_valid_api_credentials(self._api_credentials)
         )
-        self.start_button.setEnabled(can_trade and self._margin_api_access)
+        state_label = self._trade_executor.get_state_label() if self._trade_executor else "—"
+        self.start_button.setEnabled(
+            can_trade and self._margin_api_access and state_label == "IDLE"
+        )
+        self.close_button.setEnabled(can_trade and state_label == "POSITION_OPEN")
         self.stop_button.setEnabled(can_trade)
 
     def _check_margin_permissions(self) -> None:
@@ -522,10 +534,17 @@ class MainWindow(QMainWindow):
             self._refresh_orders()
 
     @Slot()
-    def _stop_trading(self) -> None:
+    def _close_position(self) -> None:
         if not self._trade_executor:
             return
         self._trade_executor.close_position()
+        self._refresh_orders()
+
+    @Slot()
+    def _stop_trading(self) -> None:
+        if not self._trade_executor:
+            return
+        self._trade_executor.abort_cycle()
         self._refresh_orders()
 
     @Slot()
@@ -586,6 +605,7 @@ class MainWindow(QMainWindow):
             allow_borrow=bool(payload.get("allow_borrow", True)),
             side_effect_type=str(payload.get("side_effect_type", "AUTO_BORROW_REPAY")).upper(),
             margin_isolated=bool(payload.get("margin_isolated", False)),
+            auto_close=bool(payload.get("auto_close", False)),
         )
 
     def _load_api_state(self) -> None:
@@ -638,6 +658,7 @@ class MainWindow(QMainWindow):
         order_type: str,
         allow_borrow: bool,
         side_effect_type: str,
+        auto_close: bool,
     ) -> None:
         if self._settings:
             self._settings.nominal_usd = notional
@@ -645,6 +666,7 @@ class MainWindow(QMainWindow):
             self._settings.order_type = order_type
             self._settings.allow_borrow = allow_borrow
             self._settings.side_effect_type = side_effect_type
+            self._settings.auto_close = auto_close
         self._append_log("[SETTINGS] saved")
 
     def _on_api_saved(self, key: str, secret: str) -> None:
