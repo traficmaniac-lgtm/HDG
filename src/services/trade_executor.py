@@ -55,6 +55,8 @@ class TradeExecutor:
         self.pnl_session: float = 0.0
         self.last_exit_reason: Optional[str] = None
         self._last_buy_price: Optional[float] = None
+        self._buy_wait_started_ts: Optional[float] = None
+        self._buy_retry_count = 0
         self._sell_wait_started_ts: Optional[float] = None
         self._sell_retry_count = 0
         self.state = TradeState.STATE_IDLE
@@ -92,11 +94,12 @@ class TradeExecutor:
                 return 0
             price_state, health_state = self._router.build_price_state()
             mid = price_state.mid
+            bid = price_state.bid
             if price_state.data_blind:
                 self._logger("[TRADE] blocked: data_blind")
                 self.last_action = "DATA_BLIND"
                 return 0
-            if mid is None:
+            if mid is None or bid is None:
                 now = time.monotonic()
                 if now - self._last_no_price_log_ts >= 2.0:
                     self._last_no_price_log_ts = now
@@ -117,8 +120,8 @@ class TradeExecutor:
                 )
                 return 0
 
-            tick_offset = self._settings.offset_ticks
-            buy_price = mid - tick_offset * self._profile.tick_size
+            tick_offset = max(0, int(self._settings.entry_offset_ticks))
+            buy_price = bid + tick_offset * self._profile.tick_size
             buy_price = self._round_to_step(buy_price, self._profile.tick_size)
             qty = self._round_down(
                 self._settings.nominal_usd / mid, self._profile.step_size
@@ -179,6 +182,11 @@ class TradeExecutor:
             timestamp = int(time.time() * 1000)
             buy_client_id = self._build_client_order_id("BUY", timestamp)
             order_type = self._normalize_order_type(self._settings.order_type)
+            if order_type == "MARKET":
+                self._logger("[TRADE] BUY rejected: MARKET disabled")
+                self.last_action = "market_buy_rejected"
+                self._transition_state(TradeState.STATE_IDLE)
+                return 0
             side_effect_type = self._normalize_side_effect_type(
                 self._settings.side_effect_type
             )
@@ -205,6 +213,8 @@ class TradeExecutor:
                 f"id={buy_order.get('orderId')}"
             )
             self._transition_state(TradeState.STATE_WAIT_BUY)
+            self._reset_buy_retry()
+            self._start_buy_wait()
             now_ms = int(time.time() * 1000)
             self.active_test_orders = [
                 {
@@ -300,11 +310,17 @@ class TradeExecutor:
             return 0
         self._inflight_trade_action = True
         try:
-            mid = mid_override
-            if mid is None:
-                price_state, health_state = self._router.build_price_state()
-                mid = price_state.mid
-            if mid is None:
+            price_state, health_state = self._router.build_price_state()
+            mid = mid_override if mid_override is not None else price_state.mid
+            ask = price_state.ask
+            exit_order_type = self._normalize_order_type(
+                self._settings.exit_order_type
+            )
+            if exit_order_type == "MARKET":
+                self._logger("[TRADE] SELL rejected: MARKET disabled")
+                self.last_action = "market_sell_rejected"
+                return 0
+            if exit_order_type == "LIMIT" and ask is None:
                 now = time.monotonic()
                 if now - self._last_no_price_log_ts >= 2.0:
                     self._last_no_price_log_ts = now
@@ -325,13 +341,10 @@ class TradeExecutor:
                 self.last_action = "precheck_failed"
                 return 0
 
-            exit_order_type = self._normalize_order_type(
-                self._settings.exit_order_type
-            )
             sell_price = None
             if exit_order_type == "LIMIT":
-                tick_offset = int(self._settings.exit_offset_ticks)
-                sell_price = mid + tick_offset * self._profile.tick_size
+                tick_offset = max(0, int(self._settings.exit_offset_ticks))
+                sell_price = ask - tick_offset * self._profile.tick_size
                 sell_price = self._round_to_step(sell_price, self._profile.tick_size)
 
             is_isolated = "TRUE" if self._settings.margin_isolated else "FALSE"
@@ -407,6 +420,125 @@ class TradeExecutor:
     def _start_sell_wait(self) -> None:
         self._sell_wait_started_ts = time.monotonic()
 
+    def _reset_buy_retry(self) -> None:
+        self._buy_wait_started_ts = None
+        self._buy_retry_count = 0
+
+    def _start_buy_wait(self) -> None:
+        self._buy_wait_started_ts = time.monotonic()
+
+    def _maybe_handle_buy_ttl(self, open_orders: dict[int, dict]) -> None:
+        if self.state != TradeState.STATE_WAIT_BUY:
+            return
+        ttl_ms = int(self._settings.buy_ttl_ms)
+        if ttl_ms <= 0:
+            return
+        buy_order = self._find_order("BUY")
+        if not buy_order or buy_order.get("status") == "FILLED":
+            return
+        if self._buy_wait_started_ts is None:
+            self._start_buy_wait()
+            return
+        elapsed_ms = (time.monotonic() - self._buy_wait_started_ts) * 1000.0
+        if elapsed_ms < ttl_ms:
+            return
+        self._logger("[BUY_TTL_EXPIRED]")
+        max_retries = int(self._settings.max_buy_retries)
+        if self._buy_retry_count >= max_retries:
+            self._logger("[BUY_ABORT retries_exceeded]")
+            self.abort_cycle()
+            return
+        order_id = buy_order.get("orderId")
+        if order_id and order_id in open_orders:
+            is_isolated = "TRUE" if self._settings.margin_isolated else "FALSE"
+            cancelled = self._cancel_margin_order(
+                symbol=self._settings.symbol,
+                order_id=order_id,
+                is_isolated=is_isolated,
+                tag=buy_order.get("tag", self.TAG),
+            )
+            if not cancelled:
+                return
+        self.active_test_orders = [
+            entry for entry in self.active_test_orders if entry.get("orderId") != order_id
+        ]
+        self.orders_count = len(self.active_test_orders)
+        self._buy_retry_count += 1
+        retry_index = self._buy_retry_count
+        price_state, health_state = self._router.build_price_state()
+        mid = price_state.mid
+        bid = price_state.bid
+        if price_state.data_blind or mid is None or bid is None:
+            now = time.monotonic()
+            if now - self._last_no_price_log_ts >= 2.0:
+                self._last_no_price_log_ts = now
+                self._logger(
+                    "[TRADE] blocked: no_price "
+                    f"(ws_age={health_state.ws_age_ms} http_age={health_state.http_age_ms})"
+                )
+            self._logger("[BUY_ABORT retries_exceeded]")
+            self.abort_cycle()
+            return
+        if not self._profile.tick_size or not self._profile.step_size or not self._profile.min_qty:
+            self._logger("[BUY_ABORT retries_exceeded]")
+            self.abort_cycle()
+            return
+        tick_offset = max(0, int(self._settings.entry_offset_ticks))
+        buy_price = bid + tick_offset * self._profile.tick_size
+        buy_price = self._round_to_step(buy_price, self._profile.tick_size)
+        qty = self._round_down(
+            self._settings.nominal_usd / mid, self._profile.step_size
+        )
+        if qty <= 0 or qty < self._profile.min_qty:
+            self._logger("[BUY_ABORT retries_exceeded]")
+            self.abort_cycle()
+            return
+        if self._profile.min_notional is not None and qty * mid < self._profile.min_notional:
+            self._logger("[BUY_ABORT retries_exceeded]")
+            self.abort_cycle()
+            return
+        retry_price = f"{buy_price:.8f}"
+        self._logger(
+            f"[BUY_RETRY {retry_index}/{max_retries} price={retry_price}]"
+        )
+        is_isolated = "TRUE" if self._settings.margin_isolated else "FALSE"
+        timestamp = int(time.time() * 1000)
+        buy_client_id = self._build_client_order_id("BUY", timestamp)
+        side_effect_type = self._normalize_side_effect_type(
+            self._settings.side_effect_type
+        )
+        buy_order = self._place_margin_order(
+            symbol=self._settings.symbol,
+            side="BUY",
+            quantity=qty,
+            price=buy_price,
+            is_isolated=is_isolated,
+            client_order_id=buy_client_id,
+            side_effect=side_effect_type,
+            order_type="LIMIT",
+        )
+        if not buy_order:
+            self._logger("[BUY_ABORT retries_exceeded]")
+            self.abort_cycle()
+            return
+        self._transition_state(TradeState.STATE_WAIT_BUY)
+        self._start_buy_wait()
+        now_ms = int(time.time() * 1000)
+        self.active_test_orders = [
+            {
+                "orderId": buy_order.get("orderId"),
+                "side": "BUY",
+                "price": buy_price,
+                "qty": qty,
+                "created_ts": now_ms,
+                "updated_ts": now_ms,
+                "status": "NEW",
+                "tag": self.TAG,
+                "clientOrderId": buy_order.get("clientOrderId", buy_client_id),
+            }
+        ]
+        self.orders_count = len(self.active_test_orders)
+
     def _maybe_handle_sell_ttl(self, open_orders: dict[int, dict]) -> None:
         if self.state != TradeState.STATE_WAIT_SELL:
             return
@@ -448,20 +580,22 @@ class TradeExecutor:
         retry_index = self._sell_retry_count
         reason = str(sell_order.get("reason") or "MANUAL").upper()
         price_state, _ = self._router.build_price_state()
-        mid = price_state.mid
-        if mid is None:
-            self._force_close_after_ttl(reason="NO_PRICE")
-            return
         exit_order_type = self._normalize_order_type(self._settings.exit_order_type)
-        retry_price = "MARKET" if exit_order_type == "MARKET" else f"{mid:.8f}"
+        if exit_order_type == "LIMIT":
+            ask = price_state.ask
+            if ask is None or not self._profile.tick_size:
+                self._force_close_after_ttl(reason="NO_PRICE")
+                return
+            tick_offset = max(0, int(self._settings.exit_offset_ticks))
+            sell_price = ask - tick_offset * self._profile.tick_size
+            sell_price = self._round_to_step(sell_price, self._profile.tick_size)
+            retry_price = f"{sell_price:.8f}"
+        else:
+            retry_price = "MARKET"
         self._logger(
             f"[SELL_RETRY {retry_index}/{max_retries} price={retry_price}]"
         )
-        self._place_sell_order(
-            reason=reason,
-            mid_override=mid,
-            reset_retry=False,
-        )
+        self._place_sell_order(reason=reason, reset_retry=False)
 
     def _force_close_after_ttl(self, reason: str = "TTL_EXCEEDED") -> None:
         self._logger(f"[SELL_FORCE_CLOSE reason={reason}]")
@@ -546,6 +680,7 @@ class TradeExecutor:
                 order["status"] = status
                 order["updated_ts"] = now_ms
         self.orders_count = len(self.active_test_orders)
+        self._maybe_handle_buy_ttl(open_map)
         self._maybe_handle_sell_ttl(open_map)
 
     def handle_order_filled(
@@ -584,6 +719,7 @@ class TradeExecutor:
         ]
         self.orders_count = len(self.active_test_orders)
         if side == "BUY":
+            self._reset_buy_retry()
             if self.position is None:
                 self._transition_state(TradeState.STATE_IDLE)
         elif side == "SELL":
@@ -600,6 +736,7 @@ class TradeExecutor:
                 f"[ORDER] BUY filled qty={order.get('qty'):.8f} "
                 f"price={order.get('price'):.8f}"
             )
+            self._reset_buy_retry()
             if self.position is None:
                 self.position = {
                     "buy_price": order.get("price"),
@@ -729,6 +866,7 @@ class TradeExecutor:
 
         self.active_test_orders = []
         self._repay_borrowed_assets()
+        self._reset_buy_retry()
         self._reset_sell_retry()
         self.last_action = reason
         self.orders_count = 0
