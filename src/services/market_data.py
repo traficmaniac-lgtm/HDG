@@ -224,7 +224,9 @@ class MarketDataService:
         self._snapshot.ask = float(payload.get("ask", self._snapshot.ask) or 0.0)
         self._snapshot.mid = float(payload.get("mid", self._snapshot.mid) or 0.0)
 
-    def _update_effective_tick(self, now_ms: float, ws_tick_received: bool) -> None:
+    def _update_effective_tick(
+        self, now_ms: float, ws_tick_received: bool = False
+    ) -> None:
         ws_fresh = self._is_ws_fresh(now_ms)
         if ws_tick_received and ws_fresh and self._last_ws_tick:
             self._ws_good_streak += 1
