@@ -54,3 +54,4 @@ python -m src.app
 
 - Live trading is **OFF by default**. Enable via **LIVE ENABLED** in Settings.
 - The bot sends real margin orders. Use at your own risk.
+- **Security:** never store API keys in `config/settings.json`. Use `config/settings.local.json` (gitignored) or environment variables (`BINANCE_API_KEY`, `BINANCE_API_SECRET`).
