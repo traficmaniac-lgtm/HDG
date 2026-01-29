@@ -1,27 +1,53 @@
 @echo off
 chcp 65001 >nul
-setlocal
+setlocal enabledelayedexpansion
 
-cd /d "C:\Users\Юрий\Desktop\HDG" || (echo [ERR] Folder not found & pause & exit /b 1)
+set "ROOT=C:\Users\Юрий\Desktop\HDG"
+set "LOG=%ROOT%\HDG_PUSH.log"
 
-echo === HDG: GIT STATUS ===
-git status
+(
+  echo === START %date% %time% ===
+  echo ROOT=%ROOT%
+  echo.
+
+  if not exist "%ROOT%\" (
+    echo [ERR] Folder not found: "%ROOT%"
+    goto :end
+  )
+
+  cd /d "%ROOT%" || (echo [ERR] cd failed & goto :end)
+
+  echo --- where git ---
+  where git
+  echo.
+
+  echo --- git --version ---
+  git --version
+  echo.
+
+  echo --- git status ---
+  git status
+  echo.
+
+  echo --- git add -A ---
+  git add -A
+  echo.
+
+  echo --- git commit -m "update" ---
+  git commit -m "update"
+  echo.
+
+  echo --- git push origin main ---
+  git push origin main
+  echo.
+
+  echo [OK] Done
+) > "%LOG%" 2>&1
+
+:end
 echo.
-
-echo === HDG: ADD ALL ===
-git add -A
+echo Log saved to: "%LOG%"
+type "%LOG%"
 echo.
-
-echo === HDG: COMMIT (auto) ===
-git commit -m "update" 2>nul
-if %errorlevel% neq 0 (
-  echo [INFO] Nothing to commit (or commit failed). Continuing...
-)
-echo.
-
-echo === HDG: PUSH ===
-git push origin main
-echo.
-
-echo Done.
 pause
+
