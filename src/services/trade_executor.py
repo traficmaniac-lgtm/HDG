@@ -76,11 +76,17 @@ class TradeExecutor:
         self._last_sell_ref_price: Optional[float] = None
         self._last_sell_ref_side: Optional[str] = None
         self._aggregate_sold_qty = 0.0
+        self._aggregate_sold_notional = 0.0
         self.position_qty_base: Optional[float] = None
         self.exit_intent: Optional[str] = None
         self.exit_intent_set_ts: Optional[float] = None
         self._last_place_error_code: Optional[int] = None
         self.state = TradeState.STATE_IDLE
+        self._cycle_id_counter = 0
+        self._current_cycle_id: Optional[int] = None
+        self._processed_fill_keys: set[tuple[int, str, float, float]] = set()
+        self.wins = 0
+        self.losses = 0
         self.cycles_target = self._normalize_cycle_target(
             getattr(settings, "cycle_count", 1)
         )
@@ -102,6 +108,119 @@ class TradeExecutor:
         self.state = next_state
         self._logger(f"[STATE] {previous.value} → {next_state.value}")
 
+    def _cycle_id_label(self) -> str:
+        return "—" if self._current_cycle_id is None else str(self._current_cycle_id)
+
+    def _get_cycle_id_for_order(self, order: Optional[dict]) -> Optional[int]:
+        if order is None:
+            return self._current_cycle_id
+        cycle_id = order.get("cycle_id")
+        if isinstance(cycle_id, int):
+            return cycle_id
+        return self._current_cycle_id
+
+    def _log_cycle_start(self, cycle_id: int) -> None:
+        self._logger(f"[CYCLE_START] id={cycle_id}")
+
+    def _log_cycle_fill(self, cycle_id: Optional[int], side: str, delta: float, cum: float) -> None:
+        if cycle_id is None:
+            cycle_id = self._current_cycle_id
+        cycle_label = "—" if cycle_id is None else str(cycle_id)
+        self._logger(
+            f"[CYCLE_FILL] id={cycle_label} side={side} delta={delta:.8f} cum={cum:.8f}"
+        )
+
+    def _log_cycle_close(
+        self,
+        cycle_id: Optional[int],
+        pnl_quote: Optional[float],
+        pnl_bps: Optional[float],
+        reason: str,
+    ) -> None:
+        cycle_label = "—" if cycle_id is None else str(cycle_id)
+        pnl_quote_label = "—" if pnl_quote is None else f"{pnl_quote:.8f}"
+        pnl_bps_label = "—" if pnl_bps is None else f"{pnl_bps:.2f}"
+        self._logger(
+            "[CYCLE_CLOSE] "
+            f"id={cycle_label} pnl_quote={pnl_quote_label} pnl_bps={pnl_bps_label} "
+            f"reason={reason}"
+        )
+
+    def _log_cycle_cleanup(self, cycle_id: Optional[int]) -> None:
+        cycle_label = "—" if cycle_id is None else str(cycle_id)
+        self._logger(f"[CYCLE_CLEANUP] id={cycle_label} ok")
+
+    def _fill_event_key(
+        self,
+        order_id: Optional[int],
+        side: str,
+        cum_qty: float,
+        avg_price: float,
+    ) -> Optional[tuple[int, str, float, float]]:
+        if order_id is None:
+            return None
+        return (int(order_id), side, float(cum_qty), float(avg_price))
+
+    def _should_process_fill(
+        self,
+        order_id: Optional[int],
+        side: str,
+        cum_qty: float,
+        avg_price: float,
+        cycle_id: Optional[int],
+    ) -> bool:
+        key = self._fill_event_key(order_id, side, cum_qty, avg_price)
+        if key is None:
+            return True
+        if key in self._processed_fill_keys:
+            cycle_label = "—" if cycle_id is None else str(cycle_id)
+            self._logger(
+                "[FILL_SKIP_DUPLICATE] "
+                f"id={cycle_label} order_id={order_id} side={side} "
+                f"cum={cum_qty:.8f} avg={avg_price:.8f}"
+            )
+            return False
+        self._processed_fill_keys.add(key)
+        return True
+
+    def _record_cycle_pnl(self, pnl: Optional[float]) -> None:
+        self.pnl_cycle = pnl
+        if pnl is not None:
+            self.pnl_session += pnl
+
+    def _cleanup_cycle_state(self, cycle_id: Optional[int]) -> None:
+        is_isolated = "TRUE" if self._settings.margin_isolated else "FALSE"
+        for order in list(self.active_test_orders):
+            order_id = order.get("orderId")
+            if not order_id:
+                continue
+            status = str(order.get("status") or "").upper()
+            if status in {"FILLED", "CANCELED", "REJECTED", "EXPIRED"}:
+                continue
+            self._cancel_margin_order(
+                symbol=self._settings.symbol,
+                order_id=order_id,
+                is_isolated=is_isolated,
+                tag=order.get("tag", self.TAG),
+            )
+        self.active_test_orders = []
+        self.orders_count = 0
+        self.sell_active_order_id = None
+        self.sell_cancel_pending = False
+        self.sell_place_inflight = False
+        self.sell_retry_pending = False
+        self._pending_sell_retry_reason = None
+        self._reset_buy_retry()
+        self._reset_sell_retry()
+        self._clear_entry_attempt()
+        self._entry_reprice_last_ts = 0.0
+        self._entry_consecutive_fresh_reads = 0
+        self._entry_last_seen_bid = None
+        self._entry_last_ws_bad_ts = None
+        self._processed_fill_keys = set()
+        self._current_cycle_id = None
+        self._log_cycle_cleanup(cycle_id)
+
     def set_margin_capabilities(
         self, margin_api_access: bool, borrow_allowed_by_api: Optional[bool]
     ) -> None:
@@ -112,6 +231,11 @@ class TradeExecutor:
             self.last_action = "inflight"
             return 0
         self._inflight_trade_action = True
+        cycle_pending = False
+        buy_placed = False
+        if self._current_cycle_id is None:
+            self._current_cycle_id = self._cycle_id_counter + 1
+            cycle_pending = True
         try:
             if self.state != TradeState.STATE_IDLE:
                 self._logger(
@@ -256,7 +380,8 @@ class TradeExecutor:
                 self._settings.side_effect_type
             )
 
-            self._logger(f"[PLACE_BUY] source={price_state.source}")
+            cycle_label = self._cycle_id_label()
+            self._logger(f"[PLACE_BUY] cycle_id={cycle_label} source={price_state.source}")
             self._transition_state(TradeState.STATE_PLACE_BUY)
             self.last_action = "placing_buy"
             self._start_entry_attempt()
@@ -281,9 +406,13 @@ class TradeExecutor:
                 self._transition_state(TradeState.STATE_IDLE)
                 self.orders_count = 0
                 return 0
+            if cycle_pending and self._current_cycle_id is not None:
+                self._cycle_id_counter = self._current_cycle_id
+                self._log_cycle_start(self._current_cycle_id)
+            buy_placed = True
             self._logger(
-                f"[ORDER] BUY placed qty={qty:.8f} price={buy_price:.8f} "
-                f"id={buy_order.get('orderId')}"
+                f"[ORDER] BUY placed cycle_id={cycle_label} qty={qty:.8f} "
+                f"price={buy_price:.8f} id={buy_order.get('orderId')}"
             )
             self._transition_state(TradeState.STATE_WAIT_BUY)
             self._reset_buy_retry()
@@ -304,6 +433,7 @@ class TradeExecutor:
                     "status": "NEW",
                     "tag": self.TAG,
                     "clientOrderId": buy_order.get("clientOrderId", buy_client_id),
+                    "cycle_id": self._current_cycle_id,
                 }
             ]
             self.orders_count = len(self.active_test_orders)
@@ -313,6 +443,8 @@ class TradeExecutor:
             self._reset_exit_intent()
             return self.orders_count
         finally:
+            if cycle_pending and not buy_placed:
+                self._current_cycle_id = None
             self._inflight_trade_action = False
 
     def start_cycle_run(self) -> int:
@@ -365,21 +497,27 @@ class TradeExecutor:
         if self.state != TradeState.STATE_IDLE:
             return 0
         cycle_index = self.cycles_done + 1
+        pending_cycle_id = self._cycle_id_counter + 1
+        self._current_cycle_id = pending_cycle_id
         placed = self.place_test_orders_margin()
         if placed:
+            self._cycle_id_counter = pending_cycle_id
+            self._log_cycle_start(pending_cycle_id)
             self._logger(
                 f"[CYCLE_START] idx={cycle_index} target={self.cycles_target}"
             )
+        else:
+            self._current_cycle_id = None
         return placed
 
     def _handle_cycle_completion(self, reason: str, critical: bool = False) -> None:
-        if not self.run_active:
-            return
         self.cycles_done += 1
         pnl_label = "—" if self.pnl_cycle is None else f"{self.pnl_cycle:.8f}"
         self._logger(
             f"[CYCLE_DONE] idx={self.cycles_done} pnl={pnl_label} reason={reason}"
         )
+        if not self.run_active:
+            return
         if critical:
             self.run_active = False
             self._next_cycle_ready_ts = None
@@ -621,19 +759,21 @@ class TradeExecutor:
                         buy_order["price"] = avg_price if avg_price > 0 else buy_order.get("price")
                         buy_order["qty"] = executed_qty
                         buy_order["updated_ts"] = int(time.time() * 1000)
-                    self._apply_order_filled(
-                        {
-                            "side": "BUY",
-                            "price": avg_price if avg_price > 0 else buy_order.get("price"),
-                            "qty": executed_qty,
-                            "updated_ts": int(time.time() * 1000),
-                        }
+                    if buy_order is not None:
+                        buy_order["orderId"] = order_id
+                    self.handle_order_filled(
+                        order_id=order_id,
+                        side="BUY",
+                        price=avg_price if avg_price > 0 else buy_order.get("price"),
+                        qty=executed_qty,
+                        ts_ms=int(time.time() * 1000),
                     )
                     return True
                 if status == "PARTIALLY_FILLED" and executed_qty > 0:
                     min_qty = self._profile.min_qty or 0.0
                     if executed_qty >= min_qty:
                         self._apply_entry_partial_fill(
+                            order_id,
                             executed_qty,
                             avg_price if avg_price > 0 else buy_order.get("price") if buy_order else None,
                         )
@@ -849,13 +989,15 @@ class TradeExecutor:
             )
             order_type = exit_order_type
 
-            self._logger(f"[PLACE_SELL] source={price_state.source}")
+            cycle_label = self._cycle_id_label()
+            self._logger(f"[PLACE_SELL] cycle_id={cycle_label} source={price_state.source}")
             self._transition_state(TradeState.STATE_PLACE_SELL)
             self.last_action = "placing_sell_tp" if reason_upper == "TP" else "placing_sell"
             price_label = "MARKET" if sell_price is None else f"{sell_price:.8f}"
             self._logger(
                 "[SELL_PLACE] "
-                f"price={price_label} qty={qty:.8f} policy={exit_policy}"
+                f"cycle_id={cycle_label} price={price_label} qty={qty:.8f} "
+                f"policy={exit_policy}"
             )
             bid_label = "—" if bid is None else f"{bid:.8f}"
             ask_label = "—" if ask is None else f"{ask:.8f}"
@@ -865,9 +1007,9 @@ class TradeExecutor:
             )
             self._logger(
                 "[SELL_PLACE] "
-                f"exit_intent={intent} exit_policy={exit_policy} sell_ref={sell_ref_label} "
-                f"bid={bid_label} ask={ask_label} mid={mid_label} "
-                f"tp_offset_ticks={tp_ticks} sl_offset_ticks={sl_ticks} "
+                f"cycle_id={cycle_label} exit_intent={intent} exit_policy={exit_policy} "
+                f"sell_ref={sell_ref_label} bid={bid_label} ask={ask_label} "
+                f"mid={mid_label} tp_offset_ticks={tp_ticks} sl_offset_ticks={sl_ticks} "
                 f"exit_offset_ticks={exit_ticks} sell_price={price_label} "
                 f"delta_ticks_to_ref={delta_label} qty={qty:.8f}"
             )
@@ -899,13 +1041,13 @@ class TradeExecutor:
             if reason_upper in {"TP", "SL"}:
                 self._logger(
                     "[ORDER] SELL placed "
-                    f"reason={reason_upper} type={order_type} price={price_label} "
-                    f"qty={qty:.8f} id={sell_order.get('orderId')}"
+                    f"cycle_id={cycle_label} reason={reason_upper} type={order_type} "
+                    f"price={price_label} qty={qty:.8f} id={sell_order.get('orderId')}"
                 )
             else:
                 self._logger(
-                    f"[ORDER] SELL placed qty={qty:.8f} price={price_label} "
-                    f"id={sell_order.get('orderId')}"
+                    f"[ORDER] SELL placed cycle_id={cycle_label} qty={qty:.8f} "
+                    f"price={price_label} id={sell_order.get('orderId')}"
                 )
             self._transition_state(TradeState.STATE_WAIT_SELL)
             if reset_retry:
@@ -931,6 +1073,7 @@ class TradeExecutor:
                     "tag": self.TAG,
                     "clientOrderId": sell_order.get("clientOrderId", sell_client_id),
                     "reason": reason_upper,
+                    "cycle_id": self._current_cycle_id,
                 }
             )
             self.orders_count = len(self.active_test_orders)
@@ -956,7 +1099,8 @@ class TradeExecutor:
             if self.position.get("partial"):
                 self._logger(f"[SELL_FOR_PARTIAL] qty={qty:.8f}")
             price_state, _ = self._router.build_price_state()
-            self._logger(f"[PLACE_SELL] source={price_state.source}")
+            cycle_label = self._cycle_id_label()
+            self._logger(f"[PLACE_SELL] cycle_id={cycle_label} source={price_state.source}")
             intent = self._normalize_exit_intent(self.exit_intent or "MANUAL")
             exit_policy, sell_ref_label = self._resolve_exit_policy(intent)
             bid_label = "—" if price_state.bid is None else f"{price_state.bid:.8f}"
@@ -964,14 +1108,15 @@ class TradeExecutor:
             mid_label = "—" if price_state.mid is None else f"{price_state.mid:.8f}"
             self._logger(
                 "[SELL_PLACE] "
-                f"price=MARKET qty={qty:.8f} policy={exit_policy}"
+                f"cycle_id={cycle_label} price=MARKET qty={qty:.8f} "
+                f"policy={exit_policy}"
             )
             self._logger(
                 "[SELL_PLACE] "
-                f"exit_intent={intent} exit_policy={exit_policy} sell_ref={sell_ref_label} "
-                f"bid={bid_label} ask={ask_label} mid={mid_label} "
-                "tp_offset_ticks=— sl_offset_ticks=— exit_offset_ticks=— "
-                "sell_price=MARKET delta_ticks_to_ref=— "
+                f"cycle_id={cycle_label} exit_intent={intent} exit_policy={exit_policy} "
+                f"sell_ref={sell_ref_label} bid={bid_label} ask={ask_label} "
+                f"mid={mid_label} tp_offset_ticks=— sl_offset_ticks=— "
+                "exit_offset_ticks=— sell_price=MARKET delta_ticks_to_ref=— "
                 f"qty={qty:.8f}"
             )
             is_isolated = "TRUE" if self._settings.margin_isolated else "FALSE"
@@ -998,8 +1143,9 @@ class TradeExecutor:
                 self._transition_state(TradeState.STATE_POSITION_OPEN)
                 return 0
             self._logger(
-                f"[ORDER] SELL placed reason=EMERGENCY type=MARKET qty={qty:.8f} "
-                f"id={sell_order.get('orderId')}"
+                "[ORDER] SELL placed "
+                f"cycle_id={cycle_label} reason=EMERGENCY type=MARKET "
+                f"qty={qty:.8f} id={sell_order.get('orderId')}"
             )
             self._transition_state(TradeState.STATE_WAIT_SELL)
             self._reset_sell_retry()
@@ -1022,6 +1168,7 @@ class TradeExecutor:
                     "tag": self.TAG,
                     "clientOrderId": sell_order.get("clientOrderId", sell_client_id),
                     "reason": "EMERGENCY",
+                    "cycle_id": self._current_cycle_id,
                 }
             )
             self.orders_count = len(self.active_test_orders)
@@ -1127,7 +1274,11 @@ class TradeExecutor:
     ) -> None:
         bid_label = "?" if bid is None else f"{bid:.8f}"
         ask_label = "?" if ask is None else f"{ask:.8f}"
-        self._logger(f"[ENTRY_PLACE] price={price:.8f} bid={bid_label} ask={ask_label}")
+        cycle_label = self._cycle_id_label()
+        self._logger(
+            f"[ENTRY_PLACE] cycle_id={cycle_label} price={price:.8f} "
+            f"bid={bid_label} ask={ask_label}"
+        )
 
     def _handle_entry_follow_top(self, open_orders: dict[int, dict]) -> None:
         if self.state != TradeState.STATE_WAIT_BUY:
@@ -1314,6 +1465,11 @@ class TradeExecutor:
         )
         if not buy_order:
             return
+        cycle_label = self._cycle_id_label()
+        self._logger(
+            f"[ORDER] BUY placed cycle_id={cycle_label} qty={qty:.8f} "
+            f"price={new_price:.8f} id={buy_order.get('orderId')}"
+        )
         self._entry_reprice_last_ts = now
         self._entry_last_seen_bid = bid
         now_ms = int(time.time() * 1000)
@@ -1332,6 +1488,7 @@ class TradeExecutor:
                 "status": "NEW",
                 "tag": self.TAG,
                 "clientOrderId": buy_order.get("clientOrderId", buy_client_id),
+                "cycle_id": self._current_cycle_id,
             }
         ]
         self.orders_count = len(self.active_test_orders)
@@ -1462,14 +1619,25 @@ class TradeExecutor:
                         or live_order.get("price", 0.0)
                         or 0.0
                     )
+                cycle_id = self._get_cycle_id_for_order(sell_order)
+                prev_cum = float(sell_order.get("cum_qty") or 0.0)
+                prev_avg = float(sell_order.get("avg_fill_price") or 0.0)
                 if status:
                     sell_order["status"] = status
                     sell_order["sell_status"] = status
+                delta = 0.0
                 if executed_qty > 0:
-                    self._update_sell_execution(sell_order, executed_qty)
+                    delta = self._update_sell_execution(sell_order, executed_qty)
                 if avg_price > 0:
+                    prev_notional = prev_avg * prev_cum
+                    new_notional = avg_price * executed_qty
+                    notional_delta = max(new_notional - prev_notional, 0.0)
+                    if notional_delta > 0:
+                        self._aggregate_sold_notional += notional_delta
                     sell_order["avg_fill_price"] = avg_price
                     sell_order["last_fill_price"] = avg_price
+                if delta > 0:
+                    self._log_cycle_fill(cycle_id, "SELL", delta, executed_qty)
                 if status == "FILLED":
                     sell_order["qty"] = (
                         executed_qty if executed_qty > 0 else sell_order.get("qty")
@@ -1749,6 +1917,10 @@ class TradeExecutor:
         )
         if order is None:
             return
+        side_upper = str(side).upper()
+        cycle_id = self._get_cycle_id_for_order(order)
+        if not self._should_process_fill(order_id, side_upper, qty, price, cycle_id):
+            return
         if order.get("status") == "FILLED":
             return
         order["status"] = "FILLED"
@@ -1757,7 +1929,7 @@ class TradeExecutor:
         order["updated_ts"] = ts_ms
         order["price"] = price
         order["qty"] = qty
-        self._apply_order_filled(order)
+        self._apply_order_filled(order, dedup_checked=True)
         self.orders_count = len(self.active_test_orders)
 
     def handle_order_partial(
@@ -1775,6 +1947,9 @@ class TradeExecutor:
         if order is None:
             return
         side_upper = str(side).upper()
+        cycle_id = self._get_cycle_id_for_order(order)
+        if not self._should_process_fill(order_id, side_upper, cum_qty, avg_price, cycle_id):
+            return
         if side_upper == "BUY":
             prev_cum = float(order.get("cum_qty") or 0.0)
             order["cum_qty"] = cum_qty
@@ -1784,6 +1959,7 @@ class TradeExecutor:
             order["updated_ts"] = ts_ms
             delta = max(cum_qty - prev_cum, 0.0)
             if delta > 0:
+                self._log_cycle_fill(cycle_id, "BUY", delta, cum_qty)
                 fill_price = avg_price if avg_price > 0 else order.get("price")
                 if self.position is None:
                     self.position = {
@@ -1818,13 +1994,23 @@ class TradeExecutor:
             avg_value = avg_price
             if avg_value <= 0 and self.position is not None:
                 avg_value = float(self.position.get("buy_price") or 0.0)
+            cycle_label = "—" if cycle_id is None else str(cycle_id)
             self._logger(
-                f"[BUY_PARTIAL] delta={delta:.8f} pos_qty={pos_qty:.8f} avg={avg_value:.8f}"
+                "[BUY_PARTIAL] "
+                f"cycle_id={cycle_label} delta={delta:.8f} "
+                f"pos_qty={pos_qty:.8f} avg={avg_value:.8f}"
             )
             return
         if side_upper == "SELL":
+            prev_cum = float(order.get("cum_qty") or 0.0)
+            prev_avg = float(order.get("avg_fill_price") or 0.0)
             delta = self._update_sell_execution(order, cum_qty)
             if avg_price > 0:
+                prev_notional = prev_avg * prev_cum
+                new_notional = avg_price * cum_qty
+                notional_delta = max(new_notional - prev_notional, 0.0)
+                if notional_delta > 0:
+                    self._aggregate_sold_notional += notional_delta
                 order["avg_fill_price"] = avg_price
                 order["last_fill_price"] = avg_price
             order["updated_ts"] = ts_ms
@@ -1833,9 +2019,12 @@ class TradeExecutor:
             remaining_qty = self._resolve_remaining_qty_raw()
             self.position["qty"] = remaining_qty
             if delta > 0:
+                self._log_cycle_fill(cycle_id, "SELL", delta, cum_qty)
+                cycle_label = "—" if cycle_id is None else str(cycle_id)
                 self._logger(
                     "[SELL_PARTIAL] "
-                    f"delta={delta:.8f} remaining={remaining_qty:.8f}"
+                    f"cycle_id={cycle_label} delta={delta:.8f} "
+                    f"remaining={remaining_qty:.8f}"
                 )
                 self._sync_sell_for_partial(delta)
             if remaining_qty <= self._get_step_size_tolerance():
@@ -1856,7 +2045,11 @@ class TradeExecutor:
             order["sell_status"] = status
         order["updated_ts"] = ts_ms
         side = str(order.get("side", "UNKNOWN")).upper()
-        self._logger(f"[ORDER] {side} {status} id={order_id}")
+        cycle_id = self._get_cycle_id_for_order(order)
+        cycle_label = "—" if cycle_id is None else str(cycle_id)
+        self._logger(
+            f"[ORDER] {side} {status} cycle_id={cycle_label} id={order_id}"
+        )
         self.active_test_orders = [
             entry for entry in self.active_test_orders if entry.get("orderId") != order_id
         ]
@@ -1875,50 +2068,79 @@ class TradeExecutor:
             else:
                 self._transition_state(TradeState.STATE_IDLE)
 
-    def _apply_order_filled(self, order: dict) -> None:
+    def _apply_order_filled(self, order: dict, dedup_checked: bool = False) -> None:
         side = order.get("side")
+        cycle_id = self._get_cycle_id_for_order(order)
+        order_id = order.get("orderId")
+        qty = float(order.get("qty") or 0.0)
+        price = float(order.get("price") or 0.0)
+        side_label = str(side or "UNKNOWN").upper()
+        if not dedup_checked:
+            if not self._should_process_fill(order_id, side_label, qty, price, cycle_id):
+                return
+        cycle_label = "—" if cycle_id is None else str(cycle_id)
         if side == "BUY":
+            prev_cum = float(order.get("cum_qty") or 0.0)
+            order["cum_qty"] = qty
             self._logger(
-                f"[ORDER] BUY filled qty={order.get('qty'):.8f} "
-                f"price={order.get('price'):.8f}"
+                "[ORDER] BUY filled "
+                f"cycle_id={cycle_label} qty={qty:.8f} "
+                f"price={price:.8f}"
             )
+            delta = max(qty - prev_cum, 0.0)
+            if delta > 0:
+                self._log_cycle_fill(cycle_id, "BUY", delta, qty)
             self._reset_buy_retry()
             self._clear_entry_attempt()
             if self.position is None:
                 self.position = {
                     "buy_price": order.get("price"),
-                    "qty": order.get("qty"),
+                    "qty": qty,
                     "opened_ts": order.get("updated_ts"),
                     "partial": False,
-                    "initial_qty": order.get("qty"),
+                    "initial_qty": qty,
                 }
-                self._set_position_qty_base(order.get("qty"))
+                self._set_position_qty_base(qty)
                 self._reset_exit_intent()
             self._transition_state(TradeState.STATE_POSITION_OPEN)
         elif side == "SELL":
-            if order.get("qty") is not None:
-                self._update_sell_execution(order, float(order.get("qty") or 0.0))
+            prev_cum = float(order.get("cum_qty") or 0.0)
+            if qty > 0:
+                self._update_sell_execution(order, qty)
+                if price > 0:
+                    prev_avg = float(order.get("avg_fill_price") or 0.0)
+                    prev_notional = prev_avg * prev_cum
+                    new_notional = price * qty
+                    notional_delta = max(new_notional - prev_notional, 0.0)
+                    if notional_delta > 0:
+                        self._aggregate_sold_notional += notional_delta
+                    order["avg_fill_price"] = price
+                    order["last_fill_price"] = price
             self._reset_sell_retry()
             self.sell_active_order_id = None
             self.sell_cancel_pending = False
             reason = str(order.get("reason") or "MANUAL").upper()
             fill_price = order.get("price")
-            qty = order.get("qty")
             buy_price = self.position.get("buy_price") if self.position else self._last_buy_price
             if reason in {"TP", "SL"}:
                 fill_price_label = "—" if fill_price is None else f"{fill_price:.8f}"
-                qty_label = "—" if qty is None else f"{qty:.8f}"
+                qty_label = "—" if qty <= 0 else f"{qty:.8f}"
                 self._logger(
                     "[ORDER] SELL filled "
-                    f"reason={reason} fill_price={fill_price_label} qty={qty_label}"
+                    f"cycle_id={cycle_label} reason={reason} "
+                    f"fill_price={fill_price_label} qty={qty_label}"
                 )
             else:
                 fill_price_label = "—" if fill_price is None else f"{fill_price:.8f}"
-                qty_label = "—" if qty is None else f"{qty:.8f}"
+                qty_label = "—" if qty <= 0 else f"{qty:.8f}"
                 self._logger(
-                    f"[ORDER] SELL filled qty={qty_label} "
+                    "[ORDER] SELL filled "
+                    f"cycle_id={cycle_label} qty={qty_label} "
                     f"price={fill_price_label}"
                 )
+            delta = max(qty - prev_cum, 0.0)
+            if delta > 0:
+                self._log_cycle_fill(cycle_id, "SELL", delta, qty)
             pnl = self._finalize_close(order)
             self.last_exit_reason = reason if reason in {"TP", "SL"} else "MANUAL"
             if reason in {"TP", "SL"}:
@@ -1935,16 +2157,27 @@ class TradeExecutor:
                 realized = "—" if pnl is None else f"{pnl:.8f}"
                 self._logger(f"[PNL] realized={realized}")
             self._transition_state(TradeState.STATE_CLOSED)
-            self._handle_cycle_completion(reason=reason)
-            self.active_test_orders = []
-            self.orders_count = 0
-            self._transition_state(TradeState.STATE_IDLE)
+            self._finalize_cycle_close(reason=reason, pnl=pnl, qty=qty, buy_price=buy_price, cycle_id=cycle_id)
 
-    def _apply_entry_partial_fill(self, qty: float, price: Optional[float]) -> None:
+    def _apply_entry_partial_fill(
+        self,
+        order_id: Optional[int],
+        qty: float,
+        price: Optional[float],
+    ) -> None:
         if qty <= 0:
             return
+        cycle_id = self._get_cycle_id_for_order(self._find_order("BUY"))
+        avg_price = price if price is not None else 0.0
+        if not self._should_process_fill(order_id, "BUY", qty, avg_price, cycle_id):
+            return
         price_label = "?" if price is None else f"{price:.8f}"
-        self._logger(f"[ORDER] BUY partial timeout qty={qty:.8f} price={price_label}")
+        cycle_label = "—" if cycle_id is None else str(cycle_id)
+        self._logger(
+            "[ORDER] BUY partial timeout "
+            f"cycle_id={cycle_label} qty={qty:.8f} price={price_label}"
+        )
+        self._log_cycle_fill(cycle_id, "BUY", qty, qty)
         self._reset_buy_retry()
         self._clear_entry_attempt()
         if self.position is None:
@@ -2000,9 +2233,7 @@ class TradeExecutor:
         pnl = None
         if buy_price is not None and sell_price is not None and qty is not None:
             pnl = (sell_price - buy_price) * qty
-        self.pnl_cycle = pnl
-        if pnl is not None:
-            self.pnl_session += pnl
+        self._record_cycle_pnl(pnl)
         self.position = None
         self._reset_position_tracking()
         self.last_action = "closed"
@@ -2043,6 +2274,7 @@ class TradeExecutor:
     def _reset_position_tracking(self) -> None:
         self.position_qty_base = None
         self._aggregate_sold_qty = 0.0
+        self._aggregate_sold_notional = 0.0
         self._reset_exit_intent()
 
     def _reset_exit_intent(self) -> None:
@@ -2150,27 +2382,61 @@ class TradeExecutor:
             reason=reason, reset_retry=False, exit_intent=self.exit_intent
         )
 
+    def _finalize_cycle_close(
+        self,
+        reason: str,
+        pnl: Optional[float],
+        qty: Optional[float],
+        buy_price: Optional[float],
+        cycle_id: Optional[int],
+    ) -> None:
+        if pnl is not None:
+            if pnl > 0:
+                self.wins += 1
+            elif pnl < 0:
+                self.losses += 1
+        pnl_bps = None
+        if pnl is not None and buy_price and qty:
+            notion = buy_price * qty
+            if notion > 0:
+                pnl_bps = (pnl / notion) * 10000
+        self._log_cycle_close(cycle_id, pnl, pnl_bps, reason)
+        self._handle_cycle_completion(reason=reason)
+        self._transition_state(TradeState.STATE_IDLE)
+        self._cleanup_cycle_state(cycle_id)
+
     def _finalize_partial_close(self, reason: str) -> None:
         self.last_exit_reason = reason
         is_isolated = "TRUE" if self._settings.margin_isolated else "FALSE"
         for order in list(self.active_test_orders):
-            if order.get("side") != "SELL":
+            order_id = order.get("orderId")
+            if not order_id:
                 continue
             self._cancel_margin_order(
                 symbol=self._settings.symbol,
-                order_id=order.get("orderId"),
+                order_id=order_id,
                 is_isolated=is_isolated,
                 tag=order.get("tag", self.TAG),
             )
-        self.sell_active_order_id = None
-        self.sell_cancel_pending = False
-        self.active_test_orders = []
-        self.orders_count = 0
+        cycle_id = self._get_cycle_id_for_order(self._find_order("SELL"))
+        if cycle_id is None:
+            cycle_id = self._current_cycle_id
+        qty = self.position_qty_base
+        buy_price = self.position.get("buy_price") if self.position else self._last_buy_price
+        pnl = None
+        if qty and buy_price and self._aggregate_sold_notional > 0:
+            pnl = self._aggregate_sold_notional - (buy_price * qty)
+        self._record_cycle_pnl(pnl)
         self.position = None
         self._reset_position_tracking()
         self._transition_state(TradeState.STATE_CLOSED)
-        self._handle_cycle_completion(reason=reason)
-        self._transition_state(TradeState.STATE_IDLE)
+        self._finalize_cycle_close(
+            reason=reason,
+            pnl=pnl,
+            qty=qty,
+            buy_price=buy_price,
+            cycle_id=cycle_id,
+        )
 
     def _find_order(self, side: str) -> Optional[dict]:
         for order in self.active_test_orders:
@@ -2273,11 +2539,22 @@ class TradeExecutor:
                 if status:
                     sell_order["status"] = status
                     sell_order["sell_status"] = status
+                cycle_id = self._get_cycle_id_for_order(sell_order)
+                prev_cum = float(sell_order.get("cum_qty") or 0.0)
+                prev_avg = float(sell_order.get("avg_fill_price") or 0.0)
+                delta = 0.0
                 if executed_qty > 0:
-                    self._update_sell_execution(sell_order, executed_qty)
+                    delta = self._update_sell_execution(sell_order, executed_qty)
                 if avg_price > 0:
+                    prev_notional = prev_avg * prev_cum
+                    new_notional = avg_price * executed_qty
+                    notional_delta = max(new_notional - prev_notional, 0.0)
+                    if notional_delta > 0:
+                        self._aggregate_sold_notional += notional_delta
                     sell_order["avg_fill_price"] = avg_price
                     sell_order["last_fill_price"] = avg_price
+                if delta > 0:
+                    self._log_cycle_fill(cycle_id, "SELL", delta, executed_qty)
                 if status == "FILLED":
                     sell_order["qty"] = (
                         executed_qty if executed_qty > 0 else sell_order.get("qty")
@@ -2312,12 +2589,14 @@ class TradeExecutor:
         return self.abort_cycle_with_reason(reason="ABORT")
 
     def abort_cycle_with_reason(self, reason: str, critical: bool = False) -> int:
+        cycle_id = self._current_cycle_id
         cancelled = self.cancel_test_orders_margin(reason="aborted")
         self._clear_entry_attempt()
         self._transition_state(TradeState.STATE_CLOSED)
         self._transition_state(TradeState.STATE_IDLE)
         self.last_action = "aborted"
         self._handle_cycle_completion(reason=reason, critical=critical)
+        self._cleanup_cycle_state(cycle_id)
         return cancelled
 
     def _cancel_open_orders_wait(self, timeout_s: float) -> float:
