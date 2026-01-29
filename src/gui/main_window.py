@@ -718,7 +718,13 @@ class MainWindow(QMainWindow):
             state_label = (
                 self._trade_executor.get_state_label() if self._trade_executor else "—"
             )
-            in_position = state_label in {"POSITION_OPEN", "WAIT_SELL"}
+            in_position = state_label in {
+                "POS_OPEN",
+                "ENTRY_WORKING",
+                "EXIT_TP_WORKING",
+                "EXIT_SL_WORKING",
+                "RECOVERY",
+            }
             if not in_position and not self._router.is_ws_stale():
                 return
         try:
