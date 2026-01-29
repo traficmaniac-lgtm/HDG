@@ -26,6 +26,7 @@ class TradeState(Enum):
 
 class TradeExecutor:
     TAG = "PRE_V0_8_0"
+    PRICE_MOVE_TICK_THRESHOLD = 1
 
     def __init__(
         self,
@@ -64,6 +65,7 @@ class TradeExecutor:
         self._entry_last_ws_bad_ts: Optional[float] = None
         self._sell_wait_started_ts: Optional[float] = None
         self._sell_retry_count = 0
+        self._sell_ttl_retry_count = 0
         self.sell_active_order_id: Optional[int] = None
         self.sell_cancel_pending = False
         self.sell_place_inflight = False
@@ -71,6 +73,8 @@ class TradeExecutor:
         self.sell_backoff_ms = 500
         self._pending_sell_retry_reason: Optional[str] = None
         self.sell_retry_pending = False
+        self._last_sell_ref_price: Optional[float] = None
+        self._last_sell_ref_side: Optional[str] = None
         self._aggregate_sold_qty = 0.0
         self.position_qty_base: Optional[float] = None
         self.exit_intent: Optional[str] = None
@@ -331,7 +335,7 @@ class TradeExecutor:
             self._logger(f"[STOP] flatten_start qty={qty:.8f}")
             if self.exit_intent is None:
                 self._set_exit_intent("MANUAL_CLOSE", mid=None)
-            self._place_sell_order(reason="STOP")
+            self._place_sell_order(reason="STOP", exit_intent=self.exit_intent)
             self._logger(f"[CYCLE_STOPPED_BY_USER] reason={reason}")
             return
         self._transition_state(TradeState.STATE_CLOSED)
@@ -405,7 +409,7 @@ class TradeExecutor:
             return 0
         if self.exit_intent is None:
             self._set_exit_intent("MANUAL_CLOSE", mid=None)
-        return self._place_sell_order(reason="manual")
+        return self._place_sell_order(reason="manual", exit_intent=self.exit_intent)
 
     def evaluate_exit_conditions(self) -> None:
         if self.state != TradeState.STATE_POSITION_OPEN:
@@ -487,7 +491,11 @@ class TradeExecutor:
             self._logger(
                 f"[EXIT_ALLOWED] src={exit_source} age={age_label}"
             )
-        self._place_sell_order(reason=self.exit_intent, mid_override=mid)
+        self._place_sell_order(
+            reason=self.exit_intent,
+            mid_override=mid,
+            exit_intent=self.exit_intent,
+        )
 
     def _start_price_wait(self, stage: str) -> None:
         now = time.monotonic()
@@ -520,6 +528,49 @@ class TradeExecutor:
             return
         age_label = age_ms if age_ms is not None else "?"
         self._logger(f"[PRICE_WAIT] stage={stage} age_ms={age_label} source={source}")
+
+    @staticmethod
+    def _normalize_exit_intent(intent: Optional[str]) -> str:
+        upper = str(intent or "").upper()
+        if upper in {"TP", "SL"}:
+            return upper
+        return "MANUAL"
+
+    @staticmethod
+    def _resolve_exit_policy(intent: str) -> tuple[str, str]:
+        if intent == "TP":
+            return "TP_MAKER", "ask"
+        if intent == "SL":
+            return "SL_CROSS", "bid"
+        return "MANUAL", "ask"
+
+    @staticmethod
+    def _compute_exit_sell_price(
+        intent: str,
+        bid: Optional[float],
+        ask: Optional[float],
+        tick_size: Optional[float],
+        tp_offset_ticks: int,
+        sl_offset_ticks: int,
+        exit_offset_ticks: int,
+    ) -> tuple[Optional[float], Optional[float], Optional[float], str]:
+        if tick_size is None or tick_size <= 0:
+            return None, None, None, "tick_size_missing"
+        policy, ref_side = TradeExecutor._resolve_exit_policy(intent)
+        ref_price = ask if ref_side == "ask" else bid
+        if ref_price is None:
+            return None, None, None, "ref_missing"
+        if intent == "TP":
+            raw_price = ref_price + (tp_offset_ticks * tick_size)
+        elif intent == "SL":
+            raw_price = ref_price - (sl_offset_ticks * tick_size)
+        else:
+            raw_price = ref_price - (exit_offset_ticks * tick_size)
+        rounded = TradeExecutor._round_to_step(raw_price, tick_size)
+        if rounded < tick_size:
+            rounded = tick_size
+        delta_ticks = (rounded - ref_price) / tick_size
+        return rounded, ref_price, delta_ticks, policy
 
     def _maybe_abort_entry_wait(self) -> bool:
         elapsed_ms = self._price_wait_elapsed_ms("ENTRY")
@@ -616,6 +667,13 @@ class TradeExecutor:
         mid_override: Optional[float] = None,
         price_override: Optional[float] = None,
         reset_retry: bool = True,
+        exit_intent: Optional[str] = None,
+        ref_bid: Optional[float] = None,
+        ref_ask: Optional[float] = None,
+        tick_size: Optional[float] = None,
+        tp_offset_ticks: Optional[int] = None,
+        sl_offset_ticks: Optional[int] = None,
+        exit_offset_ticks: Optional[int] = None,
     ) -> int:
         if self.sell_place_inflight:
             self.last_action = "sell_place_inflight"
@@ -646,7 +704,25 @@ class TradeExecutor:
         try:
             price_state, health_state = self._router.build_price_state()
             mid = mid_override if mid_override is not None else price_state.mid
-            ask = price_state.ask
+            bid = ref_bid if ref_bid is not None else price_state.bid
+            ask = ref_ask if ref_ask is not None else price_state.ask
+            intent = self._normalize_exit_intent(exit_intent or self.exit_intent or reason)
+            tick_size = tick_size or self._profile.tick_size
+            tp_ticks = (
+                max(0, int(tp_offset_ticks))
+                if tp_offset_ticks is not None
+                else max(0, int(self._settings.exit_offset_ticks))
+            )
+            sl_ticks = (
+                max(0, int(sl_offset_ticks))
+                if sl_offset_ticks is not None
+                else max(0, int(getattr(self._settings, "sl_offset_ticks", 0)))
+            )
+            exit_ticks = (
+                max(0, int(exit_offset_ticks))
+                if exit_offset_ticks is not None
+                else max(0, int(self._settings.exit_offset_ticks))
+            )
             exit_order_type = self._normalize_order_type(
                 self._settings.exit_order_type
             )
@@ -655,7 +731,7 @@ class TradeExecutor:
                 self._logger("[TRADE] SELL rejected: MARKET disabled")
                 self.last_action = "market_sell_rejected"
                 return 0
-            if exit_order_type == "LIMIT" and ask is None and price_override is None:
+            if exit_order_type == "LIMIT" and ask is None and bid is None and price_override is None:
                 now = time.monotonic()
                 if now - self._last_no_price_log_ts >= 2.0:
                     self._last_no_price_log_ts = now
@@ -721,15 +797,45 @@ class TradeExecutor:
                 return 0
 
             sell_price = None
+            sell_ref_price = None
+            delta_ticks_to_ref = None
+            exit_policy, sell_ref_label = self._resolve_exit_policy(intent)
             if exit_order_type == "LIMIT":
-                tick_offset = max(0, int(self._settings.exit_offset_ticks))
                 if price_override is None:
-                    sell_price = ask - tick_offset * self._profile.tick_size
-                    sell_price = self._round_to_step(
-                        sell_price, self._profile.tick_size
+                    (
+                        sell_price,
+                        sell_ref_price,
+                        delta_ticks_to_ref,
+                        exit_policy,
+                    ) = self._compute_exit_sell_price(
+                        intent=intent,
+                        bid=bid,
+                        ask=ask,
+                        tick_size=tick_size or self._profile.tick_size,
+                        tp_offset_ticks=tp_ticks,
+                        sl_offset_ticks=sl_ticks,
+                        exit_offset_ticks=exit_ticks,
                     )
                 else:
                     sell_price = price_override
+                    sell_ref_price = ask if sell_ref_label == "ask" else bid
+                    if (
+                        sell_ref_price is not None
+                        and tick_size
+                        and tick_size > 0
+                        and sell_price is not None
+                    ):
+                        delta_ticks_to_ref = (sell_price - sell_ref_price) / tick_size
+                if sell_price is None:
+                    now = time.monotonic()
+                    if now - self._last_no_price_log_ts >= 2.0:
+                        self._last_no_price_log_ts = now
+                        self._logger(
+                            "[TRADE] blocked: no_price "
+                            f"(ws_age={health_state.ws_age_ms} http_age={health_state.http_age_ms})"
+                        )
+                    self.last_action = "NO_PRICE"
+                    return 0
 
             is_isolated = "TRUE" if self._settings.margin_isolated else "FALSE"
             timestamp = int(time.time() * 1000)
@@ -744,7 +850,20 @@ class TradeExecutor:
             self._transition_state(TradeState.STATE_PLACE_SELL)
             self.last_action = "placing_sell_tp" if reason_upper == "TP" else "placing_sell"
             price_label = "MARKET" if sell_price is None else f"{sell_price:.8f}"
-            self._logger(f"[SELL_PLACE] qty={qty:.8f} price={price_label}")
+            bid_label = "—" if bid is None else f"{bid:.8f}"
+            ask_label = "—" if ask is None else f"{ask:.8f}"
+            mid_label = "—" if mid is None else f"{mid:.8f}"
+            delta_label = (
+                "—" if delta_ticks_to_ref is None else f"{delta_ticks_to_ref:.2f}"
+            )
+            self._logger(
+                "[SELL_PLACE] "
+                f"exit_intent={intent} exit_policy={exit_policy} sell_ref={sell_ref_label} "
+                f"bid={bid_label} ask={ask_label} mid={mid_label} "
+                f"tp_offset_ticks={tp_ticks} sl_offset_ticks={sl_ticks} "
+                f"exit_offset_ticks={exit_ticks} sell_price={price_label} "
+                f"delta_ticks_to_ref={delta_label} qty={qty:.8f}"
+            )
             if self.position is not None and self.position.get("partial"):
                 self._logger(f"[SELL_FOR_PARTIAL] qty={qty:.8f}")
             sell_order = self._place_margin_order(
@@ -788,6 +907,8 @@ class TradeExecutor:
             now_ms = int(time.time() * 1000)
             self.sell_active_order_id = sell_order.get("orderId")
             self.sell_cancel_pending = False
+            self._last_sell_ref_price = sell_ref_price
+            self._last_sell_ref_side = sell_ref_label
             self.active_test_orders.append(
                 {
                     "orderId": sell_order.get("orderId"),
@@ -826,7 +947,20 @@ class TradeExecutor:
             self.last_action = "placing_sell"
             if self.position.get("partial"):
                 self._logger(f"[SELL_FOR_PARTIAL] qty={qty:.8f}")
-            self._logger(f"[SELL_PLACE] qty={qty:.8f} price=MARKET")
+            price_state, _ = self._router.build_price_state()
+            intent = self._normalize_exit_intent(self.exit_intent or "MANUAL")
+            exit_policy, sell_ref_label = self._resolve_exit_policy(intent)
+            bid_label = "—" if price_state.bid is None else f"{price_state.bid:.8f}"
+            ask_label = "—" if price_state.ask is None else f"{price_state.ask:.8f}"
+            mid_label = "—" if price_state.mid is None else f"{price_state.mid:.8f}"
+            self._logger(
+                "[SELL_PLACE] "
+                f"exit_intent={intent} exit_policy={exit_policy} sell_ref={sell_ref_label} "
+                f"bid={bid_label} ask={ask_label} mid={mid_label} "
+                "tp_offset_ticks=— sl_offset_ticks=— exit_offset_ticks=— "
+                "sell_price=MARKET delta_ticks_to_ref=— "
+                f"qty={qty:.8f}"
+            )
             is_isolated = "TRUE" if self._settings.margin_isolated else "FALSE"
             timestamp = int(time.time() * 1000)
             sell_client_id = self._build_client_order_id("SELL", timestamp + 1)
@@ -885,6 +1019,7 @@ class TradeExecutor:
     def _reset_sell_retry(self) -> None:
         self._sell_wait_started_ts = None
         self._sell_retry_count = 0
+        self._sell_ttl_retry_count = 0
         self._clear_price_wait("EXIT")
         self._pending_sell_retry_reason = None
         self.sell_retry_pending = False
@@ -1206,11 +1341,77 @@ class TradeExecutor:
         if elapsed_ms < ttl_ms:
             return
         order_id = sell_order.get("orderId")
-        self._logger(f"[SELL_TTL_EXPIRED] id={order_id}")
+        intent = self._normalize_exit_intent(self.exit_intent or sell_order.get("reason"))
+        self._sell_ttl_retry_count += 1
+        self._logger(
+            "[SELL_TTL_EXPIRED] "
+            f"id={order_id} exit_intent={intent} "
+            f"ttl_retry_count={self._sell_ttl_retry_count}"
+        )
+        max_sl_retries = int(getattr(self._settings, "max_sl_ttl_retries", 0) or 0)
+        max_exit_total_ms = int(getattr(self._settings, "max_exit_total_ms", 0) or 0)
+        exit_elapsed_ms = None
+        if self.exit_intent_set_ts is not None:
+            exit_elapsed_ms = int((time.monotonic() - self.exit_intent_set_ts) * 1000.0)
+        if intent == "SL" and (
+            (max_sl_retries > 0 and self._sell_ttl_retry_count >= max_sl_retries)
+            or (
+                max_exit_total_ms > 0
+                and exit_elapsed_ms is not None
+                and exit_elapsed_ms >= max_exit_total_ms
+            )
+        ):
+            timeout_label = "?" if exit_elapsed_ms is None else str(exit_elapsed_ms)
+            self._logger(
+                "[SELL_EMERGENCY_TRIGGER] "
+                f"reason=sl_ttl_escalation ttl_retry_count={self._sell_ttl_retry_count} "
+                f"exit_elapsed_ms={timeout_label}"
+            )
+            self._force_close_after_ttl(reason="SL_EMERGENCY")
+            return
         max_retries = int(self._settings.max_sell_retries)
         if self._sell_retry_count >= max_retries:
             self._force_close_after_ttl()
             return
+        price_state, _ = self._router.build_price_state()
+        if price_state.data_blind:
+            self._logger(
+                "[REPRICE_SKIP reason=data_blind] "
+                f"exit_intent={intent} ref_old=— ref_new=— tick_delta=—"
+            )
+            self._sell_wait_started_ts = time.monotonic()
+            return
+        _, ref_label = self._resolve_exit_policy(intent)
+        ref_now = price_state.bid if ref_label == "bid" else price_state.ask
+        ref_old = (
+            self._last_sell_ref_price
+            if self._last_sell_ref_side == ref_label
+            else None
+        )
+        if ref_now is None or ref_old is None or not self._profile.tick_size:
+            ref_old_label = "—" if ref_old is None else f"{ref_old:.8f}"
+            ref_new_label = "—" if ref_now is None else f"{ref_now:.8f}"
+            self._logger(
+                "[REPRICE_SKIP reason=ref_missing] "
+                f"exit_intent={intent} ref_old={ref_old_label} "
+                f"ref_new={ref_new_label} tick_delta=—"
+            )
+            self._sell_wait_started_ts = time.monotonic()
+            return
+        tick_delta = abs((ref_now - ref_old) / self._profile.tick_size)
+        if tick_delta < self.PRICE_MOVE_TICK_THRESHOLD:
+            self._logger(
+                "[REPRICE_SKIP reason=ref_not_moved] "
+                f"exit_intent={intent} ref_old={ref_old:.8f} "
+                f"ref_new={ref_now:.8f} tick_delta={tick_delta:.2f}"
+            )
+            self._sell_wait_started_ts = time.monotonic()
+            return
+        self._logger(
+            "[REPRICE_DO reason=ref_moved] "
+            f"exit_intent={intent} ref_old={ref_old:.8f} "
+            f"ref_new={ref_now:.8f} tick_delta={tick_delta:.2f}"
+        )
         if order_id:
             live_order = self._get_margin_order_snapshot(order_id)
             if live_order:
@@ -1375,18 +1576,31 @@ class TradeExecutor:
         bid = price_state.bid
         ask = price_state.ask
         exit_order_type = self._normalize_order_type(self._settings.exit_order_type)
-        if exit_order_type == "LIMIT" and (ask is None or not self._profile.tick_size):
+        if exit_order_type == "LIMIT" and ((ask is None and bid is None) or not self._profile.tick_size):
             self._start_price_wait("EXIT")
             self._log_price_wait("EXIT", age_ms, source)
             if self.state != TradeState.STATE_WAIT_SELL:
                 self._transition_state(TradeState.STATE_WAIT_SELL)
                 self._start_sell_wait()
             return False
-        tick_offset = max(0, int(self._settings.exit_offset_ticks))
         new_price = None
+        intent = self._normalize_exit_intent(
+            self._pending_sell_retry_reason or self.exit_intent or "MANUAL"
+        )
         if exit_order_type == "LIMIT":
-            new_price = ask - tick_offset * self._profile.tick_size
-            new_price = self._round_to_step(new_price, self._profile.tick_size)
+            (
+                new_price,
+                _,
+                _,
+            ) = self._compute_exit_sell_price(
+                intent=intent,
+                bid=bid,
+                ask=ask,
+                tick_size=self._profile.tick_size,
+                tp_offset_ticks=max(0, int(self._settings.exit_offset_ticks)),
+                sl_offset_ticks=max(0, int(getattr(self._settings, "sl_offset_ticks", 0))),
+                exit_offset_ticks=max(0, int(self._settings.exit_offset_ticks)),
+            )
         price_label = "MARKET" if new_price is None else f"{new_price:.8f}"
         mid_label = "—" if mid is None else f"{mid:.8f}"
         bid_label = "—" if bid is None else f"{bid:.8f}"
@@ -1422,6 +1636,13 @@ class TradeExecutor:
             reset_retry=False,
             mid_override=mid,
             price_override=new_price,
+            exit_intent=intent,
+            ref_bid=bid,
+            ref_ask=ask,
+            tick_size=self._profile.tick_size,
+            tp_offset_ticks=max(0, int(self._settings.exit_offset_ticks)),
+            sl_offset_ticks=max(0, int(getattr(self._settings, "sl_offset_ticks", 0))),
+            exit_offset_ticks=max(0, int(self._settings.exit_offset_ticks)),
         )
         if placed:
             return True
@@ -1788,6 +2009,9 @@ class TradeExecutor:
     def _reset_exit_intent(self) -> None:
         self.exit_intent = None
         self.exit_intent_set_ts = None
+        self._last_sell_ref_price = None
+        self._last_sell_ref_side = None
+        self._sell_ttl_retry_count = 0
 
     def _set_exit_intent(
         self, intent: str, mid: Optional[float], ticks: Optional[int] = None
@@ -1862,7 +2086,9 @@ class TradeExecutor:
             f"qty={qty_to_sell:.8f} remaining={remaining_qty_raw:.8f} "
             f"n={retry_index}/{max_retries}"
         )
-        return self._place_sell_order(reason=reason, reset_retry=False)
+        return self._place_sell_order(
+            reason=reason, reset_retry=False, exit_intent=self.exit_intent
+        )
 
     def _finalize_partial_close(self, reason: str) -> None:
         self.last_exit_reason = reason

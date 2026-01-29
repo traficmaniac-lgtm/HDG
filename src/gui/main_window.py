@@ -720,6 +720,21 @@ class MainWindow(QMainWindow):
                     "ws_switch_hysteresis_ms", payload.get("source_switch_hysteresis_ms", 1000)
                 )
             ),
+            min_source_hold_ms=self._bounded_int(
+                payload.get("min_source_hold_ms", 3000), 0, 60000, 3000
+            ),
+            ws_stable_required_ms=self._bounded_int(
+                payload.get(
+                    "ws_stable_required_ms",
+                    payload.get("ws_switch_hysteresis_ms", 1500),
+                ),
+                0,
+                20000,
+                1500,
+            ),
+            ws_stale_grace_ms=self._bounded_int(
+                payload.get("ws_stale_grace_ms", 3000), 0, 60000, 3000
+            ),
             good_quote_ttl_ms=int(payload.get("good_quote_ttl_ms", 3000)),
             mid_fresh_ms=self._bounded_int(payload.get("mid_fresh_ms", 800), 200, 5000, 800),
             max_wait_price_ms=self._bounded_int(
@@ -774,6 +789,7 @@ class MainWindow(QMainWindow):
             order_type=str(payload.get("order_type", "LIMIT")).upper(),
             exit_order_type=str(payload.get("exit_order_type", "LIMIT")).upper(),
             exit_offset_ticks=int(payload.get("exit_offset_ticks", 1)),
+            sl_offset_ticks=int(payload.get("sl_offset_ticks", 0)),
             buy_ttl_ms=self._bounded_int(payload.get("buy_ttl_ms", 2500), 500, 20000, 2500),
             max_buy_retries=self._bounded_int(
                 payload.get("max_buy_retries", 3), 0, 10, 3
@@ -786,9 +802,15 @@ class MainWindow(QMainWindow):
             ),
             sell_ttl_ms=int(payload.get("sell_ttl_ms", 8000)),
             max_sell_retries=int(payload.get("max_sell_retries", 3)),
+            max_sl_ttl_retries=self._bounded_int(
+                payload.get("max_sl_ttl_retries", 2), 0, 20, 2
+            ),
             force_close_on_ttl=bool(payload.get("force_close_on_ttl", True)),
             max_wait_sell_ms=self._bounded_int(
                 payload.get("max_wait_sell_ms", 15000), 1000, 120000, 15000
+            ),
+            max_exit_total_ms=self._bounded_int(
+                payload.get("max_exit_total_ms", 120000), 1000, 300000, 120000
             ),
             allow_force_close=bool(payload.get("allow_force_close", False)),
             cycle_count=self._bounded_int(payload.get("cycle_count", 1), 1, 1000, 1),
