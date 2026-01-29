@@ -113,6 +113,7 @@ class TradeExecutor:
         self._exit_price_wait_started_ts: Optional[float] = None
         self._exit_started_ts: Optional[float] = None
         self._tp_exit_phase: Optional[str] = None
+        self._tp_armed = False
         self._recovery_residual_qty = 0.0
         self._recovery_active = False
         self._recovery_last_check_ts: Optional[float] = None
@@ -131,6 +132,9 @@ class TradeExecutor:
         self._last_progress_ts = now
         self._reconcile_inflight = False
         self._reconcile_attempts = 0
+        self._reconcile_recovery_attempts = 0
+        self._reconcile_invalid_totals = False
+        self._reconcile_refresh_requested = False
         self._safe_stop_issued = False
         self._last_entry_state_payload: Optional[tuple[object, ...]] = None
         self._last_entry_degraded_ts = 0.0
@@ -1156,6 +1160,18 @@ class TradeExecutor:
         elapsed_ms = int((now - self._tp_maker_started_ts) * 1000.0)
         cross_after_ms = int(getattr(self._settings, "tp_cross_after_ms", 900))
         tick_size = self._profile.tick_size
+        position_side = "LONG"
+        if self.position is not None:
+            position_side = str(self.position.get("side", "LONG") or "LONG").upper()
+        if tick_size and tp_price is not None and not self._tp_armed:
+            arm_level = tp_price - tick_size if position_side != "SHORT" else tp_price + tick_size
+            bid_reached = bid is not None and bid >= arm_level
+            mid_reached = mid is not None and mid >= arm_level
+            if position_side == "SHORT":
+                bid_reached = ask is not None and ask <= arm_level
+                mid_reached = mid is not None and mid <= arm_level
+            if bid_reached or mid_reached:
+                self._tp_armed = True
         spread_tight = False
         if bid is not None and ask is not None and tick_size:
             spread_tight = (ask - bid) <= tick_size
@@ -1169,15 +1185,16 @@ class TradeExecutor:
             and health_state.http_age_ms <= http_fresh_ms
         )
         cross_reason = None
-        if elapsed_ms >= cross_after_ms:
-            cross_reason = "timeout"
-        elif mid_against:
-            cross_reason = "mid_away"
-        elif spread_tight:
-            cross_reason = "tight_spread"
-        elif ws_bad and http_fresh:
-            cross_reason = "ws_unstable_http"
-        desired_phase = "CROSS" if cross_reason else "MAKER"
+        if self._tp_armed:
+            if elapsed_ms >= cross_after_ms:
+                cross_reason = "timeout"
+            elif mid_against:
+                cross_reason = "mid_away"
+            elif spread_tight:
+                cross_reason = "tight_spread"
+            elif ws_bad and http_fresh:
+                cross_reason = "ws_unstable_http"
+        desired_phase = "CROSS" if cross_reason and self._tp_armed else "MAKER"
         if desired_phase == "MAKER" and self._tp_exit_phase != "MAKER":
             self._logger("[TP_MAKER_ARMED]")
         if desired_phase == "CROSS" and self._tp_exit_phase != "CROSS":
@@ -2183,6 +2200,8 @@ class TradeExecutor:
         mid_val = price_state.mid
         age_ms = price_state.mid_age_ms
         source = price_state.source
+        if source == "HTTP" and health_state.http_age_ms is not None:
+            age_ms = health_state.http_age_ms
         if price_state.data_blind:
             return (
                 False,
@@ -2393,7 +2412,7 @@ class TradeExecutor:
         self._note_price_progress(bid, ask)
         self._clear_price_wait("ENTRY")
         elapsed_ms = self._entry_attempt_elapsed_ms()
-        if elapsed_ms is not None and not self._should_dedup_log("entry_wait", 2.0):
+        if elapsed_ms is not None and not self._should_dedup_log("entry_wait", 0.8):
             self._logger(f"[ENTRY_WAIT] ms={elapsed_ms} {entry_context}")
         if not self._profile.tick_size or not self._profile.step_size:
             return
@@ -2443,21 +2462,13 @@ class TradeExecutor:
             ws_bad=ws_bad,
         )
         if not can_reprice:
-            if not self._should_dedup_log("entry_reprice_skip", 2.0):
+            if not self._should_dedup_log("entry_reprice_skip", 0.8):
                 new_price_label = "?" if new_price is None else f"{new_price:.8f}"
                 self._logger(
                     "[ENTRY_REPRICE] action=SKIP "
                     f"reason={reason_label} old_price={order_price_label} "
                     f"new_price={new_price_label} {entry_context}"
                 )
-            if (
-                bid is not None
-                and ref_moved
-                and new_price is not None
-                and new_price == current_price
-            ):
-                self._entry_last_ref_bid = bid
-                self._entry_last_ref_ts_ms = now_ms
             return
         if not self._should_dedup_log("entry_reprice_do", 0.4):
             new_price_label = "?" if new_price is None else f"{new_price:.8f}"
@@ -2983,6 +2994,20 @@ class TradeExecutor:
                 trades=trades,
                 balance=balance,
             )
+            planned_qty = self._entry_plan_qty()
+            if planned_qty > self._epsilon_qty():
+                step_tolerance = self._get_step_size_tolerance()
+                max_allowed = max(planned_qty * 1.05, planned_qty + (step_tolerance * 5))
+                if executed > max_allowed:
+                    self._reconcile_invalid_totals = True
+                    if not self._should_dedup_log("reconcile_invalid_totals", 5.0):
+                        self._logger(
+                            "[RECONCILE_INVALID_TOTALS] "
+                            f"executed={executed:.8f} planned={planned_qty:.8f} "
+                            f"max_allowed={max_allowed:.8f}"
+                        )
+                    self._reconcile_refresh_requested = True
+                    return
             have_open_entry = any(
                 str(order.get("side") or "").upper() == "BUY" for order in open_orders
             )
@@ -2990,25 +3015,62 @@ class TradeExecutor:
                 str(order.get("side") or "").upper() == "SELL" for order in open_orders
             )
             self._apply_reconcile_snapshot(executed, closed, remaining, entry_avg)
+            self._reconcile_invalid_totals = False
+            self._reconcile_refresh_requested = False
             if remaining > self._epsilon_qty():
                 needs_cancel_entry = have_open_entry and executed > self._epsilon_qty()
                 needs_exit_place = not have_open_exit
                 if needs_cancel_entry or needs_exit_place:
+                    self._reconcile_recovery_attempts += 1
+                    attempt_label = self._reconcile_recovery_attempts
                     self._logger(
                         "[RECONCILE] "
                         f"actions_required cancel_entry={needs_cancel_entry} "
-                        f"place_exit={needs_exit_place} -> SAFE_STOP"
+                        f"place_exit={needs_exit_place} attempt={attempt_label}"
                     )
-                    self._enter_safe_stop(reason="RECONCILE_ACTIONS_REQUIRED", allow_rest=False)
+                    if needs_cancel_entry:
+                        for order in open_orders:
+                            if str(order.get("side") or "").upper() != "BUY":
+                                continue
+                            order_id = order.get("orderId")
+                            if not order_id:
+                                continue
+                            is_isolated = "TRUE" if self._settings.margin_isolated else "FALSE"
+                            self._cancel_margin_order(
+                                symbol=self._settings.symbol,
+                                order_id=order_id,
+                                is_isolated=is_isolated,
+                                tag=order.get("tag", self.TAG),
+                            )
+                        self.entry_cancel_pending = True
+                    if needs_exit_place:
+                        price_state, health_state = self._router.build_price_state()
+                        self._ensure_exit_orders(
+                            price_state,
+                            health_state,
+                            allow_replace=True,
+                            skip_reconcile=True,
+                        )
+                    price_state, _ = self._router.build_price_state()
+                    if (
+                        self._reconcile_recovery_attempts >= 3
+                        and (price_state.data_blind or balance is None)
+                    ):
+                        self._enter_safe_stop(
+                            reason="RECONCILE_ACTIONS_REQUIRED",
+                            allow_rest=False,
+                        )
+                        return
+                    self._transition_state(self._exit_state_for_intent(self.exit_intent))
                     return
+                self._reconcile_recovery_attempts = 0
                 self._transition_state(self._exit_state_for_intent(self.exit_intent))
                 return
             if have_open_entry or have_open_exit:
                 self._logger(
-                    "[RECONCILE] open_orders_present -> SAFE_STOP"
+                    "[RECONCILE] open_orders_present -> CANCEL"
                 )
-                self._enter_safe_stop(reason="RECONCILE_OPEN_ORDERS", allow_rest=False)
-                return
+                self._cancel_all_symbol_orders()
             cycle_id = self._current_cycle_id
             self.position = None
             self._reset_position_tracking()
@@ -3650,6 +3712,7 @@ class TradeExecutor:
         self._sell_last_seen_ts = None
         self._reset_exit_intent()
         self._clear_recovery(reason="reset")
+        self._tp_armed = False
 
     def _reset_exit_intent(self) -> None:
         self.exit_intent = None
@@ -3660,6 +3723,8 @@ class TradeExecutor:
         self._tp_exit_phase = None
         self._exit_reprice_last_ts = 0.0
         self._tp_maker_started_ts = None
+        self._tp_armed = False
+        self._reconcile_recovery_attempts = 0
 
     def _set_exit_intent(
         self,
@@ -3675,6 +3740,7 @@ class TradeExecutor:
         self._exit_started_ts = None
         self._tp_exit_phase = "MAKER" if intent == "TP" else None
         self._tp_maker_started_ts = None
+        self._tp_armed = False
         self._logger(f"[EXIT_INTENT] {intent}")
         ticks_label = "?" if ticks is None else str(ticks)
         mid_label = "—" if mid is None else f"{mid:.8f}"
