@@ -138,7 +138,7 @@ def test_stuck_triggers_reconcile() -> None:
 
 def test_reconcile_routes_to_exit_when_remaining_gt_zero() -> None:
     now_ms = int(time.time() * 1000)
-    trades = [{"price": "1.0", "qty": "1.0", "isBuyer": True, "time": now_ms}]
+    trades = [{"price": "1.0", "qty": "1.0", "isBuyer": True, "time": now_ms, "orderId": 101}]
     router = DummyRouter(bid=1.0, ask=1.1)
     rest = DummyRest(open_orders=[], trades=trades)
     profile = SymbolProfile(tick_size=0.01, step_size=0.01, min_qty=0.01, min_notional=0.0)
@@ -149,12 +149,17 @@ def test_reconcile_routes_to_exit_when_remaining_gt_zero() -> None:
         profile=profile,
         logger=lambda _msg: None,
     )
+    executor.active_test_orders = [
+        {"orderId": 101, "side": "BUY", "qty": 1.0, "cum_qty": 0.0, "status": "NEW"}
+    ]
+    executor.entry_active_order_id = 101
     executor._current_cycle_id = 1
     executor._cycle_start_ts_ms = now_ms - 500
+    executor._cycle_order_ids = {101}
     snapshot = executor.collect_reconcile_snapshot()
     executor.apply_reconcile_snapshot(snapshot)
 
-    assert executor.state == TradeState.STATE_SAFE_STOP
+    assert executor.state == TradeState.STATE_EXIT_TP_WORKING
 
 
 def test_reconcile_returns_to_idle_when_flat() -> None:
@@ -175,11 +180,11 @@ def test_reconcile_returns_to_idle_when_flat() -> None:
     assert executor.position is None
 
 
-def test_reconcile_filters_trades_by_cycle_start() -> None:
+def test_reconcile_filters_by_cycle_order_ids() -> None:
     now_ms = int(time.time() * 1000)
     trades = [
-        {"price": "1.0", "qty": "1.0", "isBuyer": True, "time": now_ms - 10000},
-        {"price": "1.1", "qty": "2.0", "isBuyer": True, "time": now_ms - 200},
+        {"price": "1.0", "qty": "1.0", "isBuyer": True, "time": now_ms - 10000, "orderId": 202},
+        {"price": "1.1", "qty": "2.0", "isBuyer": True, "time": now_ms - 200, "orderId": 203},
     ]
     router = DummyRouter(bid=1.0, ask=1.1)
     rest = DummyRest(open_orders=[], trades=trades)
@@ -193,10 +198,43 @@ def test_reconcile_filters_trades_by_cycle_start() -> None:
     )
     executor._current_cycle_id = 1
     executor._cycle_start_ts_ms = now_ms - 1000
+    executor._cycle_order_ids = {201}
     snapshot = executor.collect_reconcile_snapshot()
     executor.apply_reconcile_snapshot(snapshot)
 
-    assert executor._executed_qty_total == 2.0
+    assert executor._executed_qty_total == 0.0
+
+
+def test_invalid_totals_trigger_openorders_only_mode() -> None:
+    now_ms = int(time.time() * 1000)
+    trades = [
+        {"price": "1.0", "qty": "5.0", "isBuyer": True, "time": now_ms, "orderId": 501}
+    ]
+    open_orders = [{"orderId": 9001, "side": "BUY", "status": "NEW"}]
+    router = DummyRouter(bid=1.0, ask=1.1)
+    rest = DummyRest(open_orders=open_orders, trades=trades)
+    profile = SymbolProfile(tick_size=0.01, step_size=0.01, min_qty=0.01, min_notional=0.0)
+    executor = TradeExecutor(
+        rest=rest,
+        router=router,
+        settings=make_settings(),
+        profile=profile,
+        logger=lambda _msg: None,
+    )
+    executor.active_test_orders = [
+        {"orderId": 9001, "side": "BUY", "qty": 1.0, "cum_qty": 0.0, "status": "NEW"}
+    ]
+    executor.entry_active_order_id = 9001
+    executor._current_cycle_id = 1
+    executor._cycle_start_ts_ms = now_ms - 1000
+    executor._cycle_order_ids = {501}
+
+    snapshot = executor.collect_reconcile_snapshot()
+    executor.apply_reconcile_snapshot(snapshot)
+
+    assert executor._reconcile_invalid_totals is True
+    assert executor._executed_qty_total == 0.0
+    assert executor.state == TradeState.STATE_ENTRY_WORKING
 
 
 def test_watchdog_skips_entry_when_best_bid() -> None:

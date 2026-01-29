@@ -167,6 +167,7 @@ def test_reconcile_clamp_blocks_insane_totals() -> None:
     now_ms = int(time.time() * 1000)
     executor._current_cycle_id = 1
     executor._cycle_start_ts_ms = now_ms
+    executor._cycle_order_ids = {1}
 
     snapshot = {
         "open_orders": [],

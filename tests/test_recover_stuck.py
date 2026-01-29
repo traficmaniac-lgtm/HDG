@@ -166,7 +166,7 @@ def test_deadline_triggers_recover() -> None:
 
 def test_recover_places_cross_if_position_open_and_no_exit() -> None:
     now_ms = int(time.time() * 1000)
-    trades = [{"price": "1.0", "qty": "1.0", "isBuyer": True, "time": now_ms}]
+    trades = [{"price": "1.0", "qty": "1.0", "isBuyer": True, "time": now_ms, "orderId": 701}]
     router = DummyRouter(bid=100.0, ask=101.0)
     rest = DummyRest(open_orders=[], trades=trades, base_free=1.0, base_locked=0.0)
     profile = SymbolProfile(tick_size=0.01, step_size=0.01, min_qty=0.01, min_notional=0.0)
@@ -179,6 +179,7 @@ def test_recover_places_cross_if_position_open_and_no_exit() -> None:
     )
     executor._current_cycle_id = 1
     executor._cycle_start_ts_ms = now_ms - 500
+    executor._cycle_order_ids = {701}
     executor.exit_intent = "TP"
 
     placed = executor._recover_stuck(reason="deadline")
