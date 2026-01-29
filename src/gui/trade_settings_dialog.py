@@ -28,9 +28,6 @@ class TradeSettingsDialog(QDialog):
         int,
         int,
         int,
-        int,
-        int,
-        int,
         bool,
         bool,
     )
@@ -43,7 +40,7 @@ class TradeSettingsDialog(QDialog):
         self._settings = settings
         self.setWindowTitle("Параметры торговли")
         self.setMinimumWidth(360)
-        self.setFixedHeight(420)
+        self.setFixedHeight(360)
 
         layout = QVBoxLayout(self)
         tabs = QTabWidget()
@@ -104,20 +101,6 @@ class TradeSettingsDialog(QDialog):
         )
         basic_form.addRow("SL (тики)", self.stop_loss_input)
 
-        self.entry_offset_input = QSpinBox()
-        self.entry_offset_input.setRange(0, 1000)
-        self.entry_offset_input.setValue(
-            int(getattr(settings, "entry_offset_ticks", 1) or 0) if settings else 1
-        )
-        basic_form.addRow("Смещение входа (тики)", self.entry_offset_input)
-
-        self.exit_offset_input = QSpinBox()
-        self.exit_offset_input.setRange(0, 1000)
-        self.exit_offset_input.setValue(
-            int(getattr(settings, "exit_offset_ticks", 1) or 1) if settings else 1
-        )
-        basic_form.addRow("Смещение выхода (тики)", self.exit_offset_input)
-
         self.allow_borrow_input = QCheckBox("Разрешить заём (borrow)")
         self.allow_borrow_input.setChecked(bool(getattr(settings, "allow_borrow", True)))
         basic_form.addRow("", self.allow_borrow_input)
@@ -149,16 +132,6 @@ class TradeSettingsDialog(QDialog):
         )
         advanced_form.addRow("HTTP fresh (ms)", self.http_fresh_input)
 
-        self.max_entry_total_input = QSpinBox()
-        self.max_entry_total_input.setRange(1000, 120000)
-        self.max_entry_total_input.setSingleStep(1000)
-        self.max_entry_total_input.setValue(
-            int(getattr(settings, "max_entry_total_ms", 30000) or 30000)
-            if settings
-            else 30000
-        )
-        advanced_form.addRow("Max entry total (ms)", self.max_entry_total_input)
-
         layout.addWidget(tabs)
 
         buttons_layout = QHBoxLayout()
@@ -178,18 +151,17 @@ class TradeSettingsDialog(QDialog):
         payload.pop("budget_quote", None)
         payload.pop("usage_pct", None)
         payload.pop("min_quote_reserve", None)
+        payload.pop("entry_offset_ticks", None)
+        payload.pop("exit_offset_ticks", None)
+        payload.pop("max_entry_total_ms", None)
         payload["order_quote"] = float(self.order_quote_input.value())
         payload["max_budget"] = float(self.max_budget_input.value())
         payload["budget_reserve"] = float(self.budget_reserve_input.value())
-        payload["entry_offset_ticks"] = int(self.entry_offset_input.value())
-        payload["offset_ticks"] = int(self.entry_offset_input.value())
         payload["take_profit_ticks"] = int(self.take_profit_input.value())
         payload["stop_loss_ticks"] = int(self.stop_loss_input.value())
         payload["cycle_count"] = int(self.cycle_count_input.value())
         payload["mid_fresh_ms"] = int(self.mid_fresh_input.value())
         payload["http_fresh_ms"] = int(self.http_fresh_input.value())
-        payload["max_entry_total_ms"] = int(self.max_entry_total_input.value())
-        payload["exit_offset_ticks"] = int(self.exit_offset_input.value())
         payload["allow_borrow"] = bool(self.allow_borrow_input.isChecked())
         payload["auto_exit_enabled"] = bool(self.auto_exit_input.isChecked())
         self._store.save_settings(payload)
@@ -200,11 +172,8 @@ class TradeSettingsDialog(QDialog):
             int(self.cycle_count_input.value()),
             int(self.take_profit_input.value()),
             int(self.stop_loss_input.value()),
-            int(self.entry_offset_input.value()),
-            int(self.exit_offset_input.value()),
             int(self.mid_fresh_input.value()),
             int(self.http_fresh_input.value()),
-            int(self.max_entry_total_input.value()),
             bool(self.allow_borrow_input.isChecked()),
             bool(self.auto_exit_input.isChecked()),
         )
