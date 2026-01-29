@@ -1592,6 +1592,7 @@ class TradeExecutor:
                 new_price,
                 _,
                 _,
+                _,
             ) = self._compute_exit_sell_price(
                 intent=intent,
                 bid=bid,
