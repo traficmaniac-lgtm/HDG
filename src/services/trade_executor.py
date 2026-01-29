@@ -293,6 +293,7 @@ class TradeExecutor:
                     "orderId": buy_order.get("orderId"),
                     "side": "BUY",
                     "price": buy_price,
+                    "bid_at_place": bid,
                     "qty": qty,
                     "cum_qty": 0.0,
                     "avg_fill_price": 0.0,
@@ -1169,17 +1170,22 @@ class TradeExecutor:
         current_price = float(buy_order.get("price") or 0.0)
         if current_price <= 0:
             return
-        min_ticks = max(1, int(getattr(self._settings, "entry_reprice_min_ticks", 1)))
+        min_ticks = 1
         tick_size = self._profile.tick_size
-        bid_diff = (bid - current_price) / tick_size
-        last_seen_bid = self._entry_last_seen_bid
-        if last_seen_bid is None:
-            bid_move_ticks = 0.0
-        else:
-            bid_move_ticks = abs(bid - last_seen_bid) / tick_size
+        bid_at_place = buy_order.get("bid_at_place")
+        if bid_at_place is None:
+            bid_at_place = bid
+        bid_move_ticks = abs(bid - bid_at_place) / tick_size
+        spread_ticks = 0.0
+        if ask is not None:
+            spread_ticks = (ask - bid) / tick_size
+        spread_reprice_threshold = max(
+            1, int(getattr(self._settings, "spread_reprice_threshold", 2))
+        )
         cooldown_ms = max(
             0, int(getattr(self._settings, "entry_reprice_cooldown_ms", 1200))
         )
+        min_reprice_interval_ms = 250
         require_stable = bool(
             getattr(self._settings, "entry_reprice_require_stable_source", True)
         )
@@ -1217,7 +1223,12 @@ class TradeExecutor:
                 )
             self._entry_last_seen_bid = bid
             return
-        if bid_move_ticks < min_ticks:
+        reprice_reason = None
+        if bid_move_ticks >= min_ticks:
+            reprice_reason = "bid_move"
+        elif spread_ticks >= spread_reprice_threshold:
+            reprice_reason = "spread_expand"
+        if reprice_reason is None:
             if not self._should_dedup_log("entry_skip_no_move", 2.0):
                 age_label = age_ms if age_ms is not None else "?"
                 self._logger(
@@ -1225,11 +1236,11 @@ class TradeExecutor:
                 )
             self._entry_last_seen_bid = bid
             return
-        if bid_diff < min_ticks:
-            if not self._should_dedup_log("entry_skip_bid_diff", 2.0):
+        if (now - self._entry_reprice_last_ts) * 1000.0 < min_reprice_interval_ms:
+            if not self._should_dedup_log("entry_skip_min_interval", 2.0):
                 age_label = age_ms if age_ms is not None else "?"
                 self._logger(
-                    f"[ENTRY_REPRICE_SKIP] reason=no_move age_ms={age_label}"
+                    f"[ENTRY_REPRICE_SKIP] reason=min_interval age_ms={age_label}"
                 )
             self._entry_last_seen_bid = bid
             return
@@ -1241,11 +1252,11 @@ class TradeExecutor:
                 )
             self._entry_last_seen_bid = bid
             return
-        new_price = self._calculate_entry_price(bid)
+        new_price = self._round_to_step(bid, tick_size)
         if new_price is None:
             self._entry_last_seen_bid = bid
             return
-        if new_price <= current_price:
+        if new_price == current_price:
             self._entry_last_seen_bid = bid
             return
         order_id = buy_order.get("orderId")
@@ -1269,9 +1280,12 @@ class TradeExecutor:
             return
         if self._profile.min_notional is not None and qty * new_price < self._profile.min_notional:
             return
+        spread_label = f"{spread_ticks:.2f}"
+        bid_old_label = "?" if bid_at_place is None else f"{bid_at_place:.8f}"
         self._logger(
             "[ENTRY_REPRICE] "
-            f"old={current_price:.8f} new={new_price:.8f} bid={bid:.8f} reason=bid_moved"
+            f"reason={reprice_reason} bid_old={bid_old_label} bid_new={bid:.8f} "
+            f"spread_ticks={spread_label} new_price={new_price:.8f}"
         )
         is_isolated = "TRUE" if self._settings.margin_isolated else "FALSE"
         timestamp = int(time.time() * 1000)
@@ -1300,6 +1314,7 @@ class TradeExecutor:
                 "orderId": buy_order.get("orderId"),
                 "side": "BUY",
                 "price": new_price,
+                "bid_at_place": bid,
                 "qty": qty,
                 "cum_qty": 0.0,
                 "avg_fill_price": 0.0,
