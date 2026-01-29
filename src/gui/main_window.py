@@ -1001,6 +1001,18 @@ class MainWindow(QMainWindow):
             price_wait_log_every_ms=self._bounded_int(
                 payload.get("price_wait_log_every_ms", 1000), 250, 10000, 1000
             ),
+            tp_cross_after_ms=self._bounded_int(
+                payload.get("tp_cross_after_ms", 900), 200, 5000, 900
+            ),
+            inflight_deadline_ms=self._bounded_int(
+                payload.get("inflight_deadline_ms", 2500), 500, 10000, 2500
+            ),
+            sell_refresh_grace_ms=self._bounded_int(
+                payload.get("sell_refresh_grace_ms", 400), 100, 3000, 400
+            ),
+            epsilon_qty=self._bounded_float(
+                payload.get("epsilon_qty", 1e-6), 1e-9, 1e-2, 1e-6
+            ),
             position_guard_http=bool(payload.get("position_guard_http", True)),
             entry_mode=str(payload.get("entry_mode", "NORMAL")).upper(),
             account_mode=str(payload.get("account_mode", "CROSS_MARGIN")),

@@ -249,6 +249,13 @@ class PriceRouter:
             ask = self._http_ask
             quote_source = "HTTP"
 
+        if bid is not None and ask is not None and bid > ask:
+            self._log_queue.append(
+                "[DATA] quote_inverted "
+                f"bid={bid:.8f} ask={ask:.8f} src={quote_source}"
+            )
+            bid, ask = min(bid, ask), max(bid, ask)
+
         mid = (bid + ask) / 2.0 if bid is not None and ask is not None else None
         if mid is not None and self._tick_size:
             mid = round(mid / self._tick_size) * self._tick_size

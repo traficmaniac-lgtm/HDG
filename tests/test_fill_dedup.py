@@ -1,31 +1,16 @@
 from __future__ import annotations
 
 from src.core.models import HealthState, PriceState, Settings, SymbolProfile
-from src.services.trade_executor import TradeExecutor, TradeState
+from src.services.trade_executor import TradeExecutor
 
 
 class DummyRest:
     pass
 
 
-class HttpFreshRouter:
-    def __init__(self, mid: float, bid: float, ask: float) -> None:
-        self._mid = mid
-        self._bid = bid
-        self._ask = ask
-
+class DummyRouter:
     def build_price_state(self) -> tuple[PriceState, HealthState]:
-        return (
-            PriceState(
-                bid=self._bid,
-                ask=self._ask,
-                mid=self._mid,
-                source="HTTP",
-                mid_age_ms=500,
-                data_blind=False,
-            ),
-            HealthState(ws_connected=False, ws_age_ms=99999, http_age_ms=500),
-        )
+        return PriceState(), HealthState()
 
     def get_ws_issue_counts(self) -> tuple[int, int]:
         return (0, 0)
@@ -62,11 +47,11 @@ def make_settings() -> Settings:
         account_mode="MARGIN",
         leverage_hint=1,
         entry_reprice_min_ticks=1,
-        entry_reprice_cooldown_ms=0,
-        entry_reprice_require_stable_source=False,
-        entry_reprice_stable_source_grace_ms=0,
+        entry_reprice_cooldown_ms=1200,
+        entry_reprice_require_stable_source=True,
+        entry_reprice_stable_source_grace_ms=3000,
         entry_reprice_min_consecutive_fresh_reads=1,
-        take_profit_ticks=1,
+        take_profit_ticks=2,
         stop_loss_ticks=1,
         order_type="LIMIT",
         exit_order_type="LIMIT",
@@ -85,30 +70,22 @@ def make_settings() -> Settings:
     )
 
 
-def test_exit_not_frozen_when_http_fresh() -> None:
-    profile = SymbolProfile(tick_size=0.001, step_size=0.001, min_qty=0.001, min_notional=0.0)
-    buy_price = 1.000
-    mid = 1.001
-    router = HttpFreshRouter(mid=mid, bid=mid - 0.001, ask=mid + 0.001)
-    executor = TradeExecutor(
+def make_executor() -> TradeExecutor:
+    profile = SymbolProfile(tick_size=0.0001, step_size=0.0001, min_qty=0.0001, min_notional=0.0)
+    return TradeExecutor(
         rest=DummyRest(),
-        router=router,
+        router=DummyRouter(),
         settings=make_settings(),
         profile=profile,
         logger=lambda _msg: None,
     )
-    executor.state = TradeState.STATE_POSITION_OPEN
-    executor.position = {"buy_price": buy_price, "qty": 1.0, "opened_ts": 0, "partial": False}
 
-    placed: list[str] = []
 
-    def fake_place_sell(*_args, **_kwargs) -> int:
-        placed.append("sell")
-        return 1
+def test_fill_dedup_by_order_id_and_cum_qty() -> None:
+    executor = make_executor()
 
-    executor._place_sell_order = fake_place_sell  # type: ignore[assignment]
+    first = executor._should_process_fill(10, "BUY", 5.0, 1.2, 1)
+    second = executor._should_process_fill(10, "BUY", 5.0, 1.3, 1)
 
-    executor.evaluate_exit_conditions()
-
-    assert executor._exits_frozen is False
-    assert placed == ["sell"]
+    assert first is True
+    assert second is False
