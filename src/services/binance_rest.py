@@ -9,8 +9,10 @@ import httpx
 
 
 class BinanceRestClient:
-    def __init__(self, api_key: str = "", api_secret: str = "") -> None:
-        self._client = httpx.Client(timeout=10.0)
+    def __init__(
+        self, api_key: str = "", api_secret: str = "", timeout_s: float = 10.0
+    ) -> None:
+        self._client = httpx.Client(timeout=httpx.Timeout(timeout_s))
         self._base_url = "https://api.binance.com"
         self.api_key = api_key
         self.api_secret = api_secret

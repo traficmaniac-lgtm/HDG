@@ -317,8 +317,9 @@ class MainWindow(QMainWindow):
         self._rest = BinanceRestClient(
             api_key=api_credentials.key,
             api_secret=api_credentials.secret,
+            timeout_s=self._settings.rest_timeout_s,
         )
-        self._http_service = HttpPriceService()
+        self._http_service = HttpPriceService(timeout_s=self._settings.http_timeout_s)
 
         try:
             server_time = self._rest.get_server_time()
@@ -711,6 +712,7 @@ class MainWindow(QMainWindow):
             ws_stale_ms=int(payload.get("ws_stale_ms", 1500)),
             http_fresh_ms=int(payload.get("http_fresh_ms", 1500)),
             http_poll_ms=int(payload.get("http_poll_ms", payload.get("http_interval_ms", 350))),
+            http_timeout_s=self._bounded_float(payload.get("http_timeout_s", 5.0), 1.0, 30.0, 5.0),
             ui_refresh_ms=int(payload.get("ui_refresh_ms", 100)),
             ws_log_throttle_ms=int(payload.get("ws_log_throttle_ms", 5000)),
             ws_reconnect_dedup_ms=int(payload.get("ws_reconnect_dedup_ms", 10000)),
@@ -795,6 +797,7 @@ class MainWindow(QMainWindow):
             order_quote=order_quote,
             max_budget=max_budget,
             budget_reserve=budget_reserve,
+            rest_timeout_s=self._bounded_float(payload.get("rest_timeout_s", 10.0), 1.0, 60.0, 10.0),
         )
 
     def _log_data_blind_state(self, price_state: PriceState, state_label: str) -> None:
