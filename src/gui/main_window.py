@@ -986,6 +986,15 @@ class MainWindow(QMainWindow):
             exit_max_age_ms=self._bounded_int(
                 payload.get("exit_max_age_ms", 2500), 500, 10000, 2500
             ),
+            tp_max_age_ms=self._bounded_int(
+                payload.get("tp_max_age_ms", 400), 100, 2000, 400
+            ),
+            settlement_grace_ms=self._bounded_int(
+                payload.get("settlement_grace_ms", 400), 100, 2000, 400
+            ),
+            repricing_cooldown_ms=self._bounded_int(
+                payload.get("repricing_cooldown_ms", 75), 10, 2000, 75
+            ),
             max_wait_price_ms=self._bounded_int(
                 payload.get("max_wait_price_ms", 5000), 1000, 30000, 5000
             ),
