@@ -34,7 +34,10 @@
   "margin_isolated": false,
   "auto_exit_enabled": true,
   "max_sell_retries": 3,
-  "max_wait_sell_ms": 15000,
+  "max_wait_sell_ms": 8000,
+  "tp_maker_grace_ms": 1200,
+  "tp_force_cross_ms": 2500,
+  "tp_cross_ticks": 0,
   "allow_force_close": false,
   "cycle_count": 1000
 }
