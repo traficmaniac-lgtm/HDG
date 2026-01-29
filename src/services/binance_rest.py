@@ -55,6 +55,13 @@ class BinanceRestClient:
             {"symbol": symbol, "orderId": order_id},
         )
 
+    def get_margin_my_trades(self, symbol: str, limit: int = 50) -> list[dict]:
+        return self.signed_sapi_request(
+            "GET",
+            "/sapi/v1/margin/myTrades",
+            {"symbol": symbol, "limit": limit},
+        )
+
     def get_margin_account(self) -> dict:
         return self.signed_sapi_request("GET", "/sapi/v1/margin/account", {})
 

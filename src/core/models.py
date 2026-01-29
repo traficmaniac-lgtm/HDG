@@ -28,6 +28,10 @@ class Settings:
     price_wait_log_every_ms: int
     tp_cross_after_ms: int
     inflight_deadline_ms: int
+    watchdog_poll_ms: int
+    max_state_stuck_ms: int
+    max_no_progress_ms: int
+    max_reconcile_retries: int
     sell_refresh_grace_ms: int
     epsilon_qty: float
     position_guard_http: bool
