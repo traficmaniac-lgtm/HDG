@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 from typing import Callable
 
-from PySide6.QtCore import QObject, QTimer, Signal
+from PySide6.QtCore import QObject, QTimer, Signal, Slot
 
 from src.services.binance_rest import BinanceRestClient
 
@@ -19,6 +19,7 @@ class OrderTracker(QObject):
         symbol: str,
         poll_ms: int,
         logger: Callable[[str], None],
+        owns_rest: bool = False,
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
@@ -26,18 +27,24 @@ class OrderTracker(QObject):
         self._symbol = symbol
         self._logger = logger
         self._poll_ms = poll_ms
+        self._owns_rest = owns_rest
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._poll_orders)
         self._active_orders: dict[int, dict] = {}
         self._last_error_ts = 0.0
 
+    @Slot()
     def start(self) -> None:
         self._timer.start(self._poll_ms)
 
+    @Slot()
     def stop(self) -> None:
         self._timer.stop()
         self._active_orders.clear()
+        if self._owns_rest:
+            self._rest.close()
 
+    @Slot(list)
     def sync_active_orders(self, orders: list[dict]) -> None:
         active_ids: set[int] = set()
         for order in orders:
@@ -63,6 +70,11 @@ class OrderTracker(QObject):
         stale_ids = [order_id for order_id in self._active_orders if order_id not in active_ids]
         for order_id in stale_ids:
             self._active_orders.pop(order_id, None)
+
+    @Slot(str, str)
+    def update_api_credentials(self, api_key: str, api_secret: str) -> None:
+        self._rest.api_key = api_key
+        self._rest.api_secret = api_secret
 
     def _poll_orders(self) -> None:
         if not self._active_orders:

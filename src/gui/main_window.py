@@ -13,7 +13,7 @@ import time
 from collections import deque
 
 import httpx
-from PySide6.QtCore import Qt, QTimer, Slot
+from PySide6.QtCore import Qt, QThread, QTimer, Signal, Slot
 from PySide6.QtGui import QAction, QFontDatabase, QFontMetrics, QStandardItem, QStandardItemModel
 from PySide6.QtWidgets import (
     QDialog,
@@ -72,6 +72,10 @@ class ElidedLabel(QLabel):
 
 
 class MainWindow(QMainWindow):
+    order_tracker_sync = Signal(list)
+    order_tracker_stop = Signal()
+    order_tracker_update_credentials = Signal(str, str)
+
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle(f"Directional Hedge Scalper v{VERSION} — EURIUSDT Core")
@@ -94,6 +98,7 @@ class MainWindow(QMainWindow):
         self._margin_api_access = False
         self._borrow_allowed_by_api: Optional[bool] = None
         self._order_tracker: Optional[OrderTracker] = None
+        self._order_tracker_thread: Optional[QThread] = None
         self._last_ws_status_log_ts = 0.0
         self._data_blind_active = False
         self._last_data_blind_log_ts = 0.0
@@ -579,17 +584,35 @@ class MainWindow(QMainWindow):
             self._trade_executor.set_margin_capabilities(
                 self._margin_api_access, self._borrow_allowed_by_api
             )
+            tracker_rest = BinanceRestClient(
+                api_key=api_credentials.key,
+                api_secret=api_credentials.secret,
+            )
             self._order_tracker = OrderTracker(
-                rest=self._rest,
+                rest=tracker_rest,
                 symbol=self._settings.symbol,
                 poll_ms=self._settings.order_poll_ms,
                 logger=self._append_log,
-                parent=self,
+                owns_rest=True,
             )
+            self._order_tracker_thread = QThread(self)
+            self._order_tracker.moveToThread(self._order_tracker_thread)
+            self._order_tracker_thread.started.connect(self._order_tracker.start)
+            self._order_tracker_thread.finished.connect(self._order_tracker.deleteLater)
+            self.order_tracker_sync.connect(
+                self._order_tracker.sync_active_orders, Qt.ConnectionType.QueuedConnection
+            )
+            self.order_tracker_stop.connect(
+                self._order_tracker.stop, Qt.ConnectionType.QueuedConnection
+            )
+            self.order_tracker_update_credentials.connect(
+                self._order_tracker.update_api_credentials,
+                Qt.ConnectionType.QueuedConnection,
+            )
+            self._order_tracker_thread.start()
             self._order_tracker.order_filled.connect(self._on_order_filled)
             self._order_tracker.order_partial.connect(self._on_order_partial)
             self._order_tracker.order_done.connect(self._on_order_done)
-            self._order_tracker.start()
             self._update_trading_controls()
         else:
             self.start_button.setEnabled(False)
@@ -619,8 +642,12 @@ class MainWindow(QMainWindow):
         self._orders_timer.stop()
         self._watchdog_timer.stop()
         if self._order_tracker:
-            self._order_tracker.stop()
+            self.order_tracker_stop.emit()
             self._order_tracker = None
+        if self._order_tracker_thread:
+            self._order_tracker_thread.quit()
+            self._order_tracker_thread.wait(2000)
+            self._order_tracker_thread = None
         if self._rest_future is not None:
             self._rest_future.cancel()
             self._rest_future = None
@@ -1287,6 +1314,8 @@ class MainWindow(QMainWindow):
         if self._rest:
             self._rest.api_key = key
             self._rest.api_secret = secret
+        if self._order_tracker:
+            self.order_tracker_update_credentials.emit(key, secret)
         self._append_log("[API] saved ok")
         self._configure_trading_state()
         if self._connected and self._rest:
@@ -1458,7 +1487,7 @@ class MainWindow(QMainWindow):
             else []
         )
         if self._order_tracker:
-            self._order_tracker.sync_active_orders(orders)
+            self.order_tracker_sync.emit(orders)
         self._update_open_orders_table(orders, now_ms, price_state)
 
     def _update_open_orders_table(
