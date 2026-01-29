@@ -19,7 +19,6 @@ class Settings:
     min_source_hold_ms: int
     ws_stable_required_ms: int
     ws_stale_grace_ms: int
-    good_quote_ttl_ms: int
     mid_fresh_ms: int
     max_wait_price_ms: int
     price_wait_log_every_ms: int
@@ -42,10 +41,7 @@ class Settings:
     margin_isolated: bool
     auto_exit_enabled: bool
     max_sell_retries: int
-    max_sl_ttl_retries: int
-    force_close_on_ttl: bool
     max_wait_sell_ms: int
-    max_exit_total_ms: int
     allow_force_close: bool
     cycle_count: int
     order_quote: float
@@ -71,7 +67,6 @@ class PriceState:
     data_blind: bool = False
     from_cache: bool = False
     cache_age_ms: Optional[int] = None
-    ttl_expired: bool = False
 
 
 @dataclass

@@ -18,33 +18,53 @@ class ConfigStore:
         self._settings_path = settings_path or (
             Path(__file__).resolve().parents[2] / "config" / "settings.json"
         )
+        self._local_settings_path = self._settings_path.with_name("settings.local.json")
 
     @property
     def settings_path(self) -> Path:
         return self._settings_path
 
     def normalize_settings(self, payload: dict) -> dict:
-        if not isinstance(payload, dict):
-            return {}
-        cleaned = dict(payload)
-        deprecated_keys = {
-            "entry_offset_ticks",
-            "exit_offset_ticks",
-            "offset_ticks",
-            "test_tick_offset",
-            "aggressive_offset_ticks",
-            "sl_offset_ticks",
-            "max_entry_total_ms",
-            "buy_ttl_ms",
-            "sell_ttl_ms",
-        }
-        for key in deprecated_keys:
-            cleaned.pop(key, None)
-        for key in list(cleaned.keys()):
-            key_lower = key.lower()
-            if "ttl" in key_lower or "offset" in key_lower:
-                cleaned.pop(key, None)
+        cleaned, removed_keys = self._sanitize_settings(payload)
+        self._log_removed_keys(removed_keys)
         return cleaned
+
+    def _sanitize_settings(self, payload: dict) -> tuple[dict, list[str]]:
+        if not isinstance(payload, dict):
+            return {}, []
+        removed_keys: list[str] = []
+
+        def scrub(obj: dict, prefix: str = "") -> dict:
+            cleaned: dict = {}
+            for key, value in obj.items():
+                key_str = str(key)
+                key_lower = key_str.lower()
+                path_key = f"{prefix}.{key_str}" if prefix else key_str
+                if self._is_deprecated_key(key_lower):
+                    removed_keys.append(path_key)
+                    continue
+                if isinstance(value, dict):
+                    cleaned[key] = scrub(value, path_key)
+                else:
+                    cleaned[key] = value
+            return cleaned
+
+        return scrub(payload), removed_keys
+
+    @staticmethod
+    def _is_deprecated_key(key_lower: str) -> bool:
+        if "ttl" in key_lower or "offset" in key_lower:
+            return True
+        if key_lower in {"max_exit_total_ms", "max_entry_total_ms"}:
+            return True
+        if key_lower.startswith("max_") and key_lower.endswith("_total_ms"):
+            return True
+        return False
+
+    @staticmethod
+    def _log_removed_keys(removed_keys: list[str]) -> None:
+        if removed_keys:
+            print(f"[CFG_MIGRATE] removed_keys={removed_keys}")
 
     def load_settings(self) -> dict:
         try:
@@ -77,7 +97,7 @@ class ConfigStore:
             handle.write("\n")
 
     def load_api_credentials(self) -> ApiCredentials:
-        payload = self.load_settings()
+        payload = self.load_local_settings()
         api_payload = payload.get("api", {}) if isinstance(payload, dict) else {}
         return ApiCredentials(
             key=str(api_payload.get("key", "") or ""),
@@ -85,7 +105,23 @@ class ConfigStore:
         )
 
     def save_api_credentials(self, key: str, secret: str) -> None:
-        payload = self.load_settings()
+        payload = self.load_local_settings()
         payload["api"] = {"key": key, "secret": secret}
-        payload.setdefault("api_storage", {"source": "settings.json"})
-        self.save_settings(payload)
+        payload.setdefault("api_storage", {"source": "settings.local.json"})
+        self.save_local_settings(payload)
+
+    def load_local_settings(self) -> dict:
+        try:
+            with self._local_settings_path.open("r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+                return self.normalize_settings(payload)
+        except FileNotFoundError:
+            return {}
+        except json.JSONDecodeError:
+            return {}
+
+    def save_local_settings(self, payload: dict) -> None:
+        payload = self.normalize_settings(payload)
+        with self._local_settings_path.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, ensure_ascii=False)
+            handle.write("\n")

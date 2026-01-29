@@ -27,8 +27,6 @@ class TradeState(Enum):
 class TradeExecutor:
     TAG = "PRE_V0_8_0"
     PRICE_MOVE_TICK_THRESHOLD = 1
-    SELL_TTL_MS = 8000
-    SL_OFFSET_TICKS = 0
 
     def __init__(
         self,
@@ -67,7 +65,6 @@ class TradeExecutor:
         self._entry_last_ws_bad_ts: Optional[float] = None
         self._sell_wait_started_ts: Optional[float] = None
         self._sell_retry_count = 0
-        self._sell_ttl_retry_count = 0
         self.sell_active_order_id: Optional[int] = None
         self.sell_cancel_pending = False
         self.sell_place_inflight = False
@@ -703,7 +700,6 @@ class TradeExecutor:
         bid: Optional[float],
         ask: Optional[float],
         tick_size: Optional[float],
-        sl_offset_ticks: int,
     ) -> tuple[Optional[float], Optional[float], Optional[float], str]:
         if tick_size is None or tick_size <= 0:
             return None, None, None, "tick_size_missing"
@@ -711,10 +707,7 @@ class TradeExecutor:
         ref_price = ask if ref_side == "ask" else bid
         if ref_price is None:
             return None, None, None, "ref_missing"
-        if intent == "SL":
-            raw_price = ref_price - (sl_offset_ticks * tick_size)
-        else:
-            raw_price = ref_price
+        raw_price = ref_price
         rounded = TradeExecutor._round_to_step(raw_price, tick_size)
         if rounded < tick_size:
             rounded = tick_size
@@ -748,7 +741,6 @@ class TradeExecutor:
         ref_bid: Optional[float] = None,
         ref_ask: Optional[float] = None,
         tick_size: Optional[float] = None,
-        sl_offset_ticks: Optional[int] = None,
     ) -> int:
         if self.sell_place_inflight:
             self.last_action = "sell_place_inflight"
@@ -784,11 +776,6 @@ class TradeExecutor:
             ask = ref_ask if ref_ask is not None else price_state.ask
             intent = self._normalize_exit_intent(exit_intent or self.exit_intent or reason)
             tick_size = tick_size or self._profile.tick_size
-            sl_ticks = (
-                max(0, int(sl_offset_ticks))
-                if sl_offset_ticks is not None
-                else self.SL_OFFSET_TICKS
-            )
             exit_order_type = self._normalize_order_type(
                 self._settings.exit_order_type
             )
@@ -878,7 +865,6 @@ class TradeExecutor:
                         bid=bid,
                         ask=ask,
                         tick_size=tick_size or self._profile.tick_size,
-                        sl_offset_ticks=sl_ticks,
                     )
                 else:
                     sell_price = price_override
@@ -935,7 +921,7 @@ class TradeExecutor:
                 "[SELL_PLACE] "
                 f"cycle_id={cycle_label} exit_intent={intent} exit_policy={exit_policy} "
                 f"sell_ref={sell_ref_label} bid={bid_label} ask={ask_label} "
-                f"mid={mid_label} sl_offset_ticks={sl_ticks} sell_price={price_label} "
+                f"mid={mid_label} sell_price={price_label} "
                 f"delta_ticks_to_ref={delta_label} qty={qty:.8f}"
             )
             if self.position is not None and self.position.get("partial"):
@@ -1044,7 +1030,7 @@ class TradeExecutor:
                 "[SELL_PLACE] "
                 f"cycle_id={cycle_label} exit_intent={intent} exit_policy={exit_policy} "
                 f"sell_ref={sell_ref_label} bid={bid_label} ask={ask_label} "
-                f"mid={mid_label} sl_offset_ticks=— sell_price=MARKET "
+                f"mid={mid_label} sell_price=MARKET "
                 "delta_ticks_to_ref=— "
                 f"qty={qty:.8f}"
             )
@@ -1108,7 +1094,6 @@ class TradeExecutor:
     def _reset_sell_retry(self) -> None:
         self._sell_wait_started_ts = None
         self._sell_retry_count = 0
-        self._sell_ttl_retry_count = 0
         self._clear_price_wait("EXIT")
         self._pending_sell_retry_reason = None
         self.sell_retry_pending = False
@@ -1549,11 +1534,8 @@ class TradeExecutor:
         ]
         self.orders_count = len(self.active_test_orders)
 
-    def _maybe_handle_sell_ttl(self, open_orders: dict[int, dict]) -> None:
+    def _maybe_handle_sell_reprice(self, open_orders: dict[int, dict]) -> None:
         if self.state != TradeState.STATE_WAIT_SELL:
-            return
-        ttl_ms = self.SELL_TTL_MS
-        if ttl_ms <= 0:
             return
         sell_order = self._find_order("SELL")
         if sell_order and self.sell_active_order_id is None:
@@ -1570,60 +1552,14 @@ class TradeExecutor:
         if self.sell_cancel_pending:
             self._maybe_confirm_sell_cancel(sell_order, open_orders)
             return
-        if self._sell_wait_started_ts is None:
-            self._start_sell_wait()
-            return
-        elapsed_ms = (time.monotonic() - self._sell_wait_started_ts) * 1000.0
-        if elapsed_ms < ttl_ms:
-            return
         order_id = sell_order.get("orderId")
         intent = self._normalize_exit_intent(self.exit_intent or sell_order.get("reason"))
-        self._sell_ttl_retry_count += 1
-        self._logger(
-            "[SELL_TTL_EXPIRED] "
-            f"id={order_id} exit_intent={intent} "
-            f"ttl_retry_count={self._sell_ttl_retry_count}"
-        )
-        max_sl_retries = int(getattr(self._settings, "max_sl_ttl_retries", 0) or 0)
-        max_exit_total_ms = int(getattr(self._settings, "max_exit_total_ms", 0) or 0)
-        exit_elapsed_ms = None
-        if self.exit_intent_set_ts is not None:
-            exit_elapsed_ms = int((time.monotonic() - self.exit_intent_set_ts) * 1000.0)
-        if (
-            max_exit_total_ms > 0
-            and exit_elapsed_ms is not None
-            and exit_elapsed_ms >= max_exit_total_ms
-        ):
-            timeout_label = "?" if exit_elapsed_ms is None else str(exit_elapsed_ms)
-            self._logger(
-                "[SELL_EMERGENCY_TRIGGER] "
-                f"reason=exit_timeout ttl_retry_count={self._sell_ttl_retry_count} "
-                f"exit_elapsed_ms={timeout_label}"
-            )
-            self._force_close_after_ttl(reason="EXIT_TIMEOUT")
-            return
-        if intent == "SL" and (
-            max_sl_retries > 0 and self._sell_ttl_retry_count >= max_sl_retries
-        ):
-            timeout_label = "?" if exit_elapsed_ms is None else str(exit_elapsed_ms)
-            self._logger(
-                "[SELL_EMERGENCY_TRIGGER] "
-                f"reason=sl_ttl_escalation ttl_retry_count={self._sell_ttl_retry_count} "
-                f"exit_elapsed_ms={timeout_label}"
-            )
-            self._force_close_after_ttl(reason="SL_TTL")
-            return
-        max_retries = int(self._settings.max_sell_retries)
-        if self._sell_retry_count >= max_retries:
-            self._force_close_after_ttl()
-            return
         price_state, _ = self._router.build_price_state()
         if price_state.data_blind:
             self._logger(
                 "[REPRICE_SKIP reason=data_blind] "
                 f"exit_intent={intent} ref_old=— ref_new=— tick_delta=—"
             )
-            self._sell_wait_started_ts = time.monotonic()
             return
         _, ref_label = self._resolve_exit_policy(intent)
         ref_now = price_state.bid if ref_label == "bid" else price_state.ask
@@ -1640,7 +1576,6 @@ class TradeExecutor:
                 f"exit_intent={intent} ref_old={ref_old_label} "
                 f"ref_new={ref_new_label} tick_delta=—"
             )
-            self._sell_wait_started_ts = time.monotonic()
             return
         tick_delta = abs((ref_now - ref_old) / self._profile.tick_size)
         if tick_delta < self.PRICE_MOVE_TICK_THRESHOLD:
@@ -1649,7 +1584,6 @@ class TradeExecutor:
                 f"exit_intent={intent} ref_old={ref_old:.8f} "
                 f"ref_new={ref_now:.8f} tick_delta={tick_delta:.2f}"
             )
-            self._sell_wait_started_ts = time.monotonic()
             return
         self._logger(
             "[REPRICE_DO reason=ref_moved] "
@@ -1848,7 +1782,6 @@ class TradeExecutor:
                 bid=bid,
                 ask=ask,
                 tick_size=self._profile.tick_size,
-                sl_offset_ticks=self.SL_OFFSET_TICKS,
             )
         price_label = "MARKET" if new_price is None else f"{new_price:.8f}"
         mid_label = "—" if mid is None else f"{mid:.8f}"
@@ -1860,7 +1793,7 @@ class TradeExecutor:
         )
         max_retries = int(self._settings.max_sell_retries)
         if self._sell_retry_count >= max_retries:
-            self._force_close_after_ttl()
+            self._logger("[SELL_RETRY_LIMIT] max retries reached")
             return True
         self._sell_retry_count += 1
         retry_index = self._sell_retry_count
@@ -1889,7 +1822,6 @@ class TradeExecutor:
             ref_bid=bid,
             ref_ask=ask,
             tick_size=self._profile.tick_size,
-            sl_offset_ticks=self.SL_OFFSET_TICKS,
         )
         if placed:
             return True
@@ -1899,41 +1831,6 @@ class TradeExecutor:
             self._transition_state(TradeState.STATE_WAIT_SELL)
             self._start_sell_wait()
         return False
-
-    def _force_close_after_ttl(self, reason: str = "TTL_EXCEEDED") -> None:
-        self._logger(f"[SELL_FORCE_CLOSE reason={reason}]")
-        emergency_reason = "timeout" if reason == "EXIT_TIMEOUT" else "ttl"
-        self._logger(f"[EXIT_EMERGENCY] reason={emergency_reason}")
-        self._sell_wait_started_ts = None
-        self._sell_retry_count = 0
-        self.sell_active_order_id = None
-        self.sell_cancel_pending = False
-        self.sell_retry_pending = False
-        self._pending_sell_retry_reason = None
-        is_isolated = "TRUE" if self._settings.margin_isolated else "FALSE"
-        for order in list(self.active_test_orders):
-            if order.get("side") != "SELL":
-                continue
-            self._cancel_margin_order(
-                symbol=self._settings.symbol,
-                order_id=order.get("orderId"),
-                is_isolated=is_isolated,
-                tag=order.get("tag", self.TAG),
-            )
-        self.active_test_orders = [
-            entry for entry in self.active_test_orders if entry.get("side") != "SELL"
-        ]
-        self.orders_count = len(self.active_test_orders)
-        qty = self._round_down(
-            self._resolve_remaining_qty_raw(), self._profile.step_size
-        )
-        if qty <= 0:
-            self.last_exit_reason = "TTL_EXCEEDED"
-            self._transition_state(TradeState.STATE_CLOSED)
-            self._transition_state(TradeState.STATE_IDLE)
-            self._handle_cycle_completion(reason="TTL_EXCEEDED")
-            return
-        self._place_emergency_market_sell(qty)
 
     def sync_open_orders(self, open_orders: list[dict]) -> None:
         if not self.active_test_orders:
@@ -1957,7 +1854,7 @@ class TradeExecutor:
         self._handle_entry_follow_top(open_map)
         if self._maybe_handle_sell_watchdog(open_map):
             return
-        self._maybe_handle_sell_ttl(open_map)
+        self._maybe_handle_sell_reprice(open_map)
         self._maybe_place_sell_retry()
 
     def handle_order_filled(
@@ -2334,7 +2231,6 @@ class TradeExecutor:
         self.exit_intent_set_ts = None
         self._last_sell_ref_price = None
         self._last_sell_ref_side = None
-        self._sell_ttl_retry_count = 0
 
     def _set_exit_intent(
         self, intent: str, mid: Optional[float], ticks: Optional[int] = None
@@ -2631,7 +2527,7 @@ class TradeExecutor:
     def _retry_sell_after_cancel(self, sell_order: dict) -> None:
         max_retries = int(self._settings.max_sell_retries)
         if self._sell_retry_count >= max_retries:
-            self._force_close_after_ttl()
+            self._logger("[SELL_RETRY_LIMIT] max retries reached after cancel")
             return
         reason = str(sell_order.get("reason") or "MANUAL").upper()
         self._schedule_sell_retry(reason)

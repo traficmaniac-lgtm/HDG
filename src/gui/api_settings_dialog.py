@@ -12,7 +12,9 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
-from src.core.config_store import ApiCredentials, ConfigStore
+import os
+
+from src.core.config_store import ConfigStore
 
 
 class ApiSettingsDialog(QDialog):
@@ -31,17 +33,22 @@ class ApiSettingsDialog(QDialog):
         self._toggle_secret_button.setCheckable(True)
         self._toggle_secret_button.toggled.connect(self._toggle_secret)
 
+        self._key_status = QLabel("Ключ загружен: NO")
+        self._secret_status = QLabel("Секрет загружен: NO")
+
         self._save_button = QPushButton("Сохранить")
         self._save_button.clicked.connect(self._on_save)
         self._cancel_button = QPushButton("Отмена")
         self._cancel_button.clicked.connect(self.reject)
 
         form = QFormLayout()
-        form.addRow(QLabel("API Key"), self._key_edit)
+        form.addRow(QLabel("API Key статус"), self._key_status)
+        form.addRow(QLabel("API Key (новый)"), self._key_edit)
         secret_row = QHBoxLayout()
         secret_row.addWidget(self._secret_edit, stretch=1)
         secret_row.addWidget(self._toggle_secret_button)
-        form.addRow(QLabel("API Secret"), secret_row)
+        form.addRow(QLabel("API Secret статус"), self._secret_status)
+        form.addRow(QLabel("API Secret (новый)"), secret_row)
 
         buttons = QHBoxLayout()
         buttons.addStretch(1)
@@ -56,8 +63,18 @@ class ApiSettingsDialog(QDialog):
 
     def _load_initial(self) -> None:
         creds = self._store.load_api_credentials()
-        self._key_edit.setText(creds.key)
-        self._secret_edit.setText(creds.secret)
+        env_key = self._sanitize(os.getenv("BINANCE_API_KEY", ""))
+        env_secret = self._sanitize(os.getenv("BINANCE_API_SECRET", ""))
+        local_key_loaded = self._is_valid(creds.key)
+        local_secret_loaded = self._is_valid(creds.secret)
+        env_key_loaded = self._is_valid(env_key)
+        env_secret_loaded = self._is_valid(env_secret)
+        key_loaded = local_key_loaded or env_key_loaded
+        secret_loaded = local_secret_loaded or env_secret_loaded
+        self._key_status.setText(f"Ключ загружен: {'YES' if key_loaded else 'NO'}")
+        self._secret_status.setText(f"Секрет загружен: {'YES' if secret_loaded else 'NO'}")
+        self._key_edit.clear()
+        self._secret_edit.clear()
 
     def _toggle_secret(self, checked: bool) -> None:
         if checked:
@@ -94,4 +111,3 @@ class ApiSettingsDialog(QDialog):
         if len(value) <= 20:
             return False
         return " " not in value
-
