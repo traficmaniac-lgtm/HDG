@@ -19,7 +19,8 @@ class Settings:
     min_source_hold_ms: int
     ws_stable_required_ms: int
     ws_stale_grace_ms: int
-    mid_fresh_ms: int
+    entry_max_age_ms: int
+    exit_max_age_ms: int
     max_wait_price_ms: int
     price_wait_log_every_ms: int
     position_guard_http: bool
