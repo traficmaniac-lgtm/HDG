@@ -135,20 +135,22 @@ class PriceRouter:
             if self._last_http_ts is not None
             else None
         )
-        ws_fresh = ws_age_ms is not None and ws_age_ms <= self._settings.ws_stale_ms
+        ws_fresh = ws_age_ms is not None and ws_age_ms <= self._settings.ws_fresh_ms
         http_fresh = http_age_ms is not None and http_age_ms <= self._settings.http_fresh_ms
 
-        ws_stable = False
-        if ws_fresh:
-            stable_ms = (
-                int((now - self._ws_stable_since) * 1000)
-                if self._ws_stable_since is not None
-                else 0
+        stable_ms = (
+            int((now - self._ws_stable_since) * 1000)
+            if self._ws_stable_since is not None
+            else 0
+        )
+        ws_stable_required_ms = int(
+            getattr(
+                self._settings,
+                "ws_stable_required_ms",
+                self._settings.ws_switch_hysteresis_ms,
             )
-            ws_stable_required_ms = int(
-                getattr(self._settings, "ws_stable_required_ms", self._settings.ws_switch_hysteresis_ms)
-            )
-            ws_stable = self._ws_fresh_streak >= 3 or (stable_ms >= ws_stable_required_ms)
+        )
+        ws_acceptable = ws_fresh and stable_ms >= ws_stable_required_ms
 
         hold_remaining_ms = 0
         min_hold_ms = int(getattr(self._settings, "min_source_hold_ms", 0) or 0)
@@ -158,34 +160,45 @@ class PriceRouter:
             )
 
         effective_source = self._stable_source
-        current_valid = self._is_source_valid(
-            effective_source, ws_age_ms=ws_age_ms, http_age_ms=http_age_ms
+        current_has_quote = False
+        if effective_source == "WS":
+            current_has_quote = self._ws_bid is not None and self._ws_ask is not None
+        elif effective_source == "HTTP":
+            current_has_quote = self._http_bid is not None and self._http_ask is not None
+        force_break_hold = (
+            (effective_source == "WS" and not ws_acceptable) or not current_has_quote
         )
-        if effective_source in {"WS", "HTTP"} and hold_remaining_ms > 0 and current_valid:
+        if (
+            effective_source in {"WS", "HTTP"}
+            and hold_remaining_ms > 0
+            and not force_break_hold
+        ):
             self._last_switch_reason = "hold"
         else:
             if effective_source == "WS":
-                if ws_fresh:
-                    self._last_switch_reason = "ws_fresh"
-                elif http_fresh:
-                    effective_source = "HTTP"
-                    self._last_switch_reason = "ws_stale"
+                if not ws_acceptable:
+                    http_has_quote = self._http_bid is not None and self._http_ask is not None
+                    if http_has_quote:
+                        effective_source = "HTTP"
+                        self._last_switch_reason = "stale"
+                    else:
+                        effective_source = "NONE"
+                        self._last_switch_reason = "no_fresh_data"
                 else:
-                    effective_source = "NONE"
-                    self._last_switch_reason = "no_fresh_data"
+                    self._last_switch_reason = "ws_fresh"
             elif effective_source == "HTTP":
-                if ws_stable:
+                if ws_acceptable:
                     effective_source = "WS"
-                    self._last_switch_reason = "ws_stable"
+                    self._last_switch_reason = "stable"
                 elif http_fresh:
                     self._last_switch_reason = "http_fresh"
                 else:
                     effective_source = "NONE"
                     self._last_switch_reason = "no_fresh_data"
             else:
-                if ws_stable:
+                if ws_acceptable:
                     effective_source = "WS"
-                    self._last_switch_reason = "ws_stable"
+                    self._last_switch_reason = "stable"
                 elif http_fresh:
                     effective_source = "HTTP"
                     self._last_switch_reason = "http_fresh"
@@ -194,6 +207,7 @@ class PriceRouter:
                     self._last_switch_reason = "no_fresh_data"
 
             if effective_source != self._stable_source and effective_source != "NONE":
+                from_source = self._stable_source
                 if min_hold_ms > 0:
                     self._source_hold_until_ts = now + (min_hold_ms / 1000.0)
                 else:
@@ -203,7 +217,19 @@ class PriceRouter:
                     if self._source_hold_until_ts is not None
                     else 0
                 )
-            elif not current_valid:
+                if from_source in {"WS", "HTTP"}:
+                    if from_source == "WS" and effective_source == "HTTP":
+                        reason = "stale"
+                    elif from_source == "HTTP" and effective_source == "WS":
+                        reason = "stable"
+                    else:
+                        reason = self._last_switch_reason
+                    self._log_queue.append(
+                        "[SOURCE_LATCH] "
+                        f"from={from_source} to={effective_source} reason={reason} "
+                        f"hold_ms={min_hold_ms}"
+                    )
+            elif not current_has_quote:
                 self._source_hold_until_ts = None
                 hold_remaining_ms = 0
         self._last_hold_remaining_ms = hold_remaining_ms

@@ -256,6 +256,7 @@ class TradeExecutor:
                 self._settings.side_effect_type
             )
 
+            self._logger(f"[PLACE_BUY] source={price_state.source}")
             self._transition_state(TradeState.STATE_PLACE_BUY)
             self.last_action = "placing_buy"
             self._start_entry_attempt()
@@ -419,15 +420,14 @@ class TradeExecutor:
             return
         price_state, health_state = self._router.build_price_state()
         mid = price_state.mid
-        ws_age_ms = health_state.ws_age_ms
-        http_age_ms = health_state.http_age_ms
         mid_fresh_ms = int(self._settings.mid_fresh_ms)
-        ws_fresh = ws_age_ms is not None and ws_age_ms <= mid_fresh_ms
-        http_fresh = http_age_ms is not None and http_age_ms <= mid_fresh_ms
-        if not (ws_fresh or http_fresh):
+        mid_age_ms = price_state.mid_age_ms
+        if price_state.data_blind or mid_age_ms is None or mid_age_ms > mid_fresh_ms:
             if not self._exits_frozen:
-                ws_age_label = ws_age_ms if ws_age_ms is not None else "?"
-                http_age_label = http_age_ms if http_age_ms is not None else "?"
+                ws_age_label = health_state.ws_age_ms if health_state.ws_age_ms is not None else "?"
+                http_age_label = (
+                    health_state.http_age_ms if health_state.http_age_ms is not None else "?"
+                )
                 window_s = max(self._settings.price_wait_log_every_ms, 1) / 1000.0
                 if not self._should_dedup_log("exits_frozen:blackout", window_s):
                     self._logger(
@@ -438,8 +438,8 @@ class TradeExecutor:
             return
         if self._exits_frozen:
             self._exits_frozen = False
-        exit_source = "WS" if ws_fresh else "HTTP"
-        exit_age_ms = ws_age_ms if ws_fresh else http_age_ms
+        exit_source = price_state.source
+        exit_age_ms = mid_age_ms
         if not self._profile.tick_size:
             return
         buy_price = self.get_buy_price()
@@ -848,6 +848,7 @@ class TradeExecutor:
             )
             order_type = exit_order_type
 
+            self._logger(f"[PLACE_SELL] source={price_state.source}")
             self._transition_state(TradeState.STATE_PLACE_SELL)
             self.last_action = "placing_sell_tp" if reason_upper == "TP" else "placing_sell"
             price_label = "MARKET" if sell_price is None else f"{sell_price:.8f}"
@@ -949,6 +950,7 @@ class TradeExecutor:
             if self.position.get("partial"):
                 self._logger(f"[SELL_FOR_PARTIAL] qty={qty:.8f}")
             price_state, _ = self._router.build_price_state()
+            self._logger(f"[PLACE_SELL] source={price_state.source}")
             intent = self._normalize_exit_intent(self.exit_intent or "MANUAL")
             exit_policy, sell_ref_label = self._resolve_exit_policy(intent)
             bid_label = "—" if price_state.bid is None else f"{price_state.bid:.8f}"
@@ -1085,26 +1087,22 @@ class TradeExecutor:
         ws_bad = self._entry_ws_bad(health_state.ws_connected)
         if ws_bad:
             self._log_entry_degraded(health_state.ws_connected)
-            ok, bid, ask, mid, age_ms, status = self._router.get_http_snapshot(
-                int(self._settings.http_fresh_ms)
-            )
-            return ok, bid, ask, mid, age_ms, "HTTP", status, ws_bad
-
-        ok, mid, age_ms, source, status = self._router.get_mid_snapshot(
-            int(self._settings.mid_fresh_ms)
-        )
-        if ok:
-            bid = price_state.bid
-            ask = price_state.ask
-            mid_val = mid if mid is not None else price_state.mid
-            if bid is None or ask is None or mid_val is None:
-                return False, bid, ask, mid_val, age_ms, source, "no_quote", ws_bad
-            return True, bid, ask, mid_val, age_ms, source, status, ws_bad
-
-        ok, bid, ask, mid, age_ms, status = self._router.get_http_snapshot(
-            int(self._settings.http_fresh_ms)
-        )
-        return ok, bid, ask, mid, age_ms, "HTTP", status, ws_bad
+        bid = price_state.bid
+        ask = price_state.ask
+        mid_val = price_state.mid
+        age_ms = price_state.mid_age_ms
+        source = price_state.source
+        if price_state.data_blind:
+            return False, bid, ask, mid_val, age_ms, source, "data_blind", ws_bad
+        if mid_val is None:
+            return False, bid, ask, mid_val, age_ms, source, "no_mid", ws_bad
+        if age_ms is None:
+            return False, bid, ask, mid_val, age_ms, source, "no_age", ws_bad
+        if age_ms > int(self._settings.mid_fresh_ms):
+            return False, bid, ask, mid_val, age_ms, source, "stale", ws_bad
+        if bid is None or ask is None:
+            return False, bid, ask, mid_val, age_ms, source, "no_quote", ws_bad
+        return True, bid, ask, mid_val, age_ms, source, "fresh", ws_bad
 
     def _calculate_entry_price(self, bid: float) -> Optional[float]:
         if not self._profile.tick_size:
