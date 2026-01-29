@@ -27,6 +27,8 @@ class TradeState(Enum):
 class TradeExecutor:
     TAG = "PRE_V0_8_0"
     PRICE_MOVE_TICK_THRESHOLD = 1
+    SELL_TTL_MS = 8000
+    SL_OFFSET_TICKS = 0
 
     def __init__(
         self,
@@ -251,6 +253,14 @@ class TradeExecutor:
             mid = price_state.mid
             bid = price_state.bid
             ask = price_state.ask
+            active_src = price_state.source
+            ws_bad = active_src == "WS" and self._entry_ws_bad(health_state.ws_connected)
+            entry_context = self._entry_log_context(
+                active_src,
+                ws_bad,
+                health_state.ws_age_ms,
+                health_state.http_age_ms,
+            )
             if price_state.data_blind:
                 self._logger("[TRADE] blocked: data_blind")
                 self.last_action = "DATA_BLIND"
@@ -390,7 +400,7 @@ class TradeExecutor:
             self.last_action = "placing_buy"
             self._start_entry_attempt()
             self._entry_reprice_last_ts = time.monotonic()
-            self._log_entry_place(buy_price, bid, ask)
+            self._log_entry_place(buy_price, bid, ask, entry_context)
             buy_order = self._place_margin_order(
                 symbol=self._settings.symbol,
                 side="BUY",
@@ -777,7 +787,7 @@ class TradeExecutor:
             sl_ticks = (
                 max(0, int(sl_offset_ticks))
                 if sl_offset_ticks is not None
-                else max(0, int(getattr(self._settings, "sl_offset_ticks", 0)))
+                else self.SL_OFFSET_TICKS
             )
             exit_order_type = self._normalize_order_type(
                 self._settings.exit_order_type
@@ -1136,7 +1146,25 @@ class TradeExecutor:
         ws_no_first_tick, ws_stale_ticks = self._router.get_ws_issue_counts()
         return (not ws_connected) or ws_no_first_tick >= 2 or ws_stale_ticks >= 2
 
-    def _log_entry_degraded(self, ws_connected: bool) -> None:
+    @staticmethod
+    def _entry_log_context(
+        active_src: str,
+        ws_bad: bool,
+        ws_age_ms: Optional[int],
+        http_age_ms: Optional[int],
+    ) -> str:
+        ws_age_label = ws_age_ms if ws_age_ms is not None else "?"
+        http_age_label = http_age_ms if http_age_ms is not None else "?"
+        return (
+            f"active_src={active_src} ws_bad={ws_bad} "
+            f"http_age_ms={http_age_label} ws_age_ms={ws_age_label}"
+        )
+
+    def _log_entry_degraded(
+        self,
+        ws_connected: bool,
+        entry_context: str,
+    ) -> None:
         window_s = max(self._settings.price_wait_log_every_ms, 1) / 1000.0
         if self._should_dedup_log("entry_degraded:http", window_s):
             return
@@ -1144,7 +1172,8 @@ class TradeExecutor:
         self._logger(
             "[ENTRY_DEGRADED_TO_HTTP] "
             f"reason=ws_bad ws_connected={ws_connected} "
-            f"no_first_tick={ws_no_first_tick} stale_ticks={ws_stale_ticks}"
+            f"no_first_tick={ws_no_first_tick} stale_ticks={ws_stale_ticks} "
+            f"{entry_context}"
         )
 
     def _resolve_entry_snapshot(
@@ -1158,27 +1187,104 @@ class TradeExecutor:
         str,
         str,
         bool,
+        Optional[int],
+        Optional[int],
     ]:
         price_state, health_state = self._router.build_price_state()
-        ws_bad = self._entry_ws_bad(health_state.ws_connected)
-        if ws_bad:
-            self._log_entry_degraded(health_state.ws_connected)
+        active_src = price_state.source
+        ws_bad = False
+        if active_src == "WS":
+            ws_bad = self._entry_ws_bad(health_state.ws_connected)
+            if ws_bad:
+                entry_context = self._entry_log_context(
+                    active_src,
+                    ws_bad,
+                    health_state.ws_age_ms,
+                    health_state.http_age_ms,
+                )
+                self._log_entry_degraded(health_state.ws_connected, entry_context)
         bid = price_state.bid
         ask = price_state.ask
         mid_val = price_state.mid
         age_ms = price_state.mid_age_ms
         source = price_state.source
         if price_state.data_blind:
-            return False, bid, ask, mid_val, age_ms, source, "data_blind", ws_bad
+            return (
+                False,
+                bid,
+                ask,
+                mid_val,
+                age_ms,
+                source,
+                "data_blind",
+                ws_bad,
+                health_state.ws_age_ms,
+                health_state.http_age_ms,
+            )
         if mid_val is None:
-            return False, bid, ask, mid_val, age_ms, source, "no_mid", ws_bad
+            return (
+                False,
+                bid,
+                ask,
+                mid_val,
+                age_ms,
+                source,
+                "no_mid",
+                ws_bad,
+                health_state.ws_age_ms,
+                health_state.http_age_ms,
+            )
         if age_ms is None:
-            return False, bid, ask, mid_val, age_ms, source, "no_age", ws_bad
+            return (
+                False,
+                bid,
+                ask,
+                mid_val,
+                age_ms,
+                source,
+                "no_age",
+                ws_bad,
+                health_state.ws_age_ms,
+                health_state.http_age_ms,
+            )
         if age_ms > int(self._settings.mid_fresh_ms):
-            return False, bid, ask, mid_val, age_ms, source, "stale", ws_bad
+            return (
+                False,
+                bid,
+                ask,
+                mid_val,
+                age_ms,
+                source,
+                "stale",
+                ws_bad,
+                health_state.ws_age_ms,
+                health_state.http_age_ms,
+            )
         if bid is None or ask is None:
-            return False, bid, ask, mid_val, age_ms, source, "no_quote", ws_bad
-        return True, bid, ask, mid_val, age_ms, source, "fresh", ws_bad
+            return (
+                False,
+                bid,
+                ask,
+                mid_val,
+                age_ms,
+                source,
+                "no_quote",
+                ws_bad,
+                health_state.ws_age_ms,
+                health_state.http_age_ms,
+            )
+        return (
+            True,
+            bid,
+            ask,
+            mid_val,
+            age_ms,
+            source,
+            "fresh",
+            ws_bad,
+            health_state.ws_age_ms,
+            health_state.http_age_ms,
+        )
 
     def _calculate_entry_price(self, bid: float) -> Optional[float]:
         if not self._profile.tick_size:
@@ -1187,14 +1293,18 @@ class TradeExecutor:
         return self._round_to_step(bid, tick_size)
 
     def _log_entry_place(
-        self, price: float, bid: Optional[float], ask: Optional[float]
+        self,
+        price: float,
+        bid: Optional[float],
+        ask: Optional[float],
+        entry_context: str,
     ) -> None:
         bid_label = "?" if bid is None else f"{bid:.8f}"
         ask_label = "?" if ask is None else f"{ask:.8f}"
         cycle_label = self._cycle_id_label()
         self._logger(
             f"[ENTRY_PLACE] cycle_id={cycle_label} price={price:.8f} "
-            f"bid={bid_label} ask={ask_label}"
+            f"bid={bid_label} ask={ask_label} {entry_context}"
         )
 
     def _handle_entry_follow_top(self, open_orders: dict[int, dict]) -> None:
@@ -1205,40 +1315,61 @@ class TradeExecutor:
             return
         if self._buy_wait_started_ts is None:
             self._start_buy_wait()
-        ok, bid, ask, mid, age_ms, source, status, ws_bad = self._resolve_entry_snapshot()
+        (
+            ok,
+            bid,
+            ask,
+            mid,
+            age_ms,
+            source,
+            status,
+            ws_bad,
+            ws_age_ms,
+            http_age_ms,
+        ) = self._resolve_entry_snapshot()
+        entry_context = self._entry_log_context(
+            source,
+            ws_bad,
+            ws_age_ms,
+            http_age_ms,
+        )
         now = time.monotonic()
-        if ws_bad:
+        if ws_bad and source == "WS":
             self._entry_last_ws_bad_ts = now
         if not ok or bid is None or mid is None:
             self._entry_consecutive_fresh_reads = 0
-            if ws_bad:
+            if ws_bad and source == "WS":
                 if not self._should_dedup_log("entry_hold_wsbad", 2.0):
                     ws_no_first_tick, ws_stale_ticks = self._router.get_ws_issue_counts()
                     self._logger(
                         "[ENTRY_HOLD_WSBAD] "
-                        f"no_first_tick={ws_no_first_tick} stale_ticks={ws_stale_ticks}"
+                        f"no_first_tick={ws_no_first_tick} stale_ticks={ws_stale_ticks} "
+                        f"{entry_context}"
                     )
                 if not self._should_dedup_log("entry_skip_wsbad", 2.0):
                     age_label = age_ms if age_ms is not None else "?"
                     self._logger(
-                        f"[ENTRY_REPRICE_SKIP] reason=ws_bad age_ms={age_label}"
+                        f"[ENTRY_REPRICE_SKIP] reason=ws_bad age_ms={age_label} "
+                        f"{entry_context}"
                     )
             else:
                 if not self._should_dedup_log("entry_hold_stale", 2.0):
                     age_label = age_ms if age_ms is not None else "?"
                     self._logger(
-                        f"[ENTRY_HOLD_STALE] age_ms={age_label} source={source}"
+                        f"[ENTRY_HOLD_STALE] age_ms={age_label} source={source} "
+                        f"{entry_context}"
                     )
                 if not self._should_dedup_log("entry_skip_stale", 2.0):
                     age_label = age_ms if age_ms is not None else "?"
                     self._logger(
-                        f"[ENTRY_REPRICE_SKIP] reason=stale age_ms={age_label}"
+                        f"[ENTRY_REPRICE_SKIP] reason=stale age_ms={age_label} "
+                        f"{entry_context}"
                     )
             return
         self._clear_price_wait("ENTRY")
         elapsed_ms = self._entry_attempt_elapsed_ms()
         if elapsed_ms is not None and not self._should_dedup_log("entry_wait", 2.0):
-            self._logger(f"[ENTRY_WAIT] ms={elapsed_ms}")
+            self._logger(f"[ENTRY_WAIT] ms={elapsed_ms} {entry_context}")
         if not self._profile.tick_size or not self._profile.step_size:
             return
         current_price = float(buy_order.get("price") or 0.0)
@@ -1277,23 +1408,30 @@ class TradeExecutor:
         stable_ok = True
         if require_stable and self._entry_last_ws_bad_ts is not None:
             stable_ok = (now - self._entry_last_ws_bad_ts) * 1000.0 >= stable_grace_ms
-        if ws_bad:
+        if ws_bad and source == "WS":
             self._entry_consecutive_fresh_reads = 0
             if not self._should_dedup_log("entry_skip_wsbad_live", 2.0):
                 age_label = age_ms if age_ms is not None else "?"
-                self._logger(f"[ENTRY_REPRICE_SKIP] reason=ws_bad age_ms={age_label}")
+                self._logger(
+                    f"[ENTRY_REPRICE_SKIP] reason=ws_bad age_ms={age_label} "
+                    f"{entry_context}"
+                )
             return
         self._entry_consecutive_fresh_reads += 1
         if not stable_ok:
             if not self._should_dedup_log("entry_skip_not_stable", 2.0):
                 age_label = age_ms if age_ms is not None else "?"
-                self._logger(f"[ENTRY_REPRICE_SKIP] reason=not_stable age_ms={age_label}")
+                self._logger(
+                    f"[ENTRY_REPRICE_SKIP] reason=not_stable age_ms={age_label} "
+                    f"{entry_context}"
+                )
             return
         if self._entry_consecutive_fresh_reads < min_fresh_reads:
             if not self._should_dedup_log("entry_skip_fresh_reads", 2.0):
                 age_label = age_ms if age_ms is not None else "?"
                 self._logger(
-                    f"[ENTRY_REPRICE_SKIP] reason=stale age_ms={age_label}"
+                    f"[ENTRY_REPRICE_SKIP] reason=stale age_ms={age_label} "
+                    f"{entry_context}"
                 )
             self._entry_last_seen_bid = bid
             return
@@ -1306,7 +1444,8 @@ class TradeExecutor:
             if not self._should_dedup_log("entry_skip_no_move", 2.0):
                 age_label = age_ms if age_ms is not None else "?"
                 self._logger(
-                    f"[ENTRY_REPRICE_SKIP] reason=no_move age_ms={age_label}"
+                    f"[ENTRY_REPRICE_SKIP] reason=no_move age_ms={age_label} "
+                    f"{entry_context}"
                 )
             self._entry_last_seen_bid = bid
             return
@@ -1314,7 +1453,8 @@ class TradeExecutor:
             if not self._should_dedup_log("entry_skip_min_interval", 2.0):
                 age_label = age_ms if age_ms is not None else "?"
                 self._logger(
-                    f"[ENTRY_REPRICE_SKIP] reason=min_interval age_ms={age_label}"
+                    f"[ENTRY_REPRICE_SKIP] reason=min_interval age_ms={age_label} "
+                    f"{entry_context}"
                 )
             self._entry_last_seen_bid = bid
             return
@@ -1322,7 +1462,8 @@ class TradeExecutor:
             if not self._should_dedup_log("entry_skip_cooldown", 2.0):
                 age_label = age_ms if age_ms is not None else "?"
                 self._logger(
-                    f"[ENTRY_REPRICE_SKIP] reason=cooldown age_ms={age_label}"
+                    f"[ENTRY_REPRICE_SKIP] reason=cooldown age_ms={age_label} "
+                    f"{entry_context}"
                 )
             self._entry_last_seen_bid = bid
             return
@@ -1359,7 +1500,7 @@ class TradeExecutor:
         self._logger(
             "[ENTRY_REPRICE] "
             f"reason={reprice_reason} bid_old={bid_old_label} bid_new={bid:.8f} "
-            f"spread_ticks={spread_label} new_price={new_price:.8f}"
+            f"spread_ticks={spread_label} new_price={new_price:.8f} {entry_context}"
         )
         is_isolated = "TRUE" if self._settings.margin_isolated else "FALSE"
         timestamp = int(time.time() * 1000)
@@ -1367,7 +1508,7 @@ class TradeExecutor:
         side_effect_type = self._normalize_side_effect_type(
             self._settings.side_effect_type
         )
-        self._log_entry_place(new_price, bid, ask)
+        self._log_entry_place(new_price, bid, ask, entry_context)
         buy_order = self._place_margin_order(
             symbol=self._settings.symbol,
             side="BUY",
@@ -1411,7 +1552,7 @@ class TradeExecutor:
     def _maybe_handle_sell_ttl(self, open_orders: dict[int, dict]) -> None:
         if self.state != TradeState.STATE_WAIT_SELL:
             return
-        ttl_ms = int(self._settings.sell_ttl_ms)
+        ttl_ms = self.SELL_TTL_MS
         if ttl_ms <= 0:
             return
         sell_order = self._find_order("SELL")
@@ -1707,7 +1848,7 @@ class TradeExecutor:
                 bid=bid,
                 ask=ask,
                 tick_size=self._profile.tick_size,
-                sl_offset_ticks=max(0, int(getattr(self._settings, "sl_offset_ticks", 0))),
+                sl_offset_ticks=self.SL_OFFSET_TICKS,
             )
         price_label = "MARKET" if new_price is None else f"{new_price:.8f}"
         mid_label = "—" if mid is None else f"{mid:.8f}"
@@ -1748,7 +1889,7 @@ class TradeExecutor:
             ref_bid=bid,
             ref_ask=ask,
             tick_size=self._profile.tick_size,
-            sl_offset_ticks=max(0, int(getattr(self._settings, "sl_offset_ticks", 0))),
+            sl_offset_ticks=self.SL_OFFSET_TICKS,
         )
         if placed:
             return True

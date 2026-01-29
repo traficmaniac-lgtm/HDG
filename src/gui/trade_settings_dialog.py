@@ -145,15 +145,12 @@ class TradeSettingsDialog(QDialog):
         layout.addLayout(buttons_layout)
 
     def _on_save(self) -> None:
-        payload = self._store.load_settings()
+        payload = self._store.normalize_settings(self._store.load_settings())
         payload.pop("nominal_usd", None)
         payload.pop("budget_mode_enabled", None)
         payload.pop("budget_quote", None)
         payload.pop("usage_pct", None)
         payload.pop("min_quote_reserve", None)
-        payload.pop("entry_offset_ticks", None)
-        payload.pop("exit_offset_ticks", None)
-        payload.pop("max_entry_total_ms", None)
         payload["order_quote"] = float(self.order_quote_input.value())
         payload["max_budget"] = float(self.max_budget_input.value())
         payload["budget_reserve"] = float(self.budget_reserve_input.value())
@@ -164,6 +161,7 @@ class TradeSettingsDialog(QDialog):
         payload["http_fresh_ms"] = int(self.http_fresh_input.value())
         payload["allow_borrow"] = bool(self.allow_borrow_input.isChecked())
         payload["auto_exit_enabled"] = bool(self.auto_exit_input.isChecked())
+        payload = self._store.normalize_settings(payload)
         self._store.save_settings(payload)
         self.saved.emit(
             float(self.order_quote_input.value()),

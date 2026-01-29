@@ -25,10 +25,8 @@ class Settings:
     price_wait_log_every_ms: int
     position_guard_http: bool
     entry_mode: str
-    aggressive_offset_ticks: int
     account_mode: str
     leverage_hint: int
-    offset_ticks: int
     entry_reprice_min_ticks: int
     entry_reprice_cooldown_ms: int
     entry_reprice_require_stable_source: bool
@@ -38,14 +36,11 @@ class Settings:
     stop_loss_ticks: int
     order_type: str
     exit_order_type: str
-    sl_offset_ticks: int
-    buy_ttl_ms: int
     max_buy_retries: int
     allow_borrow: bool
     side_effect_type: str
     margin_isolated: bool
     auto_exit_enabled: bool
-    sell_ttl_ms: int
     max_sell_retries: int
     max_sl_ttl_retries: int
     force_close_on_ttl: bool

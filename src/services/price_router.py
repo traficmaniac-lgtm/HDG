@@ -232,6 +232,10 @@ class PriceRouter:
             elif not current_has_quote:
                 self._source_hold_until_ts = None
                 hold_remaining_ms = 0
+        http_has_quote = self._http_bid is not None and self._http_ask is not None
+        if http_fresh and http_has_quote and effective_source == "NONE":
+            effective_source = "HTTP"
+            self._last_switch_reason = "http_fresh"
         self._last_hold_remaining_ms = hold_remaining_ms
 
         bid = None
@@ -294,11 +298,12 @@ class PriceRouter:
         if from_cache and self._last_good_ts is not None:
             age_ref = self._last_good_ts
         mid_age_ms = int((now - age_ref) * 1000) if age_ref is not None else None
+        chosen_source = quote_source if quote_source != "NONE" else self._stable_source
         return (
             self._stable_bid,
             self._stable_ask,
             self._stable_mid,
-            self._stable_source,
+            chosen_source,
             ws_age_ms,
             http_age_ms,
             mid_age_ms,
