@@ -137,7 +137,8 @@ def test_stuck_triggers_reconcile() -> None:
 
 
 def test_reconcile_routes_to_exit_when_remaining_gt_zero() -> None:
-    trades = [{"price": "1.0", "qty": "1.0", "isBuyer": True}]
+    now_ms = int(time.time() * 1000)
+    trades = [{"price": "1.0", "qty": "1.0", "isBuyer": True, "time": now_ms}]
     router = DummyRouter(bid=1.0, ask=1.1)
     rest = DummyRest(open_orders=[], trades=trades)
     profile = SymbolProfile(tick_size=0.01, step_size=0.01, min_qty=0.01, min_notional=0.0)
@@ -148,6 +149,8 @@ def test_reconcile_routes_to_exit_when_remaining_gt_zero() -> None:
         profile=profile,
         logger=lambda _msg: None,
     )
+    executor._current_cycle_id = 1
+    executor._cycle_start_ts_ms = now_ms - 500
     snapshot = executor.collect_reconcile_snapshot()
     executor.apply_reconcile_snapshot(snapshot)
 
@@ -170,3 +173,62 @@ def test_reconcile_returns_to_idle_when_flat() -> None:
 
     assert executor.state == TradeState.STATE_IDLE
     assert executor.position is None
+
+
+def test_reconcile_filters_trades_by_cycle_start() -> None:
+    now_ms = int(time.time() * 1000)
+    trades = [
+        {"price": "1.0", "qty": "1.0", "isBuyer": True, "time": now_ms - 10000},
+        {"price": "1.1", "qty": "2.0", "isBuyer": True, "time": now_ms - 200},
+    ]
+    router = DummyRouter(bid=1.0, ask=1.1)
+    rest = DummyRest(open_orders=[], trades=trades)
+    profile = SymbolProfile(tick_size=0.01, step_size=0.01, min_qty=0.01, min_notional=0.0)
+    executor = TradeExecutor(
+        rest=rest,
+        router=router,
+        settings=make_settings(),
+        profile=profile,
+        logger=lambda _msg: None,
+    )
+    executor._current_cycle_id = 1
+    executor._cycle_start_ts_ms = now_ms - 1000
+    snapshot = executor.collect_reconcile_snapshot()
+    executor.apply_reconcile_snapshot(snapshot)
+
+    assert executor._executed_qty_total == 2.0
+
+
+def test_watchdog_skips_entry_when_best_bid() -> None:
+    router = DummyRouter(bid=1.0, ask=1.1)
+    rest = DummyRest()
+    profile = SymbolProfile(tick_size=0.01, step_size=0.01, min_qty=0.01, min_notional=0.0)
+    executor = TradeExecutor(
+        rest=rest,
+        router=router,
+        settings=make_settings(),
+        profile=profile,
+        logger=lambda _msg: None,
+    )
+    executor.state = TradeState.STATE_ENTRY_WORKING
+    executor._state_entered_ts = time.monotonic() - 1.0
+    executor._last_progress_ts = time.monotonic() - 1.0
+    executor.active_test_orders = [
+        {
+            "orderId": 101,
+            "side": "BUY",
+            "price": 1.0,
+            "qty": 1.0,
+            "cum_qty": 0.0,
+            "avg_fill_price": 0.0,
+            "status": "NEW",
+            "cycle_id": 1,
+        }
+    ]
+    executor.entry_active_order_id = 101
+    executor.entry_active_price = 1.0
+
+    need_reconcile = executor.watchdog_tick()
+
+    assert need_reconcile is False
+    assert executor.state == TradeState.STATE_ENTRY_WORKING

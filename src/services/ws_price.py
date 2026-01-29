@@ -25,7 +25,8 @@ class WsPriceWorker(QObject):
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._ws: Optional[websockets.WebSocketClientProtocol] = None
         self._connected = False
-        self._reconnect_dedup_s = reconnect_dedup_ms / 1000.0
+        dedup_s = reconnect_dedup_ms / 1000.0
+        self._reconnect_dedup_s = max(2.0, min(dedup_s, 5.0))
         self._reconnect_cooldown_s = 2.0
         self._last_reconnect_ts = 0.0
         self._reconnect_log_ts: dict[str, float] = {}
