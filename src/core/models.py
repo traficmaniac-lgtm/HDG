@@ -16,6 +16,9 @@ class Settings:
     ws_reconnect_dedup_ms: int
     order_poll_ms: int
     ws_switch_hysteresis_ms: int
+    min_source_hold_ms: int
+    ws_stable_required_ms: int
+    ws_stale_grace_ms: int
     good_quote_ttl_ms: int
     mid_fresh_ms: int
     max_wait_price_ms: int
@@ -38,6 +41,7 @@ class Settings:
     order_type: str
     exit_order_type: str
     exit_offset_ticks: int
+    sl_offset_ticks: int
     buy_ttl_ms: int
     max_buy_retries: int
     allow_borrow: bool
@@ -46,8 +50,10 @@ class Settings:
     auto_exit_enabled: bool
     sell_ttl_ms: int
     max_sell_retries: int
+    max_sl_ttl_retries: int
     force_close_on_ttl: bool
     max_wait_sell_ms: int
+    max_exit_total_ms: int
     allow_force_close: bool
     cycle_count: int
     order_quote: float

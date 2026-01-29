@@ -22,6 +22,8 @@ class PriceRouter:
         self._stable_source = "NONE"
         self._last_source = "NONE"
         self._last_switch_reason = ""
+        self._source_hold_until_ts: Optional[float] = None
+        self._last_hold_remaining_ms: Optional[int] = None
         self._ws_fresh_streak = 0
         self._ws_stable_since: Optional[float] = None
         self._ws_connected = False
@@ -76,6 +78,28 @@ class PriceRouter:
     def get_ws_issue_counts(self) -> tuple[int, int]:
         return self._ws_no_first_tick_count, self._ws_stale_ticks_count
 
+    def _is_source_valid(
+        self,
+        source: str,
+        ws_age_ms: Optional[int],
+        http_age_ms: Optional[int],
+    ) -> bool:
+        if source == "WS":
+            if self._ws_bid is None or self._ws_ask is None:
+                return False
+            if ws_age_ms is None:
+                return False
+            grace_ms = int(getattr(self._settings, "ws_stale_grace_ms", 0) or 0)
+            return ws_age_ms <= self._settings.ws_stale_ms + grace_ms
+        if source == "HTTP":
+            if self._http_bid is None or self._http_ask is None:
+                return False
+            if http_age_ms is None:
+                return False
+            grace_ms = int(getattr(self._settings, "ws_stale_grace_ms", 0) or 0)
+            return http_age_ms <= self._settings.http_fresh_ms + grace_ms
+        return False
+
     def consume_logs(self) -> list[str]:
         if not self._log_queue:
             return []
@@ -121,27 +145,68 @@ class PriceRouter:
                 if self._ws_stable_since is not None
                 else 0
             )
-            ws_stable = self._ws_fresh_streak >= 3 or (
-                stable_ms >= self._settings.ws_switch_hysteresis_ms
+            ws_stable_required_ms = int(
+                getattr(self._settings, "ws_stable_required_ms", self._settings.ws_switch_hysteresis_ms)
+            )
+            ws_stable = self._ws_fresh_streak >= 3 or (stable_ms >= ws_stable_required_ms)
+
+        hold_remaining_ms = 0
+        min_hold_ms = int(getattr(self._settings, "min_source_hold_ms", 0) or 0)
+        if self._source_hold_until_ts is not None:
+            hold_remaining_ms = max(
+                0, int((self._source_hold_until_ts - now) * 1000)
             )
 
         effective_source = self._stable_source
-        if effective_source == "WS":
-            if not ws_fresh:
-                if http_fresh:
+        current_valid = self._is_source_valid(
+            effective_source, ws_age_ms=ws_age_ms, http_age_ms=http_age_ms
+        )
+        if effective_source in {"WS", "HTTP"} and hold_remaining_ms > 0 and current_valid:
+            self._last_switch_reason = "hold"
+        else:
+            if effective_source == "WS":
+                if ws_fresh:
+                    self._last_switch_reason = "ws_fresh"
+                elif http_fresh:
                     effective_source = "HTTP"
+                    self._last_switch_reason = "ws_stale"
                 else:
                     effective_source = "NONE"
-        elif effective_source == "HTTP":
-            if ws_stable:
-                effective_source = "WS"
-            elif not http_fresh:
-                effective_source = "NONE"
-        else:
-            if ws_stable:
-                effective_source = "WS"
-            elif http_fresh:
-                effective_source = "HTTP"
+                    self._last_switch_reason = "no_fresh_data"
+            elif effective_source == "HTTP":
+                if ws_stable:
+                    effective_source = "WS"
+                    self._last_switch_reason = "ws_stable"
+                elif http_fresh:
+                    self._last_switch_reason = "http_fresh"
+                else:
+                    effective_source = "NONE"
+                    self._last_switch_reason = "no_fresh_data"
+            else:
+                if ws_stable:
+                    effective_source = "WS"
+                    self._last_switch_reason = "ws_stable"
+                elif http_fresh:
+                    effective_source = "HTTP"
+                    self._last_switch_reason = "http_fresh"
+                else:
+                    effective_source = "NONE"
+                    self._last_switch_reason = "no_fresh_data"
+
+            if effective_source != self._stable_source and effective_source != "NONE":
+                if min_hold_ms > 0:
+                    self._source_hold_until_ts = now + (min_hold_ms / 1000.0)
+                else:
+                    self._source_hold_until_ts = None
+                hold_remaining_ms = (
+                    max(0, int((self._source_hold_until_ts - now) * 1000))
+                    if self._source_hold_until_ts is not None
+                    else 0
+                )
+            elif not current_valid:
+                self._source_hold_until_ts = None
+                hold_remaining_ms = 0
+        self._last_hold_remaining_ms = hold_remaining_ms
 
         bid = None
         ask = None
@@ -233,12 +298,6 @@ class PriceRouter:
         ) = self.get_best_quote()
 
         if source != self._last_source:
-            if source == "WS":
-                self._last_switch_reason = "ws_stable"
-            elif source == "HTTP":
-                self._last_switch_reason = "ws_stale"
-            else:
-                self._last_switch_reason = "no_fresh_data"
             self._last_source = source
 
         if source != self._last_effective_source:
@@ -246,8 +305,15 @@ class PriceRouter:
             if now - self._last_source_log_ts >= 5.0:
                 self._last_source_log_ts = now
                 ws_age_label = ws_age_ms if ws_age_ms is not None else "?"
+                hold_label = (
+                    str(self._last_hold_remaining_ms)
+                    if self._last_hold_remaining_ms is not None
+                    else "?"
+                )
                 self._log_queue.append(
-                    f"[DATA] source={self._last_effective_source} -> {source} "
+                    "[DATA] "
+                    f"chosen_source={source} last_source={self._last_effective_source} "
+                    f"hold_remaining_ms={hold_label} "
                     f"reason={self._last_switch_reason} ws_age={ws_age_label}"
                 )
             self._last_effective_source = source
