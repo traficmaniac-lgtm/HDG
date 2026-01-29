@@ -130,6 +130,10 @@ class TradeExecutor:
         self._reconcile_inflight = False
         self._reconcile_attempts = 0
         self._safe_stop_issued = False
+        self._last_entry_state_payload: Optional[tuple[object, ...]] = None
+        self._last_entry_degraded_ts = 0.0
+        self._last_entry_degraded_counts: Optional[tuple[int, int]] = None
+        self._last_buy_partial_cum: dict[int, float] = {}
 
     def get_state_label(self) -> str:
         return self.state.value
@@ -2030,15 +2034,66 @@ class TradeExecutor:
             f"http_age_ms={http_age_label} ws_age_ms={ws_age_label}"
         )
 
+    @staticmethod
+    def _normalize_entry_float(value: Optional[float]) -> Optional[float]:
+        if value is None:
+            return None
+        return round(float(value), 8)
+
+    def _maybe_log_entry_state(
+        self,
+        order_id: Optional[int],
+        order_price: Optional[float],
+        best_bid: Optional[float],
+        last_ref_bid: Optional[float],
+        moved_ticks: int,
+        can_reprice: bool,
+        reason: str,
+        entry_context: str,
+        source: str,
+        ws_bad: bool,
+    ) -> None:
+        payload = (
+            self.state.value,
+            order_id,
+            self._normalize_entry_float(order_price),
+            self._normalize_entry_float(best_bid),
+            moved_ticks,
+            can_reprice,
+            reason,
+            source,
+            ws_bad,
+        )
+        if payload == self._last_entry_state_payload:
+            return
+        self._last_entry_state_payload = payload
+        cycle_label = self._cycle_id_label()
+        order_price_label = "?" if not order_price or order_price <= 0 else f"{order_price:.8f}"
+        bid_label = "?" if best_bid is None else f"{best_bid:.8f}"
+        ref_label = "?" if last_ref_bid is None else f"{last_ref_bid:.8f}"
+        can_reprice_label = "True" if can_reprice else "False"
+        self._logger(
+            "[ENTRY_STATE] "
+            f"cycle_id={cycle_label} order_id={order_id} order_price={order_price_label} "
+            f"best_bid={bid_label} last_ref_bid={ref_label} "
+            f"moved_ticks={moved_ticks} can_reprice={can_reprice_label} "
+            f"reason={reason} {entry_context}"
+        )
+
     def _log_entry_degraded(
         self,
         ws_connected: bool,
         entry_context: str,
     ) -> None:
-        window_s = max(self._settings.price_wait_log_every_ms, 1) / 1000.0
-        if self._should_dedup_log("entry_degraded:http", window_s):
-            return
         ws_no_first_tick, ws_stale_ticks = self._router.get_ws_issue_counts()
+        counts = (ws_no_first_tick, ws_stale_ticks)
+        if counts == self._last_entry_degraded_counts:
+            return
+        now = time.monotonic()
+        if now - self._last_entry_degraded_ts < 2.0:
+            return
+        self._last_entry_degraded_counts = counts
+        self._last_entry_degraded_ts = now
         self._logger(
             "[ENTRY_DEGRADED_TO_HTTP] "
             f"reason=ws_bad ws_connected={ws_connected} "
@@ -2243,22 +2298,20 @@ class TradeExecutor:
                         f"[ENTRY_REPRICE_SKIP] reason=stale age_ms={age_label} "
                         f"{entry_context}"
                     )
-            if not self._should_dedup_log("entry_state", 0.4):
-                cycle_label = self._cycle_id_label()
-                order_id = buy_order.get("orderId")
-                order_price = float(buy_order.get("price") or 0.0)
-                order_price_label = "?" if order_price <= 0 else f"{order_price:.8f}"
-                bid_label = "?" if bid is None else f"{bid:.8f}"
-                ref_label = (
-                    "?" if self._entry_last_ref_bid is None else f"{self._entry_last_ref_bid:.8f}"
-                )
-                self._logger(
-                    "[ENTRY_STATE] "
-                    f"cycle_id={cycle_label} order_id={order_id} order_price={order_price_label} "
-                    f"best_bid={bid_label} last_ref_bid={ref_label} "
-                    "moved_ticks=0 can_reprice=False "
-                    f"reason={status} {entry_context}"
-                )
+            order_id = buy_order.get("orderId")
+            order_price = float(buy_order.get("price") or 0.0)
+            self._maybe_log_entry_state(
+                order_id=order_id,
+                order_price=order_price,
+                best_bid=bid,
+                last_ref_bid=self._entry_last_ref_bid,
+                moved_ticks=0,
+                can_reprice=False,
+                reason=status,
+                entry_context=entry_context,
+                source=source,
+                ws_bad=ws_bad,
+            )
             return
         self._clear_price_wait("ENTRY")
         elapsed_ms = self._entry_attempt_elapsed_ms()
@@ -2338,21 +2391,21 @@ class TradeExecutor:
                 can_reprice = False
         order_id = buy_order.get("orderId")
         order_price_label = f"{current_price:.8f}"
-        bid_label = "?" if bid is None else f"{bid:.8f}"
-        ref_label = "?" if last_ref_bid is None else f"{last_ref_bid:.8f}"
         reason_label = reprice_reason
-        can_reprice_label = "True" if can_reprice else "False"
-        cycle_label = self._cycle_id_label()
-        if not self._should_dedup_log("entry_state", 0.4):
-            self._logger(
-                "[ENTRY_STATE] "
-                f"cycle_id={cycle_label} order_id={order_id} order_price={order_price_label} "
-                f"best_bid={bid_label} last_ref_bid={ref_label} "
-                f"moved_ticks={moved_ticks} can_reprice={can_reprice_label} "
-                f"reason={reason_label} {entry_context}"
-            )
+        self._maybe_log_entry_state(
+            order_id=order_id,
+            order_price=current_price,
+            best_bid=bid,
+            last_ref_bid=last_ref_bid,
+            moved_ticks=moved_ticks,
+            can_reprice=can_reprice,
+            reason=reason_label,
+            entry_context=entry_context,
+            source=source,
+            ws_bad=ws_bad,
+        )
         if not can_reprice:
-            if not self._should_dedup_log("entry_reprice_skip", 0.4):
+            if not self._should_dedup_log("entry_reprice_skip", 2.0):
                 new_price_label = "?" if new_price is None else f"{new_price:.8f}"
                 self._logger(
                     "[ENTRY_REPRICE] action=SKIP "
@@ -2579,23 +2632,23 @@ class TradeExecutor:
             self._sell_inflight_deadline_ts = None
             self._refresh_after_watchdog()
 
-    def watchdog_tick(self) -> None:
+    def watchdog_tick(self) -> bool:
         if self._reconcile_inflight or self._safe_stop_issued:
-            return
+            return False
         if self.state in {
             TradeState.STATE_IDLE,
             TradeState.STATE_FLAT,
             TradeState.STATE_ERROR,
             TradeState.STATE_SAFE_STOP,
         }:
-            return
+            return False
         now = time.monotonic()
         state_age_ms = self._state_age_ms(now)
         no_progress_ms = self._no_progress_ms(now)
         max_state_ms = int(getattr(self._settings, "max_state_stuck_ms", 8000))
         max_progress_ms = int(getattr(self._settings, "max_no_progress_ms", 5000))
         if state_age_ms < max_state_ms and no_progress_ms < max_progress_ms:
-            return
+            return False
         self._logger(
             "[WD] "
             f"stuck state={self.state.value} age_ms={state_age_ms} "
@@ -2603,16 +2656,12 @@ class TradeExecutor:
         )
         max_retries = int(getattr(self._settings, "max_reconcile_retries", 3))
         if self._reconcile_attempts >= max_retries:
-            self._enter_safe_stop(reason="RECONCILE_RETRY_LIMIT")
-            return
+            self._enter_safe_stop(reason="RECONCILE_RETRY_LIMIT", allow_rest=False)
+            return False
         self._reconcile_attempts += 1
         self._reconcile_inflight = True
-        try:
-            self._transition_state(TradeState.STATE_RECONCILE)
-            self._reconcile_with_exchange()
-        finally:
-            self._reconcile_inflight = False
-            self._mark_progress(reason="reconcile_complete", reset_reconcile=False)
+        self._transition_state(TradeState.STATE_RECONCILE)
+        return True
 
     def _refresh_after_watchdog(self) -> None:
         try:
@@ -2630,24 +2679,28 @@ class TradeExecutor:
         self.sync_open_orders(open_orders)
         self._reconcile_position_from_fills()
 
-    def _enter_safe_stop(self, reason: str) -> None:
+    def _enter_safe_stop(self, reason: str, allow_rest: bool = True) -> None:
         if self._safe_stop_issued:
             return
         self._safe_stop_issued = True
         self.run_active = False
         self._next_cycle_ready_ts = None
-        self._logger(f"[SAFE_STOP] reason={reason}")
+        if allow_rest:
+            self._logger(f"[SAFE_STOP] reason={reason}")
+        else:
+            self._logger(f"[SAFE_STOP] reason={reason} mode=local_only")
         self._transition_state(TradeState.STATE_SAFE_STOP)
-        self._cancel_all_symbol_orders()
-        remaining_qty_raw = self._resolve_remaining_qty_raw()
-        qty = remaining_qty_raw
-        if self._profile.step_size:
-            qty = self._round_down(remaining_qty_raw, self._profile.step_size)
-        if qty > 0:
-            self._logger(
-                f"[SAFE_STOP] action=market_close qty={qty:.8f} remaining={remaining_qty_raw:.8f}"
-            )
-            self._place_emergency_market_sell(qty, force=True)
+        if allow_rest:
+            self._cancel_all_symbol_orders()
+            remaining_qty_raw = self._resolve_remaining_qty_raw()
+            qty = remaining_qty_raw
+            if self._profile.step_size:
+                qty = self._round_down(remaining_qty_raw, self._profile.step_size)
+            if qty > 0:
+                self._logger(
+                    f"[SAFE_STOP] action=market_close qty={qty:.8f} remaining={remaining_qty_raw:.8f}"
+                )
+                self._place_emergency_market_sell(qty, force=True)
         self._handle_cycle_completion(reason=f"SAFE_STOP:{reason}", critical=True)
 
     def _cancel_all_symbol_orders(self) -> None:
@@ -2682,6 +2735,28 @@ class TradeExecutor:
             self._logger(f"[RECONCILE] trades error: {exc}")
         return []
 
+    def collect_reconcile_snapshot(self) -> Optional[dict]:
+        try:
+            open_orders = self._rest.get_margin_open_orders(self._settings.symbol)
+        except httpx.HTTPStatusError as exc:
+            self._log_binance_error("reconcile_openOrders", exc, {"symbol": self._settings.symbol})
+            return None
+        except Exception as exc:
+            self._logger(f"[RECONCILE] open_orders error: {exc}")
+            return None
+        trades = self._fetch_recent_trades()
+        balance = self._get_base_balance_snapshot()
+        return {
+            "open_orders": open_orders,
+            "trades": trades,
+            "balance": balance,
+        }
+
+    def mark_reconcile_failed(self, reason: str) -> None:
+        self._reconcile_inflight = False
+        self._mark_progress(reason="reconcile_failed", reset_reconcile=False)
+        self._logger(f"[RECONCILE] failed reason={reason}")
+
     def _apply_reconcile_snapshot(
         self,
         executed: float,
@@ -2713,19 +2788,11 @@ class TradeExecutor:
                     self.position["initial_qty"] = executed
         self._log_position_state(executed, closed, remaining, entry_avg)
 
-    def _reconcile_with_exchange(self) -> None:
-        try:
-            open_orders = self._rest.get_margin_open_orders(self._settings.symbol)
-        except httpx.HTTPStatusError as exc:
-            self._log_binance_error("reconcile_openOrders", exc, {"symbol": self._settings.symbol})
-            return
-        except Exception as exc:
-            self._logger(f"[RECONCILE] open_orders error: {exc}")
-            return
-        self.sync_open_orders(open_orders)
-        trades = self._fetch_recent_trades()
-        balance = self._get_base_balance_snapshot()
-
+    def _build_reconcile_state(
+        self,
+        trades: list[dict],
+        balance: Optional[dict],
+    ) -> tuple[float, float, float, Optional[float]]:
         executed = 0.0
         closed = 0.0
         entry_notional = 0.0
@@ -2758,12 +2825,10 @@ class TradeExecutor:
                         entry_notional += avg_price * cum_qty
                 elif side == "SELL":
                     closed += cum_qty
-
         if executed > 0 and entry_notional > 0:
             entry_avg = entry_notional / executed
         elif executed > 0:
             entry_avg = self._entry_avg_price or self.get_buy_price()
-
         remaining = max(executed - closed, 0.0)
         if executed <= 0 and self.position is not None:
             executed = float(self.position.get("initial_qty") or self.position.get("qty") or 0.0)
@@ -2775,52 +2840,62 @@ class TradeExecutor:
             entry_avg = entry_avg or self._entry_avg_price or self.get_buy_price()
         if balance and balance["total"] > remaining + self._epsilon_qty():
             remaining = balance["total"]
+        return executed, closed, remaining, entry_avg
 
-        have_open_entry = any(str(order.get("side") or "").upper() == "BUY" for order in open_orders)
-        have_open_exit = any(str(order.get("side") or "").upper() == "SELL" for order in open_orders)
-
-        self._apply_reconcile_snapshot(executed, closed, remaining, entry_avg)
-
-        if remaining > self._epsilon_qty():
-            if have_open_entry and executed > self._epsilon_qty():
-                is_isolated = "TRUE" if self._settings.margin_isolated else "FALSE"
-                for order in open_orders:
-                    if str(order.get("side") or "").upper() != "BUY":
-                        continue
-                    self._cancel_margin_order(
-                        symbol=self._settings.symbol,
-                        order_id=order.get("orderId"),
-                        is_isolated=is_isolated,
-                        tag=self.TAG,
-                    )
-                self.entry_cancel_pending = True
-                have_open_entry = False
-            if not have_open_exit:
-                if self.exit_intent is None:
-                    ticks = int(self._settings.take_profit_ticks)
-                    self._set_exit_intent("TP", mid=None, ticks=ticks)
-                self._transition_state(self._exit_state_for_intent(self.exit_intent))
-                price_state, health_state = self._router.build_price_state()
-                self._ensure_exit_orders(
-                    price_state,
-                    health_state,
-                    allow_replace=True,
-                    skip_reconcile=True,
-                )
+    def apply_reconcile_snapshot(self, snapshot: Optional[dict]) -> None:
+        try:
+            if snapshot is None:
+                self.mark_reconcile_failed("snapshot_missing")
                 return
-            self._transition_state(self._exit_state_for_intent(self.exit_intent))
-            return
+            open_orders = snapshot.get("open_orders") or []
+            trades = snapshot.get("trades") or []
+            balance = snapshot.get("balance")
+            self.sync_open_orders(open_orders)
+            executed, closed, remaining, entry_avg = self._build_reconcile_state(
+                trades=trades,
+                balance=balance,
+            )
+            have_open_entry = any(
+                str(order.get("side") or "").upper() == "BUY" for order in open_orders
+            )
+            have_open_exit = any(
+                str(order.get("side") or "").upper() == "SELL" for order in open_orders
+            )
+            self._apply_reconcile_snapshot(executed, closed, remaining, entry_avg)
+            if remaining > self._epsilon_qty():
+                needs_cancel_entry = have_open_entry and executed > self._epsilon_qty()
+                needs_exit_place = not have_open_exit
+                if needs_cancel_entry or needs_exit_place:
+                    self._logger(
+                        "[RECONCILE] "
+                        f"actions_required cancel_entry={needs_cancel_entry} "
+                        f"place_exit={needs_exit_place} -> SAFE_STOP"
+                    )
+                    self._enter_safe_stop(reason="RECONCILE_ACTIONS_REQUIRED", allow_rest=False)
+                    return
+                self._transition_state(self._exit_state_for_intent(self.exit_intent))
+                return
+            if have_open_entry or have_open_exit:
+                self._logger(
+                    "[RECONCILE] open_orders_present -> SAFE_STOP"
+                )
+                self._enter_safe_stop(reason="RECONCILE_OPEN_ORDERS", allow_rest=False)
+                return
+            cycle_id = self._current_cycle_id
+            self.position = None
+            self._reset_position_tracking()
+            self._transition_state(TradeState.STATE_FLAT)
+            self._transition_state(TradeState.STATE_IDLE)
+            if self.run_active or cycle_id is not None:
+                self._handle_cycle_completion(reason="RECONCILE_FLAT")
+            self._cleanup_cycle_state(cycle_id)
+        finally:
+            self._reconcile_inflight = False
+            self._mark_progress(reason="reconcile_complete", reset_reconcile=False)
 
-        if have_open_entry or have_open_exit:
-            self._cancel_all_symbol_orders()
-        cycle_id = self._current_cycle_id
-        self.position = None
-        self._reset_position_tracking()
-        self._transition_state(TradeState.STATE_FLAT)
-        self._transition_state(TradeState.STATE_IDLE)
-        if self.run_active or cycle_id is not None:
-            self._handle_cycle_completion(reason="RECONCILE_FLAT")
-        self._cleanup_cycle_state(cycle_id)
+    def _reconcile_with_exchange(self) -> None:
+        snapshot = self.collect_reconcile_snapshot()
+        self.apply_reconcile_snapshot(snapshot)
 
     def _finalize_sell_timeout(self) -> None:
         self._sell_wait_started_ts = None
@@ -3086,12 +3161,17 @@ class TradeExecutor:
             avg_value = avg_price
             if avg_value <= 0 and self.position is not None:
                 avg_value = float(self.position.get("buy_price") or 0.0)
-            cycle_label = "—" if cycle_id is None else str(cycle_id)
-            self._logger(
-                "[BUY_PARTIAL] "
-                f"cycle_id={cycle_label} delta={delta:.8f} "
-                f"pos_qty={pos_qty:.8f} avg={avg_value:.8f}"
-            )
+            last_logged = self._last_buy_partial_cum.get(order_id)
+            if last_logged is None or not math.isclose(
+                last_logged, cum_qty, rel_tol=0.0, abs_tol=1e-12
+            ):
+                self._last_buy_partial_cum[order_id] = cum_qty
+                cycle_label = "—" if cycle_id is None else str(cycle_id)
+                self._logger(
+                    "[BUY_PARTIAL] "
+                    f"cycle_id={cycle_label} delta={delta:.8f} "
+                    f"pos_qty={pos_qty:.8f} avg={avg_value:.8f}"
+                )
             return
         if side_upper == "SELL":
             prev_cum = float(order.get("cum_qty") or 0.0)
