@@ -23,7 +23,6 @@ class TradeState(Enum):
     STATE_EXIT_SL_WORKING = "EXIT_SL_WORKING"
     STATE_RECOVERY = "RECOVERY"
     STATE_FLAT = "FLAT"
-    STATE_NEXT_CYCLE = "NEXT_CYCLE"
     STATE_ERROR = "ERROR"
 
 
@@ -938,7 +937,7 @@ class TradeExecutor:
             return 0
         if time.monotonic() < self._next_cycle_ready_ts:
             return 0
-        if self.state not in {TradeState.STATE_IDLE, TradeState.STATE_NEXT_CYCLE}:
+        if self.state != TradeState.STATE_IDLE:
             return 0
         self._next_cycle_ready_ts = None
         placed = self._attempt_cycle_start()
@@ -947,7 +946,7 @@ class TradeExecutor:
         return placed
 
     def _attempt_cycle_start(self) -> int:
-        if self.state not in {TradeState.STATE_IDLE, TradeState.STATE_NEXT_CYCLE}:
+        if self.state != TradeState.STATE_IDLE:
             return 0
         if not self._purge_open_orders_before_cycle():
             self._logger("[PRECHECK] open_orders_not_cleared -> SAFE_STOP")
@@ -994,6 +993,26 @@ class TradeExecutor:
             self._logger(
                 f"[CYCLE_STOP] done={self.cycles_done} target={self.cycles_target}"
             )
+
+    def _auto_next_cycle(self) -> None:
+        self._transition_state(TradeState.STATE_IDLE)
+        if not self.run_active:
+            self._next_cycle_ready_ts = None
+            self._logger("[CYCLE] done -> auto_next state=IDLE reason=stop_requested")
+            return
+        if self.cycles_done >= self.cycles_target:
+            self.run_active = False
+            self._next_cycle_ready_ts = None
+            self._logger("[CYCLE] done -> auto_next state=IDLE reason=target_reached")
+            return
+        price_state, _ = self._router.build_price_state()
+        if price_state.data_blind:
+            self._next_cycle_ready_ts = time.monotonic() + self._cycle_cooldown_s
+            self._logger("[CYCLE] done -> auto_next state=IDLE reason=data_blind")
+            return
+        if self._next_cycle_ready_ts is None:
+            self._next_cycle_ready_ts = time.monotonic() + self._cycle_cooldown_s
+        self._logger("[CYCLE] done -> auto_next state=IDLE")
 
     def close_position(self) -> int:
         if self._inflight_trade_action:
@@ -3402,11 +3421,8 @@ class TradeExecutor:
         )
         self._handle_cycle_completion(reason=reason)
         self._transition_state(TradeState.STATE_FLAT)
-        if self.run_active and self.cycles_done < self.cycles_target:
-            self._transition_state(TradeState.STATE_NEXT_CYCLE)
-        else:
-            self._transition_state(TradeState.STATE_IDLE)
         self._cleanup_cycle_state(cycle_id)
+        self._auto_next_cycle()
 
     def _finalize_partial_close(self, reason: str) -> None:
         self.last_exit_reason = reason
