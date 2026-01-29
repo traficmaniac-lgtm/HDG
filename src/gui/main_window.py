@@ -233,22 +233,20 @@ class MainWindow(QMainWindow):
         )
 
         entry_group = QGroupBox("Entry")
-        entry_group.setFixedHeight(110)
+        entry_group.setFixedHeight(88)
         entry_layout = QGridLayout(entry_group)
         entry_layout.setContentsMargins(10, 10, 10, 10)
         entry_layout.setHorizontalSpacing(8)
         entry_layout.setVerticalSpacing(6)
         self.entry_price_label = self._make_value_label("—", min_chars=12, fixed_width=180)
-        self.entry_offset_label = self._make_value_label("—", min_chars=6, fixed_width=180)
         self.entry_age_label = self._make_value_label("—", min_chars=8, fixed_width=180)
         self.entry_reprice_reason_label = self._make_value_label(
             "—", min_chars=12, fixed_width=180
         )
         self._add_card_row(entry_layout, 0, "entry_price", self.entry_price_label)
-        self._add_card_row(entry_layout, 1, "entry_offset_ticks", self.entry_offset_label)
-        self._add_card_row(entry_layout, 2, "entry_age_ms", self.entry_age_label)
+        self._add_card_row(entry_layout, 1, "entry_age_ms", self.entry_age_label)
         self._add_card_row(
-            entry_layout, 3, "last_entry_reprice_reason", self.entry_reprice_reason_label
+            entry_layout, 2, "last_entry_reprice_reason", self.entry_reprice_reason_label
         )
 
         exit_group = QGroupBox("Exit")
@@ -269,17 +267,15 @@ class MainWindow(QMainWindow):
         self._add_card_row(exit_layout, 4, "exit_age_ms", self.exit_age_label)
 
         timers_group = QGroupBox("Timers")
-        timers_group.setFixedHeight(88)
+        timers_group.setFixedHeight(66)
         timers_layout = QGridLayout(timers_group)
         timers_layout.setContentsMargins(10, 10, 10, 10)
         timers_layout.setHorizontalSpacing(8)
         timers_layout.setVerticalSpacing(6)
-        self.max_entry_total_label = self._make_value_label("—", min_chars=8, fixed_width=180)
         self.max_exit_total_label = self._make_value_label("—", min_chars=8, fixed_width=180)
         self.cycles_target_label = self._make_value_label("—", min_chars=6, fixed_width=180)
-        self._add_card_row(timers_layout, 0, "max_entry_total_ms", self.max_entry_total_label)
-        self._add_card_row(timers_layout, 1, "max_exit_total_ms", self.max_exit_total_label)
-        self._add_card_row(timers_layout, 2, "cycles_target", self.cycles_target_label)
+        self._add_card_row(timers_layout, 0, "max_exit_total_ms", self.max_exit_total_label)
+        self._add_card_row(timers_layout, 1, "cycles_target", self.cycles_target_label)
 
         hud_layout.addWidget(market_hud)
         hud_layout.addWidget(health_group)
@@ -782,11 +778,7 @@ class MainWindow(QMainWindow):
         if entry_price is None and self._trade_executor:
             entry_price = self._trade_executor.get_buy_price()
         entry_age_ms = self._entry_age_ms(entry_order)
-        entry_offset = (
-            self._settings.entry_offset_ticks if self._settings else None
-        )
         self.entry_price_label.setText(self._fmt_price(entry_price, width=12))
-        self.entry_offset_label.setText(self._fmt_int(entry_offset, width=6))
         self.entry_age_label.setText(self._fmt_int(entry_age_ms, width=8))
         self.entry_reprice_reason_label.setText("—")
 
@@ -800,11 +792,6 @@ class MainWindow(QMainWindow):
         self.exit_policy_label.setText(exit_policy or "—")
         self.exit_age_label.setText(self._fmt_int(self._exit_age_ms(), width=8))
 
-        self.max_entry_total_label.setText(
-            self._fmt_int(
-                getattr(self._settings, "max_entry_total_ms", None), width=8
-            )
-        )
         self.max_exit_total_label.setText(
             self._fmt_int(getattr(self._settings, "max_exit_total_ms", None), width=8)
         )
@@ -1006,15 +993,11 @@ class MainWindow(QMainWindow):
             aggressive_offset_ticks=self._bounded_int(
                 payload.get("aggressive_offset_ticks", 0), 0, 2, 0
             ),
-            max_entry_total_ms=self._bounded_int(
-                payload.get("max_entry_total_ms", 30000), 1000, 120000, 30000
-            ),
             account_mode=str(payload.get("account_mode", "CROSS_MARGIN")),
             leverage_hint=int(
                 payload.get("leverage_hint", payload.get("max_leverage_hint", 3))
             ),
             offset_ticks=int(payload.get("offset_ticks", payload.get("test_tick_offset", 1))),
-            entry_offset_ticks=int(payload.get("entry_offset_ticks", payload.get("offset_ticks", 1))),
             entry_reprice_min_ticks=self._bounded_int(
                 payload.get(
                     "reprice_min_tick_moves",
@@ -1046,7 +1029,6 @@ class MainWindow(QMainWindow):
             stop_loss_ticks=int(payload.get("stop_loss_ticks", 2)),
             order_type=str(payload.get("order_type", "LIMIT")).upper(),
             exit_order_type=str(payload.get("exit_order_type", "LIMIT")).upper(),
-            exit_offset_ticks=int(payload.get("exit_offset_ticks", 1)),
             sl_offset_ticks=int(payload.get("sl_offset_ticks", 0)),
             buy_ttl_ms=self._bounded_int(payload.get("buy_ttl_ms", 2500), 500, 20000, 2500),
             max_buy_retries=self._bounded_int(
@@ -1171,11 +1153,8 @@ class MainWindow(QMainWindow):
         cycle_count: int,
         take_profit_ticks: int,
         stop_loss_ticks: int,
-        entry_offset_ticks: int,
-        exit_offset_ticks: int,
         mid_fresh_ms: int,
         http_fresh_ms: int,
-        max_entry_total_ms: int,
         allow_borrow: bool,
         auto_exit_enabled: bool,
     ) -> None:
@@ -1186,19 +1165,11 @@ class MainWindow(QMainWindow):
             self._settings.cycle_count = cycle_count
             self._settings.take_profit_ticks = take_profit_ticks
             self._settings.stop_loss_ticks = stop_loss_ticks
-            self._settings.entry_offset_ticks = self._bounded_int(
-                entry_offset_ticks, 0, 1000, 1
-            )
-            self._settings.offset_ticks = self._settings.entry_offset_ticks
-            self._settings.exit_offset_ticks = exit_offset_ticks
             self._settings.mid_fresh_ms = self._bounded_int(
                 mid_fresh_ms, 200, 5000, 800
             )
             self._settings.http_fresh_ms = self._bounded_int(
                 http_fresh_ms, 200, 10000, 1500
-            )
-            self._settings.max_entry_total_ms = self._bounded_int(
-                max_entry_total_ms, 1000, 120000, 30000
             )
             self._settings.allow_borrow = allow_borrow
             self._settings.auto_exit_enabled = auto_exit_enabled
@@ -1590,7 +1561,6 @@ class MainWindow(QMainWindow):
         self.data_blind_label.setText("—")
         self.switch_reason_label.setText("—")
         self.entry_price_label.setText("—")
-        self.entry_offset_label.setText("—")
         self.entry_age_label.setText("—")
         self.entry_reprice_reason_label.setText("—")
         self.tp_price_label.setText("—")
@@ -1598,7 +1568,6 @@ class MainWindow(QMainWindow):
         self.exit_intent_label.setText("—")
         self.exit_policy_label.setText("—")
         self.exit_age_label.setText("—")
-        self.max_entry_total_label.setText("—")
         self.max_exit_total_label.setText("—")
         self.cycles_target_label.setText("—")
         self.summary_label.setText(

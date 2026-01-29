@@ -26,11 +26,9 @@ class Settings:
     position_guard_http: bool
     entry_mode: str
     aggressive_offset_ticks: int
-    max_entry_total_ms: int
     account_mode: str
     leverage_hint: int
     offset_ticks: int
-    entry_offset_ticks: int
     entry_reprice_min_ticks: int
     entry_reprice_cooldown_ms: int
     entry_reprice_require_stable_source: bool
@@ -40,7 +38,6 @@ class Settings:
     stop_loss_ticks: int
     order_type: str
     exit_order_type: str
-    exit_offset_ticks: int
     sl_offset_ticks: int
     buy_ttl_ms: int
     max_buy_retries: int
