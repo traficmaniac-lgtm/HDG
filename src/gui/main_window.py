@@ -15,7 +15,6 @@ from PySide6.QtWidgets import (
     QDialog,
     QFileDialog,
     QFrame,
-    QFormLayout,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
@@ -31,6 +30,7 @@ from PySide6.QtWidgets import (
     QWidget,
     QTableView,
     QMessageBox,
+    QSizePolicy,
 )
 
 from src.core.config_store import ApiCredentials, ConfigStore
@@ -44,6 +44,27 @@ from src.services.order_tracker import OrderTracker
 from src.services.price_router import PriceRouter
 from src.services.trade_executor import TradeExecutor
 from src.services.ws_price import WsPriceWorker
+
+
+class ElidedLabel(QLabel):
+    def __init__(self, text: str = "", parent: Optional[QWidget] = None) -> None:
+        super().__init__(text, parent)
+        self._full_text = text
+
+    def setText(self, text: str) -> None:  # noqa: N802 - Qt override
+        self._full_text = text
+        self._update_elide()
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt override
+        super().resizeEvent(event)
+        self._update_elide()
+
+    def _update_elide(self) -> None:
+        metrics = QFontMetrics(self.font())
+        elided = metrics.elidedText(
+            self._full_text, Qt.TextElideMode.ElideRight, self.width()
+        )
+        super().setText(elided)
 
 
 class MainWindow(QMainWindow):
@@ -76,7 +97,9 @@ class MainWindow(QMainWindow):
         self._last_ttl_expired_log_ts = 0.0
         self._open_order_rows: dict[str, int] = {}
         self._fills_history: list[dict] = []
-        self._fill_seen_keys: set[tuple[object, str, int]] = set()
+        self._fill_rows_by_event_key: dict[str, int] = {}
+        self._cycle_id_counter = 0
+        self._last_buy_fill_price: Optional[float] = None
         self._profile_info_text = "—"
 
         self._ui_timer = QTimer(self)
@@ -100,13 +123,13 @@ class MainWindow(QMainWindow):
         self._build_menu()
 
         fixed_font = QFontDatabase.systemFont(QFontDatabase.FixedFont)
-        fixed_metrics = QFontMetrics(fixed_font)
 
         header = QFrame()
         header_layout = QHBoxLayout(header)
-        header_layout.setContentsMargins(8, 6, 8, 6)
+        header_layout.setContentsMargins(12, 6, 12, 6)
         header_layout.setSpacing(8)
-        self.summary_label = QLabel(
+        header.setFixedHeight(46)
+        self.summary_label = ElidedLabel(
             "EURIUSDT | SRC NONE | ages —/— | spread — | FSM —/— | pos — | "
             "pnl —/—/— | last_exit —"
         )
@@ -114,31 +137,34 @@ class MainWindow(QMainWindow):
         self.summary_label.setStyleSheet("font-weight: 600;")
         self.summary_label.setWordWrap(False)
         self.summary_label.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
-        self.summary_label.setMinimumWidth(fixed_metrics.horizontalAdvance("0" * 140))
+        self.summary_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.connect_button = QPushButton("CONNECT")
         self.connect_button.clicked.connect(self._toggle_connection)
         self.status_label = QLabel("DISCONNECTED")
-        self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.status_label.setFixedWidth(140)
-        self.status_label.setStyleSheet("color: #ff5f57; font-weight: 600;")
+        self.status_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.status_label.setFixedWidth(120)
+        self.status_label.setStyleSheet("color: #3ad07d; font-weight: 600;")
         self.start_button = QPushButton("START")
         self.start_button.clicked.connect(self._start_trading)
         self.stop_button = QPushButton("STOP")
         self.stop_button.clicked.connect(self._stop_trading)
         self.settings_button = QPushButton("SETTINGS")
         self.settings_button.clicked.connect(self._open_trade_settings)
-        for button in (
-            self.connect_button,
-            self.start_button,
-            self.stop_button,
-            self.settings_button,
-        ):
-            button.setFixedHeight(28)
+        self.connect_button.setFixedHeight(28)
+        self.connect_button.setFixedWidth(130)
+        self.start_button.setFixedHeight(28)
+        self.start_button.setFixedWidth(110)
+        self.stop_button.setFixedHeight(28)
+        self.stop_button.setFixedWidth(110)
+        self.settings_button.setFixedHeight(28)
+        self.settings_button.setFixedWidth(120)
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(False)
 
-        buttons_layout = QHBoxLayout()
-        buttons_layout.setSpacing(6)
+        buttons_panel = QWidget()
+        buttons_layout = QHBoxLayout(buttons_panel)
+        buttons_layout.setContentsMargins(0, 0, 0, 0)
+        buttons_layout.setSpacing(8)
         buttons_layout.addWidget(self.connect_button)
         buttons_layout.addWidget(self.start_button)
         buttons_layout.addWidget(self.stop_button)
@@ -146,8 +172,7 @@ class MainWindow(QMainWindow):
 
         header_layout.addWidget(self.summary_label)
         header_layout.addStretch(1)
-        header_layout.addLayout(buttons_layout)
-        header_layout.addStretch(1)
+        header_layout.addWidget(buttons_panel)
         header_layout.addWidget(self.status_label)
         root.addWidget(header)
 
@@ -158,67 +183,105 @@ class MainWindow(QMainWindow):
         hud_layout = QVBoxLayout(hud_widget)
         hud_layout.setSpacing(10)
 
-        market_group = QGroupBox("Market & Decision")
-        market_layout = QGridLayout(market_group)
-        market_layout.setHorizontalSpacing(10)
-        market_layout.setVerticalSpacing(6)
-        self.bid_value_label = self._make_big_value_label("—", min_chars=12)
-        self.ask_value_label = self._make_big_value_label("—", min_chars=12)
-        self.mid_value_label = self._make_big_value_label("—", min_chars=12)
-        self.spread_value_label = self._make_big_value_label("—", min_chars=6)
-        market_layout.addWidget(QLabel("Bid"), 0, 0)
-        market_layout.addWidget(self.bid_value_label, 0, 1)
-        market_layout.addWidget(QLabel("Ask"), 1, 0)
-        market_layout.addWidget(self.ask_value_label, 1, 1)
-        market_layout.addWidget(QLabel("Mid"), 2, 0)
-        market_layout.addWidget(self.mid_value_label, 2, 1)
-        market_layout.addWidget(QLabel("Spread (ticks)"), 3, 0)
-        market_layout.addWidget(self.spread_value_label, 3, 1)
+        market_hud = QFrame()
+        market_hud.setFixedHeight(70)
+        market_hud.setStyleSheet(
+            "QFrame { border: 1px solid #2b2b2b; border-radius: 8px; }"
+        )
+        market_layout = QVBoxLayout(market_hud)
+        market_layout.setContentsMargins(10, 6, 10, 6)
+        market_layout.setSpacing(2)
+        self.market_primary_label = QLabel("Bid —  Ask —  Mid —  Spr —t")
+        primary_font = QFontDatabase.systemFont(QFontDatabase.FixedFont)
+        primary_font.setPointSize(primary_font.pointSize() + 3)
+        self.market_primary_label.setFont(primary_font)
+        self.market_primary_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.NoTextInteraction
+        )
+        self.market_primary_label.setAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+        )
+        self.market_secondary_label = QLabel(
+            "SRC — | ws False age — | http age — | blind — | reason —"
+        )
+        secondary_font = QFontDatabase.systemFont(QFontDatabase.FixedFont)
+        secondary_font.setPointSize(secondary_font.pointSize() - 1)
+        self.market_secondary_label.setFont(secondary_font)
+        self.market_secondary_label.setStyleSheet("color: #9a9a9a;")
+        self.market_secondary_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.NoTextInteraction
+        )
+        self.market_secondary_label.setAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+        )
+        market_layout.addWidget(self.market_primary_label)
+        market_layout.addWidget(self.market_secondary_label)
 
         health_group = QGroupBox("Data Health")
-        health_layout = QFormLayout(health_group)
-        health_layout.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
-        self.ws_connected_label = self._make_value_label("—", min_chars=8)
-        self.data_blind_label = self._make_value_label("—", min_chars=8)
-        self.switch_reason_label = self._make_value_label("—", min_chars=10)
-        health_layout.addRow("ws_connected", self.ws_connected_label)
-        health_layout.addRow("data_blind", self.data_blind_label)
-        health_layout.addRow("effective_source_reason", self.switch_reason_label)
+        health_group.setFixedHeight(88)
+        health_layout = QGridLayout(health_group)
+        health_layout.setContentsMargins(10, 10, 10, 10)
+        health_layout.setHorizontalSpacing(8)
+        health_layout.setVerticalSpacing(6)
+        self.ws_connected_label = self._make_value_label("—", min_chars=8, fixed_width=180)
+        self.data_blind_label = self._make_value_label("—", min_chars=8, fixed_width=180)
+        self.switch_reason_label = self._make_value_label("—", min_chars=10, fixed_width=180)
+        self._add_card_row(health_layout, 0, "ws_connected", self.ws_connected_label)
+        self._add_card_row(health_layout, 1, "data_blind", self.data_blind_label)
+        self._add_card_row(
+            health_layout, 2, "effective_source_reason", self.switch_reason_label
+        )
 
         entry_group = QGroupBox("Entry")
-        entry_layout = QFormLayout(entry_group)
-        self.entry_price_label = self._make_value_label("—", min_chars=12)
-        self.entry_offset_label = self._make_value_label("—", min_chars=6)
-        self.entry_age_label = self._make_value_label("—", min_chars=8)
-        self.entry_reprice_reason_label = self._make_value_label("—", min_chars=12)
-        entry_layout.addRow("entry_price", self.entry_price_label)
-        entry_layout.addRow("entry_offset_ticks", self.entry_offset_label)
-        entry_layout.addRow("entry_age_ms", self.entry_age_label)
-        entry_layout.addRow("last_entry_reprice_reason", self.entry_reprice_reason_label)
+        entry_group.setFixedHeight(110)
+        entry_layout = QGridLayout(entry_group)
+        entry_layout.setContentsMargins(10, 10, 10, 10)
+        entry_layout.setHorizontalSpacing(8)
+        entry_layout.setVerticalSpacing(6)
+        self.entry_price_label = self._make_value_label("—", min_chars=12, fixed_width=180)
+        self.entry_offset_label = self._make_value_label("—", min_chars=6, fixed_width=180)
+        self.entry_age_label = self._make_value_label("—", min_chars=8, fixed_width=180)
+        self.entry_reprice_reason_label = self._make_value_label(
+            "—", min_chars=12, fixed_width=180
+        )
+        self._add_card_row(entry_layout, 0, "entry_price", self.entry_price_label)
+        self._add_card_row(entry_layout, 1, "entry_offset_ticks", self.entry_offset_label)
+        self._add_card_row(entry_layout, 2, "entry_age_ms", self.entry_age_label)
+        self._add_card_row(
+            entry_layout, 3, "last_entry_reprice_reason", self.entry_reprice_reason_label
+        )
 
         exit_group = QGroupBox("Exit")
-        exit_layout = QFormLayout(exit_group)
-        self.tp_price_label = self._make_value_label("—", min_chars=12)
-        self.sl_price_label = self._make_value_label("—", min_chars=12)
-        self.exit_intent_label = self._make_value_label("—", min_chars=10)
-        self.exit_policy_label = self._make_value_label("—", min_chars=10)
-        self.exit_age_label = self._make_value_label("—", min_chars=8)
-        exit_layout.addRow("tp_trigger_price", self.tp_price_label)
-        exit_layout.addRow("sl_trigger_price", self.sl_price_label)
-        exit_layout.addRow("exit_intent", self.exit_intent_label)
-        exit_layout.addRow("exit_policy", self.exit_policy_label)
-        exit_layout.addRow("exit_age_ms", self.exit_age_label)
+        exit_group.setFixedHeight(110)
+        exit_layout = QGridLayout(exit_group)
+        exit_layout.setContentsMargins(10, 10, 10, 10)
+        exit_layout.setHorizontalSpacing(8)
+        exit_layout.setVerticalSpacing(6)
+        self.tp_price_label = self._make_value_label("—", min_chars=12, fixed_width=180)
+        self.sl_price_label = self._make_value_label("—", min_chars=12, fixed_width=180)
+        self.exit_intent_label = self._make_value_label("—", min_chars=10, fixed_width=180)
+        self.exit_policy_label = self._make_value_label("—", min_chars=10, fixed_width=180)
+        self.exit_age_label = self._make_value_label("—", min_chars=8, fixed_width=180)
+        self._add_card_row(exit_layout, 0, "tp_trigger_price", self.tp_price_label)
+        self._add_card_row(exit_layout, 1, "sl_trigger_price", self.sl_price_label)
+        self._add_card_row(exit_layout, 2, "exit_intent", self.exit_intent_label)
+        self._add_card_row(exit_layout, 3, "exit_policy", self.exit_policy_label)
+        self._add_card_row(exit_layout, 4, "exit_age_ms", self.exit_age_label)
 
         timers_group = QGroupBox("Timers")
-        timers_layout = QFormLayout(timers_group)
-        self.max_entry_total_label = self._make_value_label("—", min_chars=8)
-        self.max_exit_total_label = self._make_value_label("—", min_chars=8)
-        self.cycles_target_label = self._make_value_label("—", min_chars=6)
-        timers_layout.addRow("max_entry_total_ms", self.max_entry_total_label)
-        timers_layout.addRow("max_exit_total_ms", self.max_exit_total_label)
-        timers_layout.addRow("cycles_target", self.cycles_target_label)
+        timers_group.setFixedHeight(88)
+        timers_layout = QGridLayout(timers_group)
+        timers_layout.setContentsMargins(10, 10, 10, 10)
+        timers_layout.setHorizontalSpacing(8)
+        timers_layout.setVerticalSpacing(6)
+        self.max_entry_total_label = self._make_value_label("—", min_chars=8, fixed_width=180)
+        self.max_exit_total_label = self._make_value_label("—", min_chars=8, fixed_width=180)
+        self.cycles_target_label = self._make_value_label("—", min_chars=6, fixed_width=180)
+        self._add_card_row(timers_layout, 0, "max_entry_total_ms", self.max_entry_total_label)
+        self._add_card_row(timers_layout, 1, "max_exit_total_ms", self.max_exit_total_label)
+        self._add_card_row(timers_layout, 2, "cycles_target", self.cycles_target_label)
 
-        hud_layout.addWidget(market_group)
+        hud_layout.addWidget(market_hud)
         hud_layout.addWidget(health_group)
         hud_layout.addWidget(entry_group)
         hud_layout.addWidget(exit_group)
@@ -253,32 +316,25 @@ class MainWindow(QMainWindow):
         open_header = self.orders_table.horizontalHeader()
         open_header.setStretchLastSection(False)
         open_header.setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
-        column_widths = [
-            fixed_metrics.horizontalAdvance("0" * 8),
-            fixed_metrics.horizontalAdvance("0" * 5),
-            fixed_metrics.horizontalAdvance("0" * 12),
-            fixed_metrics.horizontalAdvance("0" * 8),
-            fixed_metrics.horizontalAdvance("0" * 8),
-            fixed_metrics.horizontalAdvance("0" * 8),
-            fixed_metrics.horizontalAdvance("0" * 10),
-            fixed_metrics.horizontalAdvance("0" * 12),
-        ]
+        column_widths = [90, 55, 110, 110, 90, 80, 120, 260]
         for idx, width in enumerate(column_widths):
-            self.orders_table.setColumnWidth(idx, width + 12)
+            self.orders_table.setColumnWidth(idx, width)
         open_layout.addWidget(self.orders_table, stretch=1)
         orders_tabs.addTab(open_tab, "OPEN")
 
         fills_tab = QWidget()
         fills_layout = QVBoxLayout(fills_tab)
-        self.fills_model = QStandardItemModel(0, 8, self)
+        self.fills_model = QStandardItemModel(0, 10, self)
         self.fills_model.setHorizontalHeaderLabels(
             [
                 "time",
                 "side",
                 "avg_fill_price",
                 "qty",
+                "status",
                 "pnl_quote",
                 "pnl_bps",
+                "unreal_est",
                 "exit_reason",
                 "cycle_id",
             ]
@@ -293,24 +349,19 @@ class MainWindow(QMainWindow):
         fills_header = self.fills_table.horizontalHeader()
         fills_header.setStretchLastSection(False)
         fills_header.setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
-        fills_widths = [
-            fixed_metrics.horizontalAdvance("0" * 8),
-            fixed_metrics.horizontalAdvance("0" * 5),
-            fixed_metrics.horizontalAdvance("0" * 12),
-            fixed_metrics.horizontalAdvance("0" * 8),
-            fixed_metrics.horizontalAdvance("0" * 12),
-            fixed_metrics.horizontalAdvance("0" * 8),
-            fixed_metrics.horizontalAdvance("0" * 10),
-            fixed_metrics.horizontalAdvance("0" * 8),
-        ]
+        fills_widths = [90, 55, 120, 110, 80, 110, 90, 110, 120, 90]
         for idx, width in enumerate(fills_widths):
-            self.fills_table.setColumnWidth(idx, width + 12)
+            self.fills_table.setColumnWidth(idx, width)
         fills_layout.addWidget(self.fills_table, stretch=1)
         orders_tabs.addTab(fills_tab, "FILLS")
 
         splitter.addWidget(hud_widget)
         splitter.addWidget(orders_tabs)
-        splitter.setSizes([450, 550])
+        hud_widget.setMinimumWidth(420)
+        hud_widget.setMaximumWidth(460)
+        hud_widget.setFixedWidth(440)
+        orders_tabs.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        splitter.setSizes([440, 1000])
         root.addWidget(splitter, stretch=1)
 
         scoreboard = QFrame()
@@ -384,6 +435,7 @@ class MainWindow(QMainWindow):
         text: str = "—",
         min_chars: int = 8,
         align: Qt.AlignmentFlag = Qt.AlignmentFlag.AlignRight,
+        fixed_width: Optional[int] = None,
     ) -> QLabel:
         label = QLabel(text)
         font = QFontDatabase.systemFont(QFontDatabase.FixedFont)
@@ -391,8 +443,29 @@ class MainWindow(QMainWindow):
         label.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
         label.setAlignment(align | Qt.AlignmentFlag.AlignVCenter)
         metrics = QFontMetrics(font)
-        label.setMinimumWidth(metrics.horizontalAdvance("0" * min_chars))
+        if fixed_width is not None:
+            label.setFixedWidth(fixed_width)
+        else:
+            label.setMinimumWidth(metrics.horizontalAdvance("0" * min_chars))
         return label
+
+    @staticmethod
+    def _make_card_label(text: str) -> QLabel:
+        label = QLabel(text)
+        label.setStyleSheet("color: #8c8c8c;")
+        label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        return label
+
+    def _add_card_row(self, layout: QGridLayout, row: int, title: str, value: QLabel) -> None:
+        label = self._make_card_label(title)
+        layout.addWidget(label, row, 0)
+        layout.addWidget(value, row, 1)
+
+    @staticmethod
+    def _elide_text(text: str, table: QTableView, column: int) -> str:
+        metrics = QFontMetrics(table.font())
+        width = table.columnWidth(column) - 12
+        return metrics.elidedText(text, Qt.TextElideMode.ElideRight, max(0, width))
 
     def _make_big_value_label(self, text: str = "—", min_chars: int = 10) -> QLabel:
         label = QLabel(text)
@@ -553,8 +626,6 @@ class MainWindow(QMainWindow):
         self.stop_button.setEnabled(False)
         self._orders_model_clear()
         self._fills_model_clear()
-        self._fills_history.clear()
-        self._fill_seen_keys.clear()
         self._set_hud_defaults()
 
         self._connected = False
@@ -678,10 +749,20 @@ class MainWindow(QMainWindow):
         spread_ticks = self._calculate_spread_ticks(
             price_state.bid, price_state.ask, tick_size
         )
-        self.bid_value_label.setText(self._fmt_price(price_state.bid, width=12))
-        self.ask_value_label.setText(self._fmt_price(price_state.ask, width=12))
-        self.mid_value_label.setText(self._fmt_price(price_state.mid, width=12))
-        self.spread_value_label.setText(self._fmt_int(spread_ticks, width=6))
+        bid_label = self._fmt_price(price_state.bid, width=9)
+        ask_label = self._fmt_price(price_state.ask, width=9)
+        mid_label = self._fmt_price(price_state.mid, width=9)
+        spread_label = self._fmt_int(spread_ticks, width=3)
+        self.market_primary_label.setText(
+            f"Bid {bid_label}  Ask {ask_label}  Mid {mid_label}  Spr {spread_label}t"
+        )
+        ws_age = self._fmt_int(health_state.ws_age_ms, width=6)
+        http_age = self._fmt_int(health_state.http_age_ms, width=6)
+        self.market_secondary_label.setText(
+            f"SRC {price_state.source} | ws {health_state.ws_connected} age {ws_age} | "
+            f"http age {http_age} | blind {price_state.data_blind} | "
+            f"reason {health_state.last_switch_reason or '—'}"
+        )
 
         self.ws_connected_label.setText(str(health_state.ws_connected))
         self.data_blind_label.setText(str(price_state.data_blind))
@@ -1263,6 +1344,10 @@ class MainWindow(QMainWindow):
 
     def _fills_model_clear(self) -> None:
         self.fills_model.removeRows(0, self.fills_model.rowCount())
+        self._fill_rows_by_event_key.clear()
+        self._fills_history.clear()
+        self._cycle_id_counter = 0
+        self._last_buy_fill_price = None
 
     def _refresh_orders(self) -> None:
         if not self._connected or not self._rest or not self._settings:
@@ -1328,15 +1413,29 @@ class MainWindow(QMainWindow):
             ]
             if row is None:
                 items = [QStandardItem(value) for value in row_values]
-                for item in items:
-                    item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                for idx, item in enumerate(items):
+                    if idx == 7:
+                        item.setTextAlignment(
+                            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+                        )
+                        item.setText(self._elide_text(item.text(), self.orders_table, idx))
+                        item.setToolTip(row_values[idx])
+                    else:
+                        item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 items[0].setData(key, Qt.ItemDataRole.UserRole)
                 self.orders_model.appendRow(items)
                 self._open_order_rows[key] = self.orders_model.rowCount() - 1
             else:
                 for col, value in enumerate(row_values):
                     item = self.orders_model.item(row, col)
-                    if item and item.text() != value:
+                    if not item:
+                        continue
+                    if col == 7:
+                        elided = self._elide_text(value, self.orders_table, col)
+                        if item.text() != elided:
+                            item.setText(elided)
+                            item.setToolTip(value)
+                    elif item.text() != value:
                         item.setText(value)
                 first_item = self.orders_model.item(row, 0)
                 if first_item and first_item.data(Qt.ItemDataRole.UserRole) != key:
@@ -1379,11 +1478,11 @@ class MainWindow(QMainWindow):
         if side == "BUY":
             if bid is None:
                 return None
-            return max(0, int((price - bid) / tick_size))
+            return max(0, round((price - bid) / tick_size))
         if side == "SELL":
             if ask is None:
                 return None
-            return max(0, int((price - ask) / tick_size))
+            return max(0, round((ask - price) / tick_size))
         return None
 
     @staticmethod
@@ -1483,10 +1582,10 @@ class MainWindow(QMainWindow):
         self.avg_pnl_value_label.setText(self._fmt_pnl(avg_pnl, width=10))
 
     def _set_hud_defaults(self) -> None:
-        self.bid_value_label.setText("—")
-        self.ask_value_label.setText("—")
-        self.mid_value_label.setText("—")
-        self.spread_value_label.setText("—")
+        self.market_primary_label.setText("Bid —  Ask —  Mid —  Spr —t")
+        self.market_secondary_label.setText(
+            "SRC — | ws False age — | http age — | blind — | reason —"
+        )
         self.ws_connected_label.setText("—")
         self.data_blind_label.setText("—")
         self.switch_reason_label.setText("—")
@@ -1515,18 +1614,33 @@ class MainWindow(QMainWindow):
     def _register_fill(
         self, order_id: int, side: str, price: float, qty: float, ts_ms: int
     ) -> None:
-        key = (order_id, side, ts_ms)
-        if key in self._fill_seen_keys:
-            return
-        self._fill_seen_keys.add(key)
         side_upper = str(side).upper()
+        status = "FILLED"
+        event_key = self._fill_event_key(order_id, side_upper, status, qty, price, ts_ms)
+        if event_key in self._fill_rows_by_event_key:
+            return
         pnl_quote = None
         pnl_bps = None
         exit_reason = "—"
-        if self._trade_executor and side_upper == "SELL":
-            pnl_quote = self._trade_executor.pnl_cycle
-            exit_reason = self._trade_executor.last_exit_reason or "—"
-            buy_price = self._trade_executor.get_buy_price()
+        cycle_id = "—"
+        unreal_est = None
+        buy_price = None
+        if side_upper == "BUY":
+            self._last_buy_fill_price = price
+            if self._last_mid is not None and qty:
+                unreal_est = (self._last_mid - price) * qty
+        elif side_upper == "SELL":
+            self._cycle_id_counter += 1
+            cycle_id = str(self._cycle_id_counter)
+            if self._trade_executor:
+                pnl_quote = self._trade_executor.pnl_cycle
+                exit_reason = self._trade_executor.last_exit_reason or "—"
+                buy_price = self._trade_executor.get_buy_price()
+            if pnl_quote is None:
+                if buy_price is None:
+                    buy_price = self._last_buy_fill_price
+                if buy_price is not None and qty:
+                    pnl_quote = (price - buy_price) * qty
             if pnl_quote is not None and buy_price and qty:
                 notion = buy_price * qty
                 if notion > 0:
@@ -1534,35 +1648,83 @@ class MainWindow(QMainWindow):
         entry = {
             "time": self._format_time(ts_ms),
             "side": side_upper,
+            "status": status,
             "avg_fill_price": price,
             "qty": qty,
             "pnl_quote": pnl_quote,
             "pnl_bps": pnl_bps,
+            "unreal_est": unreal_est,
             "exit_reason": exit_reason,
-            "cycle_id": "—",
+            "cycle_id": cycle_id,
+            "event_key": event_key,
         }
         self._fills_history.insert(0, entry)
         self._append_fill_row(entry)
         if len(self._fills_history) > 200:
-            self._fills_history.pop()
-            if self.fills_model.rowCount() > 200:
-                self.fills_model.removeRow(self.fills_model.rowCount() - 1)
+            removed = self._fills_history.pop()
+            self._remove_fill_row_by_key(removed.get("event_key"))
 
     def _append_fill_row(self, entry: dict) -> None:
-        row = [
+        row = self._fill_row_values(entry)
+        items = [QStandardItem(value) for value in row]
+        for idx, item in enumerate(items):
+            if idx in {8, 9}:
+                item.setTextAlignment(
+                    Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+                )
+                item.setText(self._elide_text(item.text(), self.fills_table, idx))
+                item.setToolTip(row[idx])
+            else:
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._shift_fill_row_indices(1)
+        self.fills_model.insertRow(0, items)
+        event_key = entry.get("event_key")
+        if isinstance(event_key, str):
+            self._fill_rows_by_event_key[event_key] = 0
+
+    def _fill_row_values(self, entry: dict) -> list[str]:
+        return [
             entry.get("time", "—"),
             entry.get("side", "—"),
             self._fmt_price(entry.get("avg_fill_price"), width=12),
             self._fmt_qty(entry.get("qty"), width=8),
+            str(entry.get("status", "—")),
             self._fmt_pnl(entry.get("pnl_quote"), width=12),
             self._fmt_pnl(entry.get("pnl_bps"), width=8),
+            self._fmt_pnl(entry.get("unreal_est"), width=12),
             str(entry.get("exit_reason", "—")),
             str(entry.get("cycle_id", "—")),
         ]
-        items = [QStandardItem(value) for value in row]
-        for item in items:
-            item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.fills_model.insertRow(0, items)
+
+    def _shift_fill_row_indices(self, delta: int) -> None:
+        if not delta:
+            return
+        for key in list(self._fill_rows_by_event_key.keys()):
+            self._fill_rows_by_event_key[key] += delta
+
+    def _remove_fill_row_by_key(self, event_key: Optional[str]) -> None:
+        if not event_key:
+            return
+        row = self._fill_rows_by_event_key.pop(event_key, None)
+        if row is None:
+            return
+        self.fills_model.removeRow(row)
+        for key, idx in list(self._fill_rows_by_event_key.items()):
+            if idx > row:
+                self._fill_rows_by_event_key[key] = idx - 1
+
+    @staticmethod
+    def _fill_event_key(
+        order_id: Optional[int],
+        side: str,
+        status: str,
+        cum_qty: float,
+        avg_price: float,
+        ts_ms: int,
+    ) -> str:
+        if order_id is not None:
+            return f"{order_id}:{side}:{status}:{cum_qty}:{avg_price}"
+        return f"{ts_ms}:{side}:{status}:{cum_qty}:{avg_price}"
 
     @staticmethod
     def _format_time(value: Optional[int]) -> str:
