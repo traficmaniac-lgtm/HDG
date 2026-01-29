@@ -21,6 +21,9 @@ class Settings:
     ws_stale_grace_ms: int
     entry_max_age_ms: int
     exit_max_age_ms: int
+    tp_max_age_ms: int
+    settlement_grace_ms: int
+    repricing_cooldown_ms: int
     max_wait_price_ms: int
     price_wait_log_every_ms: int
     position_guard_http: bool
