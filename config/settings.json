@@ -16,17 +16,17 @@
   "position_guard_http": true,
   "entry_mode": "NORMAL",
   "aggressive_offset_ticks": 0,
-  "max_entry_total_ms": 30000,
+  "max_entry_total_ms": 40000,
   "account_mode": "CROSS_MARGIN",
   "max_leverage_hint": 3,
   "leverage_hint": 3,
-  "order_quote": 50.0,
-  "max_budget": 1000.0,
+  "order_quote": 611.0,
+  "max_budget": 2000.0,
   "budget_reserve": 20.0,
-  "offset_ticks": 1,
+  "offset_ticks": 0,
   "entry_offset_ticks": 0,
-  "take_profit_ticks": 1,
-  "stop_loss_ticks": 2,
+  "take_profit_ticks": 2,
+  "stop_loss_ticks": 1,
   "order_type": "LIMIT",
   "exit_order_type": "LIMIT",
   "exit_offset_ticks": 1,
@@ -42,10 +42,11 @@
   "max_wait_sell_ms": 15000,
   "allow_force_close": false,
   "api": {
-    "key": "",
-    "secret": ""
+    "key": "QqafeYMR0spwlghqligrK5n2XHq5YLvzGDK2hLicHCoDmFtGUb81xFwXbwKxPS0v",
+    "secret": "CPgVuOSM0nsJiQvOMW5hmBu26DcXztUU2Hnf2SVup2MtJsb2d5oACgONnJcMq4pY"
   },
   "api_storage": {
     "source": "settings.json"
-  }
+  },
+  "cycle_count": 1000
 }

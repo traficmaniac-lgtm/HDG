@@ -1,0 +1,302 @@
+Loaded settings
+Server time synced: 1769681098525
+[MARGIN_CHECK] ok borrow=fail
+CONNECT: data services started
+[DATA] source=NONE -> HTTP reason=ws_stale ws_age=?
+WS connected: True
+[DATA] source=HTTP -> WS reason=ws_stable ws_age=797
+WS connected: False
+WS reconnect: stale ticks
+[DATA] source=HTTP -> WS reason=ws_stable ws_age=360
+WS connected: False
+WS reconnect: stale ticks
+[SETTINGS] saved
+[DATA] source=HTTP -> WS reason=ws_stable ws_age=1078
+[ORDER_UNIT] quote=611.00000000
+[BUDGET_CHECK] free=999.36164080 max=2000.00000000 reserve=20.00000000
+[TRADE] place_test_orders | mode=CROSS_MARGIN lev_hint=3 buy=1.19630 qty=510.70000 tag=PRE_V0_8_0
+[STATE] IDLE → PLACE_BUY
+[ENTRY_PLACE] price=1.19630000 bid=1.19630000 ask=1.19670000
+[ORDER] BUY placed qty=510.70000000 price=1.19630000 id=46324955
+[STATE] PLACE_BUY → WAIT_BUY
+[CYCLE_START] idx=1 target=1000
+[ENTRY_DEGRADED_TO_HTTP] reason=ws_bad ws_connected=True no_first_tick=0 stale_ticks=2
+[ENTRY_WAIT] ms=577
+[ENTRY_REPRICE_SKIP] reason=ws_bad age_ms=1202
+[ENTRY_DEGRADED_TO_HTTP] reason=ws_bad ws_connected=True no_first_tick=0 stale_ticks=2
+[ENTRY_DEGRADED_TO_HTTP] reason=ws_bad ws_connected=True no_first_tick=0 stale_ticks=2
+[ENTRY_WAIT] ms=3202
+[ENTRY_REPRICE_SKIP] reason=ws_bad age_ms=592
+[ENTRY_DEGRADED_TO_HTTP] reason=ws_bad ws_connected=True no_first_tick=0 stale_ticks=2
+[ENTRY_DEGRADED_TO_HTTP] reason=ws_bad ws_connected=True no_first_tick=0 stale_ticks=2
+[ENTRY_HOLD_WSBAD] no_first_tick=0 stale_ticks=2
+[ENTRY_REPRICE_SKIP] reason=ws_bad age_ms=1561
+[DATA] mid_from_cache age_ms=1577 state=WAIT_BUY
+[ENTRY_WAIT] ms=7937
+[ENTRY_REPRICE_SKIP] reason=ws_bad age_ms=296
+[ENTRY_DEGRADED_TO_HTTP] reason=ws_bad ws_connected=True no_first_tick=0 stale_ticks=2
+[ENTRY_DEGRADED_TO_HTTP] reason=ws_bad ws_connected=True no_first_tick=0 stale_ticks=2
+[ENTRY_WAIT] ms=12655
+[ENTRY_REPRICE_SKIP] reason=ws_bad age_ms=1077
+WS connected: False
+WS reconnect: stale ticks
+[ENTRY_DEGRADED_TO_HTTP] reason=ws_bad ws_connected=False no_first_tick=0 stale_ticks=3
+[ENTRY_DEGRADED_TO_HTTP] reason=ws_bad ws_connected=True no_first_tick=0 stale_ticks=3
+[ENTRY_WAIT] ms=15577
+[ENTRY_REPRICE_SKIP] reason=ws_bad age_ms=1233
+[ENTRY_DEGRADED_TO_HTTP] reason=ws_bad ws_connected=True no_first_tick=0 stale_ticks=3
+[ENTRY_WAIT] ms=17827
+[ENTRY_REPRICE_SKIP] reason=ws_bad age_ms=781
+[ENTRY_DEGRADED_TO_HTTP] reason=ws_bad ws_connected=True no_first_tick=0 stale_ticks=3
+[ENTRY_DEGRADED_TO_HTTP] reason=ws_bad ws_connected=True no_first_tick=0 stale_ticks=3
+[ENTRY_WAIT] ms=21968
+[ENTRY_REPRICE_SKIP] reason=ws_bad age_ms=297
+[ENTRY_DEGRADED_TO_HTTP] reason=ws_bad ws_connected=True no_first_tick=0 stale_ticks=3
+[ENTRY_WAIT] ms=24093
+[ENTRY_REPRICE_SKIP] reason=ws_bad age_ms=625
+[ENTRY_DEGRADED_TO_HTTP] reason=ws_bad ws_connected=True no_first_tick=0 stale_ticks=3
+[ENTRY_DEGRADED_TO_HTTP] reason=ws_bad ws_connected=True no_first_tick=0 stale_ticks=3
+[ENTRY_WAIT] ms=27296
+[ENTRY_REPRICE_SKIP] reason=ws_bad age_ms=577
+[ORDER_TRACKER] status change id=46324955 side=BUY status=PARTIALLY_FILLED
+[BUY_PARTIAL] cum_qty=346.00000000 avg=1.19630000
+[ENTRY_DEGRADED_TO_HTTP] reason=ws_bad ws_connected=True no_first_tick=0 stale_ticks=3
+WS connected: False
+WS reconnect: no first tick
+[BUY_PARTIAL] cum_qty=346.00000000 avg=1.19630000
+[ENTRY_DEGRADED_TO_HTTP] reason=ws_bad ws_connected=True no_first_tick=1 stale_ticks=3
+[ENTRY_WAIT] ms=30171
+[ENTRY_REPRICE_SKIP] reason=ws_bad age_ms=593
+[BUY_PARTIAL] cum_qty=346.00000000 avg=1.19630000
+[ENTRY_DEGRADED_TO_HTTP] reason=ws_bad ws_connected=True no_first_tick=1 stale_ticks=3
+[BUY_PARTIAL] cum_qty=346.00000000 avg=1.19630000
+[ENTRY_DEGRADED_TO_HTTP] reason=ws_bad ws_connected=True no_first_tick=1 stale_ticks=3
+[ENTRY_WAIT] ms=33109
+[ENTRY_REPRICE_SKIP] reason=ws_bad age_ms=657
+[BUY_PARTIAL] cum_qty=346.00000000 avg=1.19630000
+[ENTRY_DEGRADED_TO_HTTP] reason=ws_bad ws_connected=True no_first_tick=1 stale_ticks=3
+[ENTRY_WAIT] ms=35141
+[ENTRY_REPRICE_SKIP] reason=ws_bad age_ms=875
+[BUY_PARTIAL] cum_qty=346.00000000 avg=1.19630000
+[ENTRY_DEGRADED_TO_HTTP] reason=ws_bad ws_connected=True no_first_tick=1 stale_ticks=3
+[BUY_PARTIAL] cum_qty=346.00000000 avg=1.19630000
+[ENTRY_DEGRADED_TO_HTTP] reason=ws_bad ws_connected=True no_first_tick=1 stale_ticks=3
+[ENTRY_WAIT] ms=37718
+[ENTRY_REPRICE_SKIP] reason=ws_bad age_ms=563
+[BUY_PARTIAL] cum_qty=346.00000000 avg=1.19630000
+[ENTRY_DEGRADED_TO_HTTP] reason=ws_bad ws_connected=True no_first_tick=1 stale_ticks=3
+[BUY_PARTIAL] cum_qty=346.00000000 avg=1.19630000
+[ENTRY_ABORT_TIMEOUT] waited_ms=41343
+[ORDER] BUY partial timeout qty=346.00000000 price=1.19630000
+[STATE] WAIT_BUY → POSITION_OPEN
+WS connected: False
+WS reconnect: no first tick
+[DATA] mid_from_cache age_ms=906 state=POSITION_OPEN
+[EXITS_FROZEN] reason=blackout ws_age=40328 http_age=2219
+[DATA] source=HTTP -> WS reason=ws_stable ws_age=358
+[EXIT_INTENT_SET] intent=TP ticks=2 mid=1.19650000
+[EXIT_ALLOWED] src=WS age=358
+[STATE] POSITION_OPEN → PLACE_SELL
+[SELL_PLACE] qty=346.00000000 price=1.19660000
+[SELL_FOR_PARTIAL] qty=346.00000000
+[ORDER] SELL placed reason=TP type=LIMIT price=1.19660000 qty=346.00000000 id=46325029
+[STATE] PLACE_SELL → WAIT_SELL
+[SELL_TTL_EXPIRED] id=46325029
+[SELL_CANCEL_REQUEST] id=46325029
+WS connected: False
+WS reconnect: stale ticks
+[ORDER_TRACKER] status change id=46325029 side=SELL status=CANCELED
+[ORDER] SELL CANCELED id=46325029
+[STATE] WAIT_SELL → POSITION_OPEN
+[DATA] mid_from_cache age_ms=640 state=POSITION_OPEN
+[EXITS_FROZEN] reason=blackout ws_age=10327 http_age=1875
+[EXIT_INTENT_HOLD] intent=TP
+[EXIT_ALLOWED] src=HTTP age=281
+[STATE] POSITION_OPEN → PLACE_SELL
+[SELL_PLACE] qty=346.00000000 price=1.19660000
+[SELL_FOR_PARTIAL] qty=346.00000000
+[ORDER] SELL placed reason=TP type=LIMIT price=1.19660000 qty=346.00000000 id=46325038
+[STATE] PLACE_SELL → WAIT_SELL
+[DATA] source=HTTP -> WS reason=ws_stable ws_age=1108
+[SELL_TTL_EXPIRED] id=46325038
+[SELL_CANCEL_REQUEST] id=46325038
+[ORDER_TRACKER] status change id=46325038 side=SELL status=CANCELED
+[ORDER] SELL CANCELED id=46325038
+[STATE] WAIT_SELL → POSITION_OPEN
+[EXIT_INTENT_HOLD] intent=TP
+[EXIT_ALLOWED] src=HTTP age=672
+[STATE] POSITION_OPEN → PLACE_SELL
+[SELL_PLACE] qty=346.00000000 price=1.19660000
+[SELL_FOR_PARTIAL] qty=346.00000000
+[ORDER] SELL placed reason=TP type=LIMIT price=1.19660000 qty=346.00000000 id=46325048
+[STATE] PLACE_SELL → WAIT_SELL
+WS connected: False
+WS reconnect: stale ticks
+[DATA] source=HTTP -> WS reason=ws_stable ws_age=1233
+[SELL_TTL_EXPIRED] id=46325048
+[SELL_CANCEL_REQUEST] id=46325048
+[ORDER_TRACKER] status change id=46325048 side=SELL status=CANCELED
+[ORDER] SELL CANCELED id=46325048
+[STATE] WAIT_SELL → POSITION_OPEN
+[EXIT_INTENT_HOLD] intent=TP
+[EXIT_ALLOWED] src=HTTP age=0
+[STATE] POSITION_OPEN → PLACE_SELL
+[SELL_PLACE] qty=346.00000000 price=1.19660000
+[SELL_FOR_PARTIAL] qty=346.00000000
+[ORDER] SELL placed reason=TP type=LIMIT price=1.19660000 qty=346.00000000 id=46325060
+[STATE] PLACE_SELL → WAIT_SELL
+WS connected: False
+WS reconnect: stale ticks
+[SELL_TTL_EXPIRED] id=46325060
+[SELL_CANCEL_REQUEST] id=46325060
+[DATA] mid_from_cache age_ms=1343 state=WAIT_SELL
+[SELL_CANCEL_CONFIRMED] id=46325060
+[SELL_RETRY_PENDING] intent=TP remaining=346.00000000
+[STATE] WAIT_SELL → PLACE_SELL
+[SELL_REPRICE] mid=1.19680000 bid=1.19650000 ask=1.19700000 new_price=1.19690000
+[SELL_RETRY 1/3 price=1.19690000]
+[SELL_RETRY_REMAINING] qty=346.00000000 remaining=346.00000000 n=1/3
+[SELL_PLACE] qty=346.00000000 price=1.19690000
+[SELL_FOR_PARTIAL] qty=346.00000000
+[ORDER] SELL placed reason=TP type=LIMIT price=1.19690000 qty=346.00000000 id=46325086
+[STATE] PLACE_SELL → WAIT_SELL
+[ORDER_TRACKER] status change id=46325086 side=SELL status=FILLED
+[ORDER] SELL filled reason=TP fill_price=1.19690000 qty=346.00000000
+[PNL] realized reason=TP pnl_quote=0.20760000 pnl_bps=5.02
+[STATE] WAIT_SELL → CLOSED
+[CYCLE_DONE] idx=1 pnl=0.20760000 reason=TP
+[CYCLE_NEXT] done=1 target=1000
+[STATE] CLOSED → IDLE
+[ORDER_UNIT] quote=611.00000000
+[BUDGET_CHECK] free=999.56924080 max=2000.00000000 reserve=20.00000000
+[TRADE] place_test_orders | mode=CROSS_MARGIN lev_hint=3 buy=1.19680 qty=510.50000 tag=PRE_V0_8_0
+[STATE] IDLE → PLACE_BUY
+[ENTRY_PLACE] price=1.19680000 bid=1.19680000 ask=1.19720000
+[ORDER] BUY placed qty=510.50000000 price=1.19680000 id=46325107
+[STATE] PLACE_BUY → WAIT_BUY
+[CYCLE_START] idx=2 target=1000
+[ENTRY_DEGRADED_TO_HTTP] reason=ws_bad ws_connected=True no_first_tick=2 stale_ticks=6
+[ENTRY_HOLD_WSBAD] no_first_tick=2 stale_ticks=6
+[ENTRY_REPRICE_SKIP] reason=ws_bad age_ms=2108
+WS connected: False
+WS reconnect: no first tick
+[ENTRY_DEGRADED_TO_HTTP] reason=ws_bad ws_connected=False no_first_tick=3 stale_ticks=6
+[ENTRY_WAIT] ms=1782
+[ENTRY_REPRICE_SKIP] reason=ws_bad age_ms=593
+[ENTRY_DEGRADED_TO_HTTP] reason=ws_bad ws_connected=True no_first_tick=3 stale_ticks=6
+[ENTRY_WAIT] ms=3813
+[ENTRY_REPRICE_SKIP] reason=ws_bad age_ms=578
+[ENTRY_DEGRADED_TO_HTTP] reason=ws_bad ws_connected=True no_first_tick=3 stale_ticks=6
+[ENTRY_WAIT] ms=6000
+[ENTRY_REPRICE_SKIP] reason=ws_bad age_ms=281
+[DATA] source=HTTP -> WS reason=ws_stable ws_age=1077
+[ENTRY_DEGRADED_TO_HTTP] reason=ws_bad ws_connected=True no_first_tick=3 stale_ticks=6
+[ENTRY_DEGRADED_TO_HTTP] reason=ws_bad ws_connected=True no_first_tick=3 stale_ticks=6
+[ENTRY_WAIT] ms=8093
+[ENTRY_REPRICE_SKIP] reason=ws_bad age_ms=593
+[ENTRY_DEGRADED_TO_HTTP] reason=ws_bad ws_connected=True no_first_tick=3 stale_ticks=6
+[ENTRY_DEGRADED_TO_HTTP] reason=ws_bad ws_connected=True no_first_tick=3 stale_ticks=6
+[ENTRY_WAIT] ms=11063
+[ENTRY_REPRICE_SKIP] reason=ws_bad age_ms=672
+[DATA] source=WS -> HTTP reason=ws_stale ws_age=1516
+[ENTRY_DEGRADED_TO_HTTP] reason=ws_bad ws_connected=True no_first_tick=3 stale_ticks=6
+[ENTRY_DEGRADED_TO_HTTP] reason=ws_bad ws_connected=True no_first_tick=3 stale_ticks=6
+[ENTRY_WAIT] ms=14250
+[ENTRY_REPRICE_SKIP] reason=ws_bad age_ms=608
+[ENTRY_DEGRADED_TO_HTTP] reason=ws_bad ws_connected=True no_first_tick=3 stale_ticks=6
+[ENTRY_DEGRADED_TO_HTTP] reason=ws_bad ws_connected=True no_first_tick=3 stale_ticks=6
+[ENTRY_WAIT] ms=17093
+[ENTRY_REPRICE_SKIP] reason=ws_bad age_ms=593
+[ENTRY_DEGRADED_TO_HTTP] reason=ws_bad ws_connected=True no_first_tick=3 stale_ticks=6
+[ENTRY_DEGRADED_TO_HTTP] reason=ws_bad ws_connected=True no_first_tick=3 stale_ticks=6
+[ENTRY_WAIT] ms=20343
+[ENTRY_REPRICE_SKIP] reason=ws_bad age_ms=311
+WS connected: False
+WS reconnect: stale ticks
+[ENTRY_DEGRADED_TO_HTTP] reason=ws_bad ws_connected=True no_first_tick=3 stale_ticks=7
+[ENTRY_DEGRADED_TO_HTTP] reason=ws_bad ws_connected=True no_first_tick=3 stale_ticks=7
+[ENTRY_WAIT] ms=23234
+[ENTRY_REPRICE_SKIP] reason=ws_bad age_ms=625
+[ENTRY_DEGRADED_TO_HTTP] reason=ws_bad ws_connected=True no_first_tick=3 stale_ticks=7
+[DATA] source=HTTP -> WS reason=ws_stable ws_age=1186
+[ENTRY_DEGRADED_TO_HTTP] reason=ws_bad ws_connected=True no_first_tick=3 stale_ticks=7
+[ENTRY_WAIT] ms=26063
+[ENTRY_REPRICE_SKIP] reason=ws_bad age_ms=594
+[ENTRY_DEGRADED_TO_HTTP] reason=ws_bad ws_connected=True no_first_tick=3 stale_ticks=7
+[ENTRY_DEGRADED_TO_HTTP] reason=ws_bad ws_connected=True no_first_tick=3 stale_ticks=7
+[ENTRY_WAIT] ms=29297
+[ENTRY_REPRICE_SKIP] reason=ws_bad age_ms=265
+[ENTRY_DEGRADED_TO_HTTP] reason=ws_bad ws_connected=True no_first_tick=3 stale_ticks=7
+[ENTRY_DEGRADED_TO_HTTP] reason=ws_bad ws_connected=True no_first_tick=3 stale_ticks=7
+[ENTRY_WAIT] ms=32202
+[ENTRY_REPRICE_SKIP] reason=ws_bad age_ms=577
+WS connected: False
+WS reconnect: stale ticks
+[ENTRY_DEGRADED_TO_HTTP] reason=ws_bad ws_connected=False no_first_tick=3 stale_ticks=8
+[ENTRY_DEGRADED_TO_HTTP] reason=ws_bad ws_connected=True no_first_tick=3 stale_ticks=8
+[ENTRY_WAIT] ms=35077
+[ENTRY_REPRICE_SKIP] reason=ws_bad age_ms=608
+[ENTRY_DEGRADED_TO_HTTP] reason=ws_bad ws_connected=True no_first_tick=3 stale_ticks=8
+[ENTRY_DEGRADED_TO_HTTP] reason=ws_bad ws_connected=True no_first_tick=3 stale_ticks=8
+[ENTRY_WAIT] ms=38313
+[ENTRY_REPRICE_SKIP] reason=ws_bad age_ms=594
+[ENTRY_DEGRADED_TO_HTTP] reason=ws_bad ws_connected=True no_first_tick=3 stale_ticks=8
+[ENTRY_ABORT_TIMEOUT] waited_ms=41188
+[TRADE] cancel_test_orders | cancelled=1 tag=PRE_V0_8_0
+[STATE] WAIT_BUY → CLOSED
+[STATE] CLOSED → IDLE
+[CYCLE_DONE] idx=2 pnl=— reason=ENTRY_TIMEOUT
+[CYCLE_NEXT] done=2 target=1000
+[ORDER_UNIT] quote=611.00000000
+[BUDGET_CHECK] free=999.56924080 max=2000.00000000 reserve=20.00000000
+[TRADE] place_test_orders | mode=CROSS_MARGIN lev_hint=3 buy=1.19680 qty=510.50000 tag=PRE_V0_8_0
+[STATE] IDLE → PLACE_BUY
+[ENTRY_PLACE] price=1.19680000 bid=1.19680000 ask=1.19720000
+[ORDER] BUY placed qty=510.50000000 price=1.19680000 id=46325149
+[STATE] PLACE_BUY → WAIT_BUY
+[CYCLE_START] idx=3 target=1000
+[ENTRY_DEGRADED_TO_HTTP] reason=ws_bad ws_connected=True no_first_tick=3 stale_ticks=8
+[ENTRY_HOLD_WSBAD] no_first_tick=3 stale_ticks=8
+[ENTRY_REPRICE_SKIP] reason=ws_bad age_ms=1702
+WS connected: False
+WS reconnect: no first tick
+[DATA] mid_from_cache age_ms=2858 state=WAIT_BUY
+[ENTRY_DEGRADED_TO_HTTP] reason=ws_bad ws_connected=True no_first_tick=4 stale_ticks=8
+[ENTRY_WAIT] ms=2967
+[ENTRY_REPRICE_SKIP] reason=ws_bad age_ms=311
+[ENTRY_DEGRADED_TO_HTTP] reason=ws_bad ws_connected=True no_first_tick=4 stale_ticks=8
+[ENTRY_WAIT] ms=5092
+[ENTRY_REPRICE_SKIP] reason=ws_bad age_ms=280
+[ENTRY_DEGRADED_TO_HTTP] reason=ws_bad ws_connected=True no_first_tick=4 stale_ticks=8
+[ENTRY_WAIT] ms=7217
+[ENTRY_REPRICE_SKIP] reason=ws_bad age_ms=592
+[ENTRY_DEGRADED_TO_HTTP] reason=ws_bad ws_connected=True no_first_tick=4 stale_ticks=8
+[ENTRY_WAIT] ms=10031
+[ENTRY_REPRICE_SKIP] reason=ws_bad age_ms=781
+[ENTRY_DEGRADED_TO_HTTP] reason=ws_bad ws_connected=True no_first_tick=4 stale_ticks=8
+[ENTRY_HOLD_WSBAD] no_first_tick=4 stale_ticks=8
+[ENTRY_REPRICE_SKIP] reason=ws_bad age_ms=2750
+[DATA] mid_from_cache age_ms=1500 state=WAIT_BUY
+WS connected: False
+WS reconnect: no first tick
+[ENTRY_DEGRADED_TO_HTTP] reason=ws_bad ws_connected=False no_first_tick=5 stale_ticks=8
+[ENTRY_WAIT] ms=14108
+[ENTRY_REPRICE_SKIP] reason=ws_bad age_ms=296
+[ENTRY_DEGRADED_TO_HTTP] reason=ws_bad ws_connected=True no_first_tick=5 stale_ticks=8
+[ENTRY_WAIT] ms=16203
+[ENTRY_REPRICE_SKIP] reason=ws_bad age_ms=594
+[DATA] source=HTTP -> WS reason=ws_stable ws_age=313
+[ENTRY_DEGRADED_TO_HTTP] reason=ws_bad ws_connected=True no_first_tick=5 stale_ticks=8
+[ENTRY_DEGRADED_TO_HTTP] reason=ws_bad ws_connected=True no_first_tick=5 stale_ticks=8
+[ENTRY_WAIT] ms=19140
+[ENTRY_REPRICE_SKIP] reason=ws_bad age_ms=625
+[ENTRY_DEGRADED_TO_HTTP] reason=ws_bad ws_connected=True no_first_tick=5 stale_ticks=8
+[ENTRY_DEGRADED_TO_HTTP] reason=ws_bad ws_connected=True no_first_tick=5 stale_ticks=8
+[ENTRY_WAIT] ms=22328
+[ENTRY_REPRICE_SKIP] reason=ws_bad age_ms=297
+[ENTRY_DEGRADED_TO_HTTP] reason=ws_bad ws_connected=True no_first_tick=5 stale_ticks=8
+[ENTRY_WAIT] ms=24483
+[ENTRY_REPRICE_SKIP] reason=ws_bad age_ms=280
+WS connected: False
+WS reconnect: stale ticks
+[ENTRY_DEGRADED_TO_HTTP] reason=ws_bad ws_connected=False no_first_tick=5 stale_ticks=9
