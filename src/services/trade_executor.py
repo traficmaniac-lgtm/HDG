@@ -1151,21 +1151,41 @@ class TradeExecutor:
             return
 
         now = time.monotonic()
+        if self._tp_maker_started_ts is None:
+            self._tp_maker_started_ts = now
+        elapsed_ms = int((now - self._tp_maker_started_ts) * 1000.0)
         cross_after_ms = int(getattr(self._settings, "tp_cross_after_ms", 900))
-        desired_phase = "MAKER"
-        if bid is not None and bid >= tp_price:
-            if self._tp_maker_started_ts is None:
-                self._tp_maker_started_ts = now
-            elapsed_ms = (now - self._tp_maker_started_ts) * 1000.0
-            if elapsed_ms >= cross_after_ms:
-                desired_phase = "CROSS"
-        else:
-            self._tp_maker_started_ts = None
+        tick_size = self._profile.tick_size
+        spread_tight = False
+        if bid is not None and ask is not None and tick_size:
+            spread_tight = (ask - bid) <= tick_size
+        mid_against = False
+        if mid is not None and tick_size and tp_price is not None:
+            mid_against = (tp_price - mid) >= tick_size
+        ws_bad = price_state.source == "WS" and self._entry_ws_bad(health_state.ws_connected)
+        http_fresh_ms = int(getattr(self._settings, "http_fresh_ms", 1000) or 0)
+        http_fresh = (
+            health_state.http_age_ms is not None
+            and health_state.http_age_ms <= http_fresh_ms
+        )
+        cross_reason = None
+        if elapsed_ms >= cross_after_ms:
+            cross_reason = "timeout"
+        elif mid_against:
+            cross_reason = "mid_away"
+        elif spread_tight:
+            cross_reason = "tight_spread"
+        elif ws_bad and http_fresh:
+            cross_reason = "ws_unstable_http"
+        desired_phase = "CROSS" if cross_reason else "MAKER"
         if desired_phase == "MAKER" and self._tp_exit_phase != "MAKER":
             self._logger("[TP_MAKER_ARMED]")
         if desired_phase == "CROSS" and self._tp_exit_phase != "CROSS":
-            elapsed_label = int((now - (self._tp_maker_started_ts or now)) * 1000.0)
-            self._logger(f"[TP_CROSS_ARMED] reason=timeout elapsed_ms={elapsed_label}")
+            elapsed_label = elapsed_ms
+            reason_label = cross_reason or "trigger"
+            self._logger(
+                f"[TP_CROSS_ARMED] reason={reason_label} elapsed_ms={elapsed_label}"
+            )
 
         active_sell_order = self._get_active_sell_order()
         if active_sell_order and not self._sell_order_is_final(active_sell_order):
@@ -1516,7 +1536,7 @@ class TradeExecutor:
             self._logger("[TRADE] close_position | SELL already active")
             self.last_action = "sell_active"
             return 0
-        if self._has_active_order("BUY"):
+        if self._has_active_order("BUY") and self._executed_qty_total <= self._epsilon_qty():
             if not self._cancel_entry_before_exit():
                 self._logger("[CANCEL_ENTRY_FAILED] action=flatten")
                 self._flatten_position("CANCEL_ENTRY_FAILED")
@@ -2383,73 +2403,29 @@ class TradeExecutor:
         tick_size = self._profile.tick_size
         now_ms = int(time.time() * 1000)
         last_ref_bid = self._entry_last_ref_bid
-        if last_ref_bid is None:
+        if last_ref_bid is None and bid is not None:
+            self._entry_last_ref_bid = bid
+            self._entry_last_ref_ts_ms = now_ms
             last_ref_bid = bid
         moved_ticks = 0
         ref_moved = False
-        if bid is not None:
+        if bid is not None and last_ref_bid is not None:
             moved_ticks = self._ticks_between(last_ref_bid, bid, tick_size)
             ref_moved = moved_ticks >= 1
         if self._entry_order_price is None:
             self._entry_order_price = current_price
-        cooldown_ms = max(
-            0, int(getattr(self._settings, "entry_reprice_cooldown_ms", 1200))
-        )
-        min_reprice_interval_ms = 250
-        require_stable = bool(
-            getattr(self._settings, "entry_reprice_require_stable_source", True)
-        )
-        stable_grace_ms = max(
-            0, int(getattr(self._settings, "entry_reprice_stable_source_grace_ms", 3000))
-        )
-        min_fresh_reads = max(
-            1,
-            int(
-                getattr(
-                    self._settings, "entry_reprice_min_consecutive_fresh_reads", 2
-                )
-            ),
-        )
-        if source == "HTTP":
-            require_stable = False
-            stable_grace_ms = 0
-            min_fresh_reads = 1
-        stable_ok = True
-        if require_stable and self._entry_last_ws_bad_ts is not None:
-            stable_ok = (now - self._entry_last_ws_bad_ts) * 1000.0 >= stable_grace_ms
-        if ws_bad and source == "WS":
-            self._entry_consecutive_fresh_reads = 0
-            reprice_reason = "ws_bad"
-            can_reprice = False
-        else:
-            self._entry_consecutive_fresh_reads += 1
-            reprice_reason = "ready"
-            can_reprice = True
-            if not stable_ok:
-                reprice_reason = "not_stable"
-                can_reprice = False
-            elif self._entry_consecutive_fresh_reads < min_fresh_reads:
-                reprice_reason = "not_enough_fresh"
-                can_reprice = False
-            elif not ref_moved:
-                reprice_reason = "ref_not_moved"
-                can_reprice = False
+        self._entry_consecutive_fresh_reads = 0
+        reprice_reason = "ref_moved" if ref_moved else "ref_not_moved"
+        can_reprice = ref_moved
         new_price = None
         if bid is not None:
             new_price = self._round_to_step(bid, tick_size)
         if can_reprice:
-            reprice_reason = "ref_moved"
             if new_price is None:
                 reprice_reason = "price_invalid"
                 can_reprice = False
             elif new_price == current_price:
                 reprice_reason = "already_at_best_bid"
-                can_reprice = False
-            elif (now - self._entry_reprice_last_ts) * 1000.0 < min_reprice_interval_ms:
-                reprice_reason = "min_interval"
-                can_reprice = False
-            elif (now - self._entry_reprice_last_ts) * 1000.0 < cooldown_ms:
-                reprice_reason = "cooldown"
                 can_reprice = False
         order_id = buy_order.get("orderId")
         order_price_label = f"{current_price:.8f}"
@@ -2474,13 +2450,15 @@ class TradeExecutor:
                     f"reason={reason_label} old_price={order_price_label} "
                     f"new_price={new_price_label} {entry_context}"
                 )
-            if bid is not None and (self._entry_last_ref_bid is None or ref_moved):
+            if (
+                bid is not None
+                and ref_moved
+                and new_price is not None
+                and new_price == current_price
+            ):
                 self._entry_last_ref_bid = bid
                 self._entry_last_ref_ts_ms = now_ms
             return
-        if bid is not None and (self._entry_last_ref_bid is None or ref_moved):
-            self._entry_last_ref_bid = bid
-            self._entry_last_ref_ts_ms = now_ms
         if not self._should_dedup_log("entry_reprice_do", 0.4):
             new_price_label = "?" if new_price is None else f"{new_price:.8f}"
             self._logger(
@@ -2580,6 +2558,7 @@ class TradeExecutor:
             f"price={new_price:.8f} id={buy_order.get('orderId')}"
         )
         self._entry_reprice_last_ts = now
+        self._entry_consecutive_fresh_reads = 0
         self._entry_order_price = new_price
         now_ms = int(time.time() * 1000)
         self.active_test_orders = [
@@ -2603,8 +2582,9 @@ class TradeExecutor:
         self.entry_active_order_id = buy_order.get("orderId")
         self.entry_active_price = new_price
         self.entry_cancel_pending = False
-        self._entry_last_ref_bid = bid
-        self._entry_last_ref_ts_ms = now_ms
+        if bid is not None:
+            self._entry_last_ref_bid = bid
+            self._entry_last_ref_ts_ms = now_ms
         self.orders_count = len(self.active_test_orders)
 
     def _maybe_handle_sell_reprice(self, open_orders: dict[int, dict]) -> None:
