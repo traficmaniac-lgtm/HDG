@@ -38,6 +38,8 @@ class PriceRouter:
         self._log_queue: list[str] = []
         self._last_source_log_ts = 0.0
         self._last_effective_source = "NONE"
+        self._last_summary_log_ts = 0.0
+        self._last_summary_payload: Optional[tuple[object, ...]] = None
 
     def update_ws(self, bid: float, ask: float) -> None:
         self._ws_bid = bid
@@ -337,8 +339,8 @@ class PriceRouter:
         if source != self._last_source:
             self._last_source = source
 
+        now = time.monotonic()
         if source != self._last_effective_source:
-            now = time.monotonic()
             if now - self._last_source_log_ts >= 5.0:
                 self._last_source_log_ts = now
                 ws_age_label = ws_age_ms if ws_age_ms is not None else "?"
@@ -354,6 +356,18 @@ class PriceRouter:
                     f"reason={self._last_switch_reason} ws_age={ws_age_label}"
                 )
             self._last_effective_source = source
+
+        if now - self._last_summary_log_ts >= 5.0:
+            self._last_summary_log_ts = now
+            ws_age_label = ws_age_ms if ws_age_ms is not None else "?"
+            http_age_label = http_age_ms if http_age_ms is not None else "?"
+            ws_state = "up" if self._ws_connected else "down"
+            self._log_queue.append(
+                "[DATA_SUMMARY] "
+                f"ws_state={ws_state} last_reason={self._last_switch_reason} "
+                f"ws_age_ms={ws_age_label} http_age_ms={http_age_label} "
+                f"effective_source={source}"
+            )
 
         price_state = PriceState(
             bid=bid,

@@ -47,7 +47,9 @@ class TradeExecutor:
         self._profile = profile
         self._logger = logger
         self.active_test_orders: list[dict] = []
-        self._client_tag = self._sanitize_client_order_id(self.TAG)
+        self._client_tag = self._sanitize_client_order_id(
+            f"HDG_{self._settings.symbol}"
+        )
         self.borrowed_assets: dict[str, float] = {}
         self.last_action = "idle"
         self.orders_count = 0
@@ -134,6 +136,11 @@ class TradeExecutor:
         self._last_entry_degraded_ts = 0.0
         self._last_entry_degraded_counts: Optional[tuple[int, int]] = None
         self._last_buy_partial_cum: dict[int, float] = {}
+        self._cycle_start_ts_ms: Optional[int] = None
+        self._last_progress_bid: Optional[float] = None
+        self._last_progress_ask: Optional[float] = None
+        self._entry_missing_since_ts: Optional[float] = None
+        self._data_blind_since_ts: Optional[float] = None
 
     def get_state_label(self) -> str:
         return self.state.value
@@ -238,6 +245,14 @@ class TradeExecutor:
     def _log_cycle_cleanup(self, cycle_id: Optional[int]) -> None:
         cycle_label = "—" if cycle_id is None else str(cycle_id)
         self._logger(f"[CYCLE_CLEANUP] id={cycle_label} ok")
+
+    def _mark_cycle_entry_start(self) -> None:
+        if self._cycle_start_ts_ms is None:
+            self._cycle_start_ts_ms = int(time.time() * 1000)
+
+    def _cycle_client_prefix(self, cycle_id: Optional[int]) -> str:
+        cycle_label = 0 if cycle_id is None else cycle_id
+        return f"{self._client_tag}_C{cycle_label}"
 
     @staticmethod
     def _extract_trade_id(order: Optional[dict]) -> Optional[object]:
@@ -677,11 +692,16 @@ class TradeExecutor:
         self._entry_last_ws_bad_ts = None
         self._processed_fill_keys = set()
         self._processed_fill_queue.clear()
+        self._last_progress_bid = None
+        self._last_progress_ask = None
+        self._data_blind_since_ts = None
         self.entry_active_order_id = None
         self.entry_active_price = None
         self.entry_cancel_pending = False
+        self._entry_missing_since_ts = None
         self._current_cycle_id = None
         self._cycle_started_ts = None
+        self._cycle_start_ts_ms = None
         self._log_cycle_cleanup(cycle_id)
 
     def set_margin_capabilities(
@@ -850,6 +870,7 @@ class TradeExecutor:
 
             is_isolated = "TRUE" if self._settings.margin_isolated else "FALSE"
             timestamp = int(time.time() * 1000)
+            self._mark_cycle_entry_start()
             buy_client_id = self._build_client_order_id("BUY", timestamp)
             order_type = self._normalize_order_type(self._settings.order_type)
             if order_type == "MARKET":
@@ -1095,6 +1116,9 @@ class TradeExecutor:
     ) -> None:
         if not skip_reconcile:
             self._reconcile_position_from_fills()
+        self._update_data_blind_state(price_state)
+        if not price_state.data_blind:
+            self._note_price_progress(price_state.bid, price_state.ask)
         remaining_qty = self._remaining_qty
         if remaining_qty <= self._epsilon_qty():
             return
@@ -1137,6 +1161,11 @@ class TradeExecutor:
                 desired_phase = "CROSS"
         else:
             self._tp_maker_started_ts = None
+        if desired_phase == "MAKER" and self._tp_exit_phase != "MAKER":
+            self._logger("[TP_MAKER_ARMED]")
+        if desired_phase == "CROSS" and self._tp_exit_phase != "CROSS":
+            elapsed_label = int((now - (self._tp_maker_started_ts or now)) * 1000.0)
+            self._logger(f"[TP_CROSS_ARMED] reason=timeout elapsed_ms={elapsed_label}")
 
         active_sell_order = self._get_active_sell_order()
         if active_sell_order and not self._sell_order_is_final(active_sell_order):
@@ -2116,6 +2145,7 @@ class TradeExecutor:
         Optional[int],
     ]:
         price_state, health_state = self._router.build_price_state()
+        self._update_data_blind_state(price_state)
         active_src = price_state.source
         ws_bad = False
         if active_src == "WS":
@@ -2211,6 +2241,33 @@ class TradeExecutor:
             health_state.ws_age_ms,
             health_state.http_age_ms,
         )
+
+    def _note_price_progress(self, bid: Optional[float], ask: Optional[float]) -> None:
+        if bid is None or ask is None:
+            self._mark_progress(reason="price_fresh", reset_reconcile=True)
+            return
+        tick_size = self._profile.tick_size
+        moved = False
+        if tick_size:
+            if self._last_progress_bid is None:
+                moved = True
+            else:
+                moved = self._ticks_between(self._last_progress_bid, bid, tick_size) >= 1
+            if not moved and self._last_progress_ask is not None:
+                moved = self._ticks_between(self._last_progress_ask, ask, tick_size) >= 1
+        else:
+            moved = True
+        self._last_progress_bid = bid
+        self._last_progress_ask = ask
+        self._mark_progress(reason="price_move" if moved else "price_fresh", reset_reconcile=True)
+
+    def _update_data_blind_state(self, price_state: PriceState) -> None:
+        now = time.monotonic()
+        if price_state.data_blind:
+            if self._data_blind_since_ts is None:
+                self._data_blind_since_ts = now
+        else:
+            self._data_blind_since_ts = None
 
     def _calculate_entry_price(self, bid: float) -> Optional[float]:
         if not self._profile.tick_size:
@@ -2313,6 +2370,7 @@ class TradeExecutor:
                 ws_bad=ws_bad,
             )
             return
+        self._note_price_progress(bid, ask)
         self._clear_price_wait("ENTRY")
         elapsed_ms = self._entry_attempt_elapsed_ms()
         if elapsed_ms is not None and not self._should_dedup_log("entry_wait", 2.0):
@@ -2352,6 +2410,10 @@ class TradeExecutor:
                 )
             ),
         )
+        if source == "HTTP":
+            require_stable = False
+            stable_grace_ms = 0
+            min_fresh_reads = 1
         stable_ok = True
         if require_stable and self._entry_last_ws_bad_ts is not None:
             stable_ok = (now - self._entry_last_ws_bad_ts) * 1000.0 >= stable_grace_ms
@@ -2494,6 +2556,7 @@ class TradeExecutor:
             return
         is_isolated = "TRUE" if self._settings.margin_isolated else "FALSE"
         timestamp = int(time.time() * 1000)
+        self._mark_cycle_entry_start()
         buy_client_id = self._build_client_order_id("BUY", timestamp)
         side_effect_type = self._normalize_side_effect_type(
             self._settings.side_effect_type
@@ -2647,8 +2710,55 @@ class TradeExecutor:
         no_progress_ms = self._no_progress_ms(now)
         max_state_ms = int(getattr(self._settings, "max_state_stuck_ms", 8000))
         max_progress_ms = int(getattr(self._settings, "max_no_progress_ms", 5000))
+        if self.state == TradeState.STATE_ENTRY_WORKING:
+            entry_stuck_ms = max(
+                max_state_ms,
+                max_progress_ms,
+                int(getattr(self._settings, "entry_stuck_ms", 15000)),
+            )
+            entry_order = self._get_active_entry_order()
+            entry_order_active = entry_order is not None and not self._entry_order_is_final(
+                entry_order
+            )
+            price_state, _ = self._router.build_price_state()
+            self._update_data_blind_state(price_state)
+            moved_ticks = 0
+            if (
+                entry_order_active
+                and price_state.bid is not None
+                and self.entry_active_price is not None
+                and self._profile.tick_size
+            ):
+                moved_ticks = self._ticks_between(
+                    self.entry_active_price, price_state.bid, self._profile.tick_size
+                )
+            if entry_order_active and not price_state.data_blind and moved_ticks == 0:
+                if no_progress_ms < entry_stuck_ms:
+                    return False
+            if self._entry_missing_since_ts is not None:
+                missing_ms = int((now - self._entry_missing_since_ts) * 1000.0)
+                if missing_ms >= 1000:
+                    self._logger(
+                        "[WD] "
+                        f"entry_missing_ms={missing_ms} state={self.state.value} -> RECONCILE"
+                    )
+                    return self._start_reconcile_from_watchdog(state_age_ms, no_progress_ms)
+            if self._data_blind_since_ts is not None:
+                blind_ms = int((now - self._data_blind_since_ts) * 1000.0)
+                data_blind_ms = int(getattr(self._settings, "data_blind_ms", 8000))
+                if blind_ms >= data_blind_ms and self.position is not None:
+                    self._logger(
+                        "[WD] "
+                        f"data_blind_ms={blind_ms} state={self.state.value} -> RECONCILE"
+                    )
+                    return self._start_reconcile_from_watchdog(state_age_ms, no_progress_ms)
+            if entry_order_active and no_progress_ms < entry_stuck_ms:
+                return False
         if state_age_ms < max_state_ms and no_progress_ms < max_progress_ms:
             return False
+        return self._start_reconcile_from_watchdog(state_age_ms, no_progress_ms)
+
+    def _start_reconcile_from_watchdog(self, state_age_ms: int, no_progress_ms: int) -> bool:
         self._logger(
             "[WD] "
             f"stuck state={self.state.value} age_ms={state_age_ms} "
@@ -2728,12 +2838,49 @@ class TradeExecutor:
         if not hasattr(self._rest, "get_margin_my_trades"):
             return []
         try:
-            return self._rest.get_margin_my_trades(self._settings.symbol, limit=50)
+            return self._rest.get_margin_my_trades(self._settings.symbol, limit=100)
         except httpx.HTTPStatusError as exc:
             self._log_binance_error("reconcile_trades", exc, {"symbol": self._settings.symbol})
         except Exception as exc:
             self._logger(f"[RECONCILE] trades error: {exc}")
         return []
+
+    def _filter_trades_for_cycle(
+        self,
+        trades: list[dict],
+        open_orders: list[dict],
+    ) -> list[dict]:
+        if self._cycle_start_ts_ms is None:
+            return []
+        cycle_id = self._current_cycle_id
+        cycle_prefix = self._cycle_client_prefix(cycle_id)
+        order_ids: set[int] = set()
+        for order in self.active_test_orders:
+            if self._get_cycle_id_for_order(order) != cycle_id:
+                continue
+            order_id = order.get("orderId")
+            if isinstance(order_id, int):
+                order_ids.add(order_id)
+        for order in open_orders:
+            client_order_id = str(order.get("clientOrderId") or "")
+            if client_order_id.startswith(cycle_prefix):
+                order_id = order.get("orderId")
+                if isinstance(order_id, int):
+                    order_ids.add(order_id)
+        min_ts = self._cycle_start_ts_ms - 2000
+        filtered: list[dict] = []
+        for trade in trades:
+            trade_time = trade.get("time") or trade.get("transactTime")
+            order_id = trade.get("orderId")
+            client_order_id = str(trade.get("clientOrderId") or "")
+            if isinstance(order_id, str) and order_id.isdigit():
+                order_id = int(order_id)
+            time_ok = isinstance(trade_time, (int, float)) and trade_time >= min_ts
+            id_ok = isinstance(order_id, int) and order_id in order_ids
+            client_ok = client_order_id.startswith(cycle_prefix)
+            if time_ok or id_ok or client_ok:
+                filtered.append(trade)
+        return filtered
 
     def collect_reconcile_snapshot(self) -> Optional[dict]:
         try:
@@ -2849,6 +2996,7 @@ class TradeExecutor:
                 return
             open_orders = snapshot.get("open_orders") or []
             trades = snapshot.get("trades") or []
+            trades = self._filter_trades_for_cycle(trades, open_orders)
             balance = snapshot.get("balance")
             self.sync_open_orders(open_orders)
             executed, closed, remaining, entry_avg = self._build_reconcile_state(
@@ -3051,6 +3199,20 @@ class TradeExecutor:
             if buy_order:
                 self.entry_active_order_id = buy_order.get("orderId")
                 self.entry_active_price = buy_order.get("price")
+        entry_order = self._get_active_entry_order()
+        if (
+            self.state == TradeState.STATE_ENTRY_WORKING
+            and entry_order is not None
+            and not self._entry_order_is_final(entry_order)
+        ):
+            entry_id = entry_order.get("orderId")
+            if entry_id not in open_map:
+                if self._entry_missing_since_ts is None:
+                    self._entry_missing_since_ts = time.monotonic()
+            else:
+                self._entry_missing_since_ts = None
+        else:
+            self._entry_missing_since_ts = None
         self._enter_tick(open_map)
         if self._maybe_handle_sell_watchdog(open_map):
             return
@@ -4341,10 +4503,11 @@ class TradeExecutor:
         return False
 
     def _build_client_order_id(self, side: str, timestamp: int) -> str:
-        raw = f"{self._client_tag}_{side}_{timestamp}"
+        cycle_id = self._current_cycle_id or 0
+        raw = f"{self._client_tag}_C{cycle_id}_{side}_{timestamp}"
         sanitized = self._sanitize_client_order_id(raw)
         if len(sanitized) > 36:
-            sanitized = sanitized[-36:]
+            sanitized = sanitized[:36]
         return sanitized
 
     @staticmethod
