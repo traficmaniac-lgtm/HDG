@@ -81,15 +81,35 @@ class TradeExecutor:
             getattr(settings, "cycle_count", 1)
         )
         self.cycles_done = 0
+        self.cycles_failed = 0
+        self.consecutive_failures = 0
+        self.run_enabled = False
+        self.session_active = False
         self.run_active = False
+        self.last_stop_reason: Optional[str] = None
+        self.last_error_code: Optional[int] = None
         self._next_cycle_ready_ts: Optional[float] = None
         self._cycle_cooldown_s = 0.3
+        self._recovery_cooldown_s = 1.5
+        self.max_consecutive_failures = 20
         self._exits_frozen = False
         self._entry_price_wait_started_ts: Optional[float] = None
         self._exit_price_wait_started_ts: Optional[float] = None
 
     def get_state_label(self) -> str:
         return self.state.value
+
+    def get_session_status(self) -> dict:
+        return {
+            "run_enabled": self.run_enabled,
+            "session_active": self.session_active,
+            "cycles_target": self.cycles_target,
+            "cycles_done": self.cycles_done,
+            "cycles_failed": self.cycles_failed,
+            "consecutive_failures": self.consecutive_failures,
+            "last_stop_reason": self.last_stop_reason,
+            "last_error_code": self.last_error_code,
+        }
 
     def _transition_state(self, next_state: TradeState) -> None:
         if self.state == next_state:
@@ -270,10 +290,18 @@ class TradeExecutor:
             if not buy_order:
                 self.last_action = "place_failed"
                 self._clear_entry_attempt()
-                self._transition_state(TradeState.STATE_ERROR)
-                self._handle_cycle_completion(reason="ERROR")
-                self._transition_state(TradeState.STATE_CLOSED)
-                self._transition_state(TradeState.STATE_IDLE)
+                if self._is_fatal_auth_error(
+                    self._last_place_error_code, None, None
+                ):
+                    self.last_error_code = self._last_place_error_code
+                    self._stop_session("FATAL_AUTH")
+                    return 0
+                self._handle_cycle_completion(
+                    reason="ERROR",
+                    cooldown_s=self._recovery_cooldown_s,
+                    success=False,
+                )
+                self._recover_from_error("ENTRY_PLACE_FAILED", self._last_place_error_code)
                 self.orders_count = 0
                 return 0
             self._logger(
@@ -310,14 +338,23 @@ class TradeExecutor:
             self._inflight_trade_action = False
 
     def start_cycle_run(self) -> int:
+        self.run_enabled = True
+        self.session_active = True
         self.run_active = True
         self.cycles_done = 0
+        self.cycles_failed = 0
+        self.consecutive_failures = 0
+        self.last_stop_reason = None
+        self.last_error_code = None
         self.cycles_target = self._normalize_cycle_target(self._settings.cycle_count)
         self._next_cycle_ready_ts = None
-        return self._attempt_cycle_start()
+        placed = self._attempt_cycle_start()
+        if not placed:
+            self._next_cycle_ready_ts = time.monotonic() + self._cycle_cooldown_s
+        return placed
 
     def stop_run_by_user(self, reason: str = "user") -> None:
-        self.run_active = False
+        self._stop_session("USER_STOP")
         self._next_cycle_ready_ts = None
         cancel_wait = self._cancel_open_orders_wait(timeout_s=2.0)
         self._clear_entry_attempt()
@@ -339,9 +376,9 @@ class TradeExecutor:
         self._logger(f"[CYCLE_STOPPED_BY_USER] reason={reason}")
 
     def process_cycle_flow(self) -> int:
-        if not self.run_active:
+        if not self.run_enabled or not self.session_active:
             return 0
-        if self.cycles_done >= self.cycles_target:
+        if not self._should_continue_session():
             return 0
         if self._next_cycle_ready_ts is None:
             return 0
@@ -366,32 +403,103 @@ class TradeExecutor:
             )
         return placed
 
-    def _handle_cycle_completion(self, reason: str, critical: bool = False) -> None:
-        if not self.run_active:
+    def _handle_cycle_completion(
+        self,
+        reason: str,
+        critical: bool = False,
+        cooldown_s: Optional[float] = None,
+        success: Optional[bool] = None,
+    ) -> None:
+        if not self.session_active:
             return
+        reason_upper = str(reason or "").upper()
         self.cycles_done += 1
+        is_success = success if success is not None else self._is_cycle_success(reason_upper)
+        if is_success:
+            self.consecutive_failures = 0
+        else:
+            self.cycles_failed += 1
+            self.consecutive_failures += 1
         pnl_label = "—" if self.pnl_cycle is None else f"{self.pnl_cycle:.8f}"
         self._logger(
             f"[CYCLE_DONE] idx={self.cycles_done} pnl={pnl_label} reason={reason}"
         )
-        if critical:
-            self.run_active = False
-            self._next_cycle_ready_ts = None
-            self._logger(
-                f"[CYCLE_STOP] done={self.cycles_done} target={self.cycles_target}"
-            )
+        if self.consecutive_failures >= self.max_consecutive_failures:
+            self._stop_session("TOO_MANY_FAILURES")
             return
-        if self.run_active and self.cycles_done < self.cycles_target:
-            self._next_cycle_ready_ts = time.monotonic() + self._cycle_cooldown_s
+        if critical:
+            self._stop_session("FATAL_EXCEPTION")
+            return
+        if not self._should_continue_session():
+            self._stop_session("CYCLES_DONE")
+            return
+        if self.run_enabled and self.session_active:
+            delay = cooldown_s if cooldown_s is not None else self._cycle_cooldown_s
+            self._next_cycle_ready_ts = time.monotonic() + delay
             self._logger(
                 f"[CYCLE_NEXT] done={self.cycles_done} target={self.cycles_target}"
             )
-        else:
-            self.run_active = False
-            self._next_cycle_ready_ts = None
-            self._logger(
-                f"[CYCLE_STOP] done={self.cycles_done} target={self.cycles_target}"
-            )
+
+    def _should_continue_session(self) -> bool:
+        if not self.run_enabled or not self.session_active:
+            return False
+        if self.cycles_target == 0:
+            return True
+        return self.cycles_done < self.cycles_target
+
+    @staticmethod
+    def _is_cycle_success(reason_upper: str) -> bool:
+        return reason_upper in {"TP", "SL", "MANUAL"}
+
+    def _stop_session(self, reason: str) -> None:
+        self.run_enabled = False
+        self.session_active = False
+        self.run_active = False
+        self.last_stop_reason = reason
+        self._next_cycle_ready_ts = None
+        last_error = self.last_error_code
+        self._logger(
+            "[SESSION_STOPPED] "
+            f"reason={reason} cycles_done={self.cycles_done} "
+            f"failed={self.cycles_failed} last_error={last_error}"
+        )
+
+    def _reset_cycle_runtime(self) -> None:
+        self._clear_entry_attempt()
+        self._reset_buy_retry()
+        self._reset_sell_retry()
+        self._reset_exit_intent()
+        self.sell_active_order_id = None
+        self.sell_cancel_pending = False
+        self.sell_place_inflight = False
+        self.sell_retry_pending = False
+        self._pending_sell_retry_reason = None
+        self._exits_frozen = False
+        self._entry_price_wait_started_ts = None
+        self._exit_price_wait_started_ts = None
+
+    def _recover_from_error(self, reason: str, error_code: Optional[int] = None) -> None:
+        self.last_error_code = error_code
+        code_label = "—" if error_code is None else str(error_code)
+        self._logger(f"[RECOVER] reason={reason} code={code_label}")
+        self.cancel_test_orders_margin(reason="recover")
+        self._reset_cycle_runtime()
+        self._transition_state(TradeState.STATE_ERROR)
+        self._transition_state(TradeState.STATE_IDLE)
+
+    @staticmethod
+    def _is_fatal_auth_error(
+        code: Optional[int], status: Optional[int], msg: Optional[str]
+    ) -> bool:
+        if code in {-2015, -2014}:
+            return True
+        if status in {401, 403}:
+            return True
+        if msg:
+            lowered = msg.lower()
+            if "permission" in lowered or "disabled" in lowered or "not authorized" in lowered:
+                return True
+        return False
 
     def close_position(self) -> int:
         if self._inflight_trade_action:
@@ -529,7 +637,7 @@ class TradeExecutor:
             return False
         self._logger(f"[PRICE_WAIT_TIMEOUT] stage=ENTRY waited_ms={elapsed_ms}")
         self._clear_price_wait("ENTRY")
-        self.abort_cycle()
+        self.abort_cycle_with_reason(reason="PRICE_WAIT_TIMEOUT")
         return True
 
     def _maybe_abort_entry_total_timeout(self) -> bool:
@@ -762,10 +870,18 @@ class TradeExecutor:
                     return self._handle_sell_insufficient_balance(reason)
                 self._logger("[ORDER] SELL rejected")
                 self.last_action = "place_failed"
-                self._transition_state(TradeState.STATE_ERROR)
-                self._handle_cycle_completion(reason="ERROR", critical=True)
-                self._transition_state(TradeState.STATE_CLOSED)
-                self._transition_state(TradeState.STATE_IDLE)
+                if self._is_fatal_auth_error(
+                    self._last_place_error_code, None, None
+                ):
+                    self.last_error_code = self._last_place_error_code
+                    self._stop_session("FATAL_AUTH")
+                    return 0
+                self._handle_cycle_completion(
+                    reason="ERROR",
+                    cooldown_s=self._recovery_cooldown_s,
+                    success=False,
+                )
+                self._recover_from_error("SELL_PLACE_FAILED", self._last_place_error_code)
                 return 0
             price_label = (
                 f"{mid:.8f}" if sell_price is None else f"{sell_price:.8f}"
@@ -2001,6 +2117,16 @@ class TradeExecutor:
         self._finalize_sell_cancel(order_id)
         self._schedule_sell_retry(reason)
 
+    def handle_unhandled_exception(self, context: str = "engine") -> None:
+        self.last_action = "exception"
+        self._handle_cycle_completion(
+            reason="EXCEPTION",
+            cooldown_s=self._recovery_cooldown_s,
+            success=False,
+        )
+        if self.session_active:
+            self._recover_from_error(f"UNCAUGHT_{context.upper()}")
+
     def _retry_sell_after_cancel(self, sell_order: dict) -> None:
         max_retries = int(self._settings.max_sell_retries)
         if self._sell_retry_count >= max_retries:
@@ -2239,6 +2365,8 @@ class TradeExecutor:
             pass
         if exc.request and exc.request.url:
             path = exc.request.url.path
+        status_code = status if isinstance(status, int) else None
+        self.last_error_code = code if code is not None else status_code
         if action == "borrow" and (status == 401 or code == -1002):
             key = f"{action}:{code or status}:{path}"
             if self._should_dedup_log(key, 10.0):
@@ -2251,6 +2379,12 @@ class TradeExecutor:
                 "[AUTH] invalid api key format (-2014). "
                 "Check API settings in меню -> Настройки API."
             )
+            if self._is_fatal_auth_error(code, status_code, msg):
+                self._stop_session("FATAL_AUTH")
+            return
+        if self._is_fatal_auth_error(code, status_code, msg):
+            self._logger("[AUTH] fatal authorization error; stopping session.")
+            self._stop_session("FATAL_AUTH")
             return
         self._logger(
             f"[BINANCE_ERROR] action={action} http={status} code={code} msg={msg} path={path}"
@@ -2425,4 +2559,6 @@ class TradeExecutor:
             parsed = int(value)
         except (TypeError, ValueError):
             return 1
+        if parsed == 0:
+            return 0
         return max(1, min(1000, parsed))

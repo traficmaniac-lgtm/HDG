@@ -7,6 +7,7 @@ from typing import Optional
 
 from datetime import datetime
 import time
+import traceback
 
 import httpx
 from PySide6.QtCore import Qt, QTimer, Slot
@@ -523,46 +524,80 @@ class MainWindow(QMainWindow):
             self._append_log(f"HTTP ticker error: {exc}")
 
     def _refresh_ui(self) -> None:
-        if not self._router:
-            return
-        price_state, health_state = self._router.build_price_state()
-        self._last_mid = price_state.mid
-        for log_message in self._router.consume_logs():
-            self._append_log(log_message)
+        try:
+            if not self._router:
+                return
+            price_state, health_state = self._router.build_price_state()
+            self._last_mid = price_state.mid
+            for log_message in self._router.consume_logs():
+                self._append_log(log_message)
 
-        self.mid_label.setText(f"Mid: {self._fmt_price(price_state.mid)}")
-        self.bid_label.setText(f"Bid: {self._fmt_price(price_state.bid)}")
-        self.ask_label.setText(f"Ask: {self._fmt_price(price_state.ask)}")
-        last_action = "—"
-        orders_count = "—"
-        state_label = "—"
-        if self._trade_executor:
-            last_action = self._trade_executor.last_action
-            orders_count = str(self._trade_executor.orders_count)
-            state_label = self._trade_executor.get_state_label()
-        margin_auth = "OK" if self._margin_api_access else "FAIL"
-        borrow_status = "—"
-        if self._borrow_allowed_by_api is not None:
-            borrow_status = "OK" if self._borrow_allowed_by_api else "FAIL"
-        self.summary_label.setText(
-            f"{self._settings.symbol if self._settings else 'EURIUSDT'} | "
-            f"SRC: {price_state.source} | "
-            f"MARGIN_AUTH: {margin_auth} | BORROW: {borrow_status} | "
-            f"state: {state_label} | last_action: {last_action} | orders: {orders_count}"
-        )
-        self.ws_connected_label.setText(f"ws_connected: {health_state.ws_connected}")
-        self.ws_age_label.setText(f"ws_age_ms: {self._fmt_int(health_state.ws_age_ms)}")
-        self.http_age_label.setText(
-            f"http_age_ms: {self._fmt_int(health_state.http_age_ms)}"
-        )
-        self.switch_reason_label.setText(
-            f"last_switch_reason: {health_state.last_switch_reason or '—'}"
-        )
-        self._log_data_blind_state(price_state, state_label)
-        self._update_exit_status(price_state.mid)
-        self._update_trading_controls(price_state)
-        if self._trade_executor and self._trade_executor.process_cycle_flow():
-            self._refresh_orders()
+            self.mid_label.setText(f"Mid: {self._fmt_price(price_state.mid)}")
+            self.bid_label.setText(f"Bid: {self._fmt_price(price_state.bid)}")
+            self.ask_label.setText(f"Ask: {self._fmt_price(price_state.ask)}")
+            last_action = "—"
+            orders_count = "—"
+            state_label = "—"
+            session_label = "STOPPED"
+            cycles_label = "—"
+            stop_reason = "—"
+            last_error = "—"
+            cycles_failed = "—"
+            failure_streak = "—"
+            cycles_done = "—"
+            if self._trade_executor:
+                last_action = self._trade_executor.last_action
+                orders_count = str(self._trade_executor.orders_count)
+                state_label = self._trade_executor.get_state_label()
+                session = self._trade_executor.get_session_status()
+                is_running = session["run_enabled"] and session["session_active"]
+                session_label = "RUNNING" if is_running else "STOPPED"
+                target = session["cycles_target"]
+                cycles_label = "∞" if target == 0 else str(target)
+                stop_reason = session["last_stop_reason"] or "—"
+                last_error = session["last_error_code"] or "—"
+                cycles_failed = str(session["cycles_failed"])
+                failure_streak = str(session["consecutive_failures"])
+                cycles_done = str(session["cycles_done"])
+            margin_auth = "OK" if self._margin_api_access else "FAIL"
+            borrow_status = "—"
+            if self._borrow_allowed_by_api is not None:
+                borrow_status = "OK" if self._borrow_allowed_by_api else "FAIL"
+            self.summary_label.setText(
+                f"{self._settings.symbol if self._settings else 'EURIUSDT'} | "
+                f"SRC: {price_state.source} | "
+                f"MARGIN_AUTH: {margin_auth} | BORROW: {borrow_status} | "
+                f"state: {state_label} | last_action: {last_action} | orders: {orders_count} | "
+                f"session: {session_label} | cycles: {cycles_done}/{cycles_label} "
+                f"failed: {cycles_failed} streak: {failure_streak} "
+                f"stop: {stop_reason} last_error: {last_error}"
+            )
+            if stop_reason in {"FATAL_AUTH", "TOO_MANY_FAILURES", "FATAL_EXCEPTION"}:
+                self.summary_label.setStyleSheet("font-weight: 600; color: #ff5f57;")
+            else:
+                self.summary_label.setStyleSheet("font-weight: 600;")
+            self.ws_connected_label.setText(
+                f"ws_connected: {health_state.ws_connected}"
+            )
+            self.ws_age_label.setText(
+                f"ws_age_ms: {self._fmt_int(health_state.ws_age_ms)}"
+            )
+            self.http_age_label.setText(
+                f"http_age_ms: {self._fmt_int(health_state.http_age_ms)}"
+            )
+            self.switch_reason_label.setText(
+                f"last_switch_reason: {health_state.last_switch_reason or '—'}"
+            )
+            self._log_data_blind_state(price_state, state_label)
+            self._update_exit_status(price_state.mid)
+            self._update_trading_controls(price_state)
+            if self._trade_executor and self._trade_executor.process_cycle_flow():
+                self._refresh_orders()
+        except Exception as exc:
+            self._append_log(f"[EXCEPTION] {exc}")
+            self._append_log(traceback.format_exc())
+            if self._trade_executor:
+                self._trade_executor.handle_unhandled_exception("ui_tick")
 
     def _update_status(self, connected: bool) -> None:
         if connected:
@@ -585,8 +620,15 @@ class MainWindow(QMainWindow):
             and self._has_valid_api_credentials(self._api_credentials)
         )
         state_label = self._trade_executor.get_state_label() if self._trade_executor else "—"
+        session_running = False
+        if self._trade_executor:
+            session = self._trade_executor.get_session_status()
+            session_running = session["run_enabled"] and session["session_active"]
         self.start_button.setEnabled(
-            can_trade and self._margin_api_access and state_label == "IDLE"
+            can_trade
+            and self._margin_api_access
+            and state_label == "IDLE"
+            and not session_running
         )
         self.close_button.setEnabled(can_trade and state_label == "POSITION_OPEN")
         self.stop_button.setEnabled(can_trade)
@@ -793,7 +835,7 @@ class MainWindow(QMainWindow):
                 payload.get("max_wait_sell_ms", 15000), 1000, 120000, 15000
             ),
             allow_force_close=bool(payload.get("allow_force_close", False)),
-            cycle_count=self._bounded_int(payload.get("cycle_count", 1), 1, 1000, 1),
+            cycle_count=self._bounded_int(payload.get("cycle_count", 1), 0, 1000, 1),
             order_quote=order_quote,
             max_budget=max_budget,
             budget_reserve=budget_reserve,

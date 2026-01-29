@@ -84,9 +84,10 @@ class TradeSettingsDialog(QDialog):
         basic_form.addRow("Резерв (USDT)", self.budget_reserve_input)
 
         self.cycle_count_input = QSpinBox()
-        self.cycle_count_input.setRange(1, 1000)
+        self.cycle_count_input.setRange(0, 1000)
+        self.cycle_count_input.setSpecialValueText("∞")
         self.cycle_count_input.setValue(
-            int(getattr(settings, "cycle_count", 1) or 1) if settings else 1
+            int(getattr(settings, "cycle_count", 1) or 0) if settings else 1
         )
         basic_form.addRow("Кол-во циклов", self.cycle_count_input)
 
