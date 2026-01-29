@@ -974,7 +974,12 @@ class MainWindow(QMainWindow):
             ws_stale_grace_ms=self._bounded_int(
                 payload.get("ws_stale_grace_ms", 3000), 0, 60000, 3000
             ),
-            mid_fresh_ms=self._bounded_int(payload.get("mid_fresh_ms", 800), 200, 5000, 800),
+            entry_max_age_ms=self._bounded_int(
+                payload.get("entry_max_age_ms", 800), 200, 5000, 800
+            ),
+            exit_max_age_ms=self._bounded_int(
+                payload.get("exit_max_age_ms", 2500), 500, 10000, 2500
+            ),
             max_wait_price_ms=self._bounded_int(
                 payload.get("max_wait_price_ms", 5000), 1000, 30000, 5000
             ),
@@ -1136,7 +1141,8 @@ class MainWindow(QMainWindow):
         cycle_count: int,
         take_profit_ticks: int,
         stop_loss_ticks: int,
-        mid_fresh_ms: int,
+        entry_max_age_ms: int,
+        exit_max_age_ms: int,
         http_fresh_ms: int,
         allow_borrow: bool,
         auto_exit_enabled: bool,
@@ -1148,8 +1154,11 @@ class MainWindow(QMainWindow):
             self._settings.cycle_count = cycle_count
             self._settings.take_profit_ticks = take_profit_ticks
             self._settings.stop_loss_ticks = stop_loss_ticks
-            self._settings.mid_fresh_ms = self._bounded_int(
-                mid_fresh_ms, 200, 5000, 800
+            self._settings.entry_max_age_ms = self._bounded_int(
+                entry_max_age_ms, 200, 5000, 800
+            )
+            self._settings.exit_max_age_ms = self._bounded_int(
+                exit_max_age_ms, 500, 10000, 2500
             )
             self._settings.http_fresh_ms = self._bounded_int(
                 http_fresh_ms, 200, 10000, 1500

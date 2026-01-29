@@ -98,6 +98,9 @@ class TradeExecutor:
         self._next_cycle_ready_ts: Optional[float] = None
         self._cycle_cooldown_s = 0.3
         self._exits_frozen = False
+        self.entry_active_order_id: Optional[int] = None
+        self.entry_active_price: Optional[float] = None
+        self.entry_cancel_pending = False
         self._entry_price_wait_started_ts: Optional[float] = None
         self._exit_price_wait_started_ts: Optional[float] = None
 
@@ -221,6 +224,9 @@ class TradeExecutor:
         self._entry_last_seen_bid = None
         self._entry_last_ws_bad_ts = None
         self._processed_fill_keys = set()
+        self.entry_active_order_id = None
+        self.entry_active_price = None
+        self.entry_cancel_pending = False
         self._current_cycle_id = None
         self._log_cycle_cleanup(cycle_id)
 
@@ -245,6 +251,14 @@ class TradeExecutor:
                     f"[TRADE] START ignored: state={self.state.value}"
                 )
                 self.last_action = "state_blocked"
+                return 0
+            if not self._purge_open_orders_before_cycle():
+                self._logger("[PRECHECK] open_orders_not_cleared -> SAFE_STOP")
+                self.abort_cycle_with_reason(reason="OPEN_ORDERS_PRESENT", critical=True)
+                return 0
+            if self._has_active_order("SELL") or self.sell_active_order_id is not None:
+                self._logger("[ERROR] active SELL detected during PLACE_BUY -> SAFE_STOP")
+                self.abort_cycle_with_reason(reason="ACTIVE_SELL_ON_BUY", critical=True)
                 return 0
             if self._has_active_order("BUY") or self.position is not None:
                 self._logger("[TRADE] place_test_orders | BUY already active")
@@ -451,6 +465,9 @@ class TradeExecutor:
                     "cycle_id": self._current_cycle_id,
                 }
             ]
+            self.entry_active_order_id = buy_order.get("orderId")
+            self.entry_active_price = buy_price
+            self.entry_cancel_pending = False
             self._entry_last_ref_bid = bid
             self._entry_last_ref_ts_ms = now_ms
             self._entry_order_price = buy_price
@@ -514,6 +531,11 @@ class TradeExecutor:
     def _attempt_cycle_start(self) -> int:
         if self.state != TradeState.STATE_IDLE:
             return 0
+        if not self._purge_open_orders_before_cycle():
+            self._logger("[PRECHECK] open_orders_not_cleared -> SAFE_STOP")
+            self._transition_state(TradeState.STATE_ERROR)
+            self.abort_cycle_with_reason(reason="OPEN_ORDERS_PRESENT", critical=True)
+            return 0
         cycle_index = self.cycles_done + 1
         pending_cycle_id = self._cycle_id_counter + 1
         self._current_cycle_id = pending_cycle_id
@@ -576,9 +598,14 @@ class TradeExecutor:
             return
         price_state, health_state = self._router.build_price_state()
         mid = price_state.mid
-        mid_fresh_ms = int(self._settings.mid_fresh_ms)
+        exit_max_age_ms = int(getattr(self._settings, "exit_max_age_ms", 2500))
         mid_age_ms = price_state.mid_age_ms
-        if price_state.data_blind or mid_age_ms is None or mid_age_ms > mid_fresh_ms:
+        exit_allowed = (
+            price_state.source != "NONE"
+            and mid_age_ms is not None
+            and mid_age_ms <= exit_max_age_ms
+        )
+        if not exit_allowed:
             if not self._exits_frozen:
                 ws_age_label = health_state.ws_age_ms if health_state.ws_age_ms is not None else "?"
                 http_age_label = (
@@ -645,8 +672,14 @@ class TradeExecutor:
             f"exit_allowed:{exit_source}", 1.0
         ):
             age_label = exit_age_ms if exit_age_ms is not None else "?"
+            ws_age_label = health_state.ws_age_ms if health_state.ws_age_ms is not None else "?"
+            http_age_label = (
+                health_state.http_age_ms if health_state.http_age_ms is not None else "?"
+            )
             self._logger(
-                f"[EXIT_ALLOWED] src={exit_source} age={age_label}"
+                "[EXIT_ALLOWED] "
+                f"src={exit_source} age={age_label} "
+                f"ws_age={ws_age_label} http_age={http_age_label}"
             )
         self._place_sell_order(
             reason=self.exit_intent,
@@ -760,6 +793,10 @@ class TradeExecutor:
             self._logger("[SELL_SKIP_DUPLICATE] reason=active_sell")
             self._logger("[TRADE] close_position | SELL already active")
             self.last_action = "sell_active"
+            return 0
+        if self._has_active_order("BUY"):
+            self._logger("[ERROR] active BUY detected during PLACE_SELL -> SAFE_STOP")
+            self.abort_cycle_with_reason(reason="ACTIVE_BUY_ON_SELL", critical=True)
             return 0
         now = time.monotonic()
         if (
@@ -1286,7 +1323,8 @@ class TradeExecutor:
                 health_state.ws_age_ms,
                 health_state.http_age_ms,
             )
-        if age_ms > int(self._settings.mid_fresh_ms):
+        entry_max_age_ms = int(getattr(self._settings, "entry_max_age_ms", 800))
+        if age_ms > entry_max_age_ms:
             return (
                 False,
                 bid,
@@ -1349,9 +1387,16 @@ class TradeExecutor:
     def _handle_entry_follow_top(self, open_orders: dict[int, dict]) -> None:
         if self.state != TradeState.STATE_WAIT_BUY:
             return
-        buy_order = self._find_order("BUY")
+        buy_order = self._get_active_entry_order()
         if not buy_order or buy_order.get("status") == "FILLED":
             return
+        if self.entry_cancel_pending:
+            self._maybe_confirm_entry_cancel(buy_order, open_orders)
+            if self.entry_cancel_pending:
+                return
+            status_label = str(buy_order.get("status") or "").upper()
+            if status_label in {"FILLED", "PARTIALLY_FILLED"}:
+                return
         if self._buy_wait_started_ts is None:
             self._start_buy_wait()
         (
@@ -1534,16 +1579,62 @@ class TradeExecutor:
                 f"reason={reason_label} old_price={order_price_label} "
                 f"new_price={new_price_label} {entry_context}"
             )
-        if order_id and order_id in open_orders:
-            is_isolated = "TRUE" if self._settings.margin_isolated else "FALSE"
-            cancelled = self._cancel_margin_order(
-                symbol=self._settings.symbol,
-                order_id=order_id,
-                is_isolated=is_isolated,
-                tag=buy_order.get("tag", self.TAG),
-            )
-            if not cancelled:
-                return
+        if order_id:
+            status_label = str(buy_order.get("status") or "").upper()
+            if status_label not in {"FILLED", "PARTIALLY_FILLED"}:
+                is_isolated = "TRUE" if self._settings.margin_isolated else "FALSE"
+                cancel_result = False
+                final_status = "UNKNOWN"
+                if order_id in open_orders:
+                    cancel_result = self._cancel_margin_order(
+                        symbol=self._settings.symbol,
+                        order_id=order_id,
+                        is_isolated=is_isolated,
+                        tag=buy_order.get("tag", self.TAG),
+                    )
+                live_order = self._get_margin_order_snapshot(order_id)
+                if live_order:
+                    final_status = str(live_order.get("status") or "").upper()
+                self._logger(
+                    "[ENTRY_REPRICE_CANCEL] "
+                    f"old_id={order_id} new_price={new_price:.8f} "
+                    f"cancel_result={cancel_result} final_status_old={final_status}"
+                )
+                if final_status in {"FILLED", "PARTIALLY_FILLED"}:
+                    self._logger(
+                        "[ENTRY_REPRICE_ABORT] "
+                        f"old_id={order_id} status={final_status}"
+                    )
+                    if live_order:
+                        executed_qty = float(
+                            live_order.get("executedQty", 0.0)
+                            or live_order.get("executedQuantity", 0.0)
+                            or 0.0
+                        )
+                        cum_quote = float(
+                            live_order.get("cummulativeQuoteQty", 0.0) or 0.0
+                        )
+                        avg_price = 0.0
+                        if executed_qty > 0 and cum_quote > 0:
+                            avg_price = cum_quote / executed_qty
+                        if final_status == "FILLED" and executed_qty > 0:
+                            buy_order["qty"] = executed_qty
+                            buy_order["price"] = avg_price or buy_order.get("price")
+                            buy_order["status"] = "FILLED"
+                            self._apply_order_filled(buy_order)
+                        elif final_status == "PARTIALLY_FILLED" and executed_qty > 0:
+                            self._apply_entry_partial_fill(
+                                order_id, executed_qty, avg_price or None
+                            )
+                    self.entry_cancel_pending = False
+                    return
+                if final_status in {"CANCELED", "REJECTED", "EXPIRED"}:
+                    self.entry_cancel_pending = False
+                elif not cancel_result:
+                    return
+                else:
+                    self.entry_cancel_pending = True
+                    return
         self.active_test_orders = [
             entry for entry in self.active_test_orders if entry.get("orderId") != order_id
         ]
@@ -1599,6 +1690,9 @@ class TradeExecutor:
                 "cycle_id": self._current_cycle_id,
             }
         ]
+        self.entry_active_order_id = buy_order.get("orderId")
+        self.entry_active_price = new_price
+        self.entry_cancel_pending = False
         self._entry_last_ref_bid = bid
         self._entry_last_ref_ts_ms = now_ms
         self.orders_count = len(self.active_test_orders)
@@ -1815,7 +1909,9 @@ class TradeExecutor:
             TradeState.STATE_PLACE_SELL,
         }:
             return False
-        snapshot = self._router.get_mid_snapshot(int(self._settings.mid_fresh_ms))
+        snapshot = self._router.get_mid_snapshot(
+            int(getattr(self._settings, "exit_max_age_ms", 2500))
+        )
         ok, mid, age_ms, source, status = snapshot
         if not ok:
             self._start_price_wait("EXIT")
@@ -1920,6 +2016,11 @@ class TradeExecutor:
             sell_order = self._find_order("SELL")
             if sell_order:
                 self.sell_active_order_id = sell_order.get("orderId")
+        if self.entry_active_order_id is None:
+            buy_order = self._find_order("BUY")
+            if buy_order:
+                self.entry_active_order_id = buy_order.get("orderId")
+                self.entry_active_price = buy_order.get("price")
         self._handle_entry_follow_top(open_map)
         if self._maybe_handle_sell_watchdog(open_map):
             return
@@ -2082,6 +2183,10 @@ class TradeExecutor:
         if side == "BUY":
             self._reset_buy_retry()
             self._clear_entry_attempt()
+            if self.entry_active_order_id == order_id:
+                self.entry_active_order_id = None
+                self.entry_active_price = None
+                self.entry_cancel_pending = False
             if self.position is None:
                 self._transition_state(TradeState.STATE_IDLE)
         elif side == "SELL":
@@ -2117,6 +2222,10 @@ class TradeExecutor:
                 self._log_cycle_fill(cycle_id, "BUY", delta, qty)
             self._reset_buy_retry()
             self._clear_entry_attempt()
+            if self.entry_active_order_id == order_id:
+                self.entry_active_order_id = None
+                self.entry_active_price = None
+                self.entry_cancel_pending = False
             if self.position is None:
                 self.position = {
                     "buy_price": order.get("price"),
@@ -2558,6 +2667,92 @@ class TradeExecutor:
             None,
         )
 
+    def _get_active_entry_order(self) -> Optional[dict]:
+        if self.entry_active_order_id is None:
+            return self._find_order("BUY")
+        return next(
+            (
+                entry
+                for entry in self.active_test_orders
+                if entry.get("orderId") == self.entry_active_order_id
+            ),
+            None,
+        )
+
+    @staticmethod
+    def _entry_order_is_final(order: dict) -> bool:
+        status = str(order.get("status") or "").upper()
+        return status in {"FILLED", "CANCELED", "REJECTED", "EXPIRED"}
+
+    def _handle_entry_cancel_confirmed(
+        self, buy_order: dict, order_id: Optional[int], status: str
+    ) -> None:
+        self.entry_cancel_pending = False
+        if order_id is None:
+            return
+        buy_order["status"] = status
+        self.active_test_orders = [
+            entry for entry in self.active_test_orders if entry.get("orderId") != order_id
+        ]
+        self.orders_count = len(self.active_test_orders)
+        if self.entry_active_order_id == order_id:
+            self.entry_active_order_id = None
+            self.entry_active_price = None
+        if status in {"CANCELED", "REJECTED", "EXPIRED"}:
+            self._reset_buy_retry()
+            self._clear_entry_attempt()
+        self._logger(f"[ENTRY_CANCEL_CONFIRMED] id={order_id} status={status}")
+
+    def _maybe_confirm_entry_cancel(
+        self, buy_order: dict, open_orders: dict[int, dict]
+    ) -> None:
+        order_id = buy_order.get("orderId")
+        if order_id is None:
+            self.entry_cancel_pending = False
+            return
+        live_order = self._get_margin_order_snapshot(order_id)
+        status = str(buy_order.get("status") or "").upper()
+        if live_order:
+            status = str(live_order.get("status") or status or "").upper()
+        if status in {"FILLED", "PARTIALLY_FILLED"}:
+            executed_qty = 0.0
+            cum_quote = 0.0
+            if live_order:
+                executed_qty = float(
+                    live_order.get("executedQty", 0.0)
+                    or live_order.get("executedQuantity", 0.0)
+                    or 0.0
+                )
+                cum_quote = float(live_order.get("cummulativeQuoteQty", 0.0) or 0.0)
+            avg_price = 0.0
+            if executed_qty > 0 and cum_quote > 0:
+                avg_price = cum_quote / executed_qty
+            elif live_order:
+                avg_price = float(
+                    live_order.get("avgPrice", 0.0)
+                    or live_order.get("price", 0.0)
+                    or 0.0
+                )
+            self.entry_cancel_pending = False
+            self._logger(
+                "[ENTRY_CANCEL_ABORT] "
+                f"id={order_id} status={status} executed={executed_qty:.8f}"
+            )
+            if status == "FILLED" and executed_qty > 0:
+                buy_order["qty"] = executed_qty
+                buy_order["price"] = avg_price if avg_price > 0 else buy_order.get("price")
+                buy_order["status"] = "FILLED"
+                self._apply_order_filled(buy_order)
+            elif status == "PARTIALLY_FILLED" and executed_qty > 0:
+                self._apply_entry_partial_fill(order_id, executed_qty, avg_price or None)
+            return
+        if status in {"CANCELED", "REJECTED", "EXPIRED"} or order_id not in open_orders:
+            final_status = status if status else "CANCELED"
+            self._handle_entry_cancel_confirmed(buy_order, order_id, final_status)
+            return
+        if not self._should_dedup_log(f"entry_cancel_wait:{order_id}", 2.0):
+            self._logger(f"[ENTRY_CANCEL_WAIT] id={order_id}")
+
     @staticmethod
     def _sell_order_is_final(order: dict) -> bool:
         status = str(order.get("status") or "").upper()
@@ -2692,6 +2887,42 @@ class TradeExecutor:
         self._cleanup_cycle_state(cycle_id)
         return cancelled
 
+    def _purge_open_orders_before_cycle(self) -> bool:
+        try:
+            open_orders = self._rest.get_margin_open_orders(self._settings.symbol)
+        except httpx.HTTPStatusError as exc:
+            self._log_binance_error("openOrders", exc, {"symbol": self._settings.symbol})
+            return False
+        except Exception as exc:
+            self._logger(f"[TRADE] openOrders error: {exc} tag={self.TAG}")
+            return False
+        if not open_orders:
+            return True
+        self._logger(
+            f"[PRECHECK] open_orders_detected count={len(open_orders)} action=cancel_all"
+        )
+        is_isolated = "TRUE" if self._settings.margin_isolated else "FALSE"
+        for order in open_orders:
+            order_id = order.get("orderId")
+            if not order_id:
+                continue
+            self._cancel_margin_order(
+                symbol=self._settings.symbol,
+                order_id=order_id,
+                is_isolated=is_isolated,
+                tag=self.TAG,
+            )
+        try:
+            remaining = self._rest.get_margin_open_orders(self._settings.symbol)
+        except Exception:
+            return False
+        if remaining:
+            self._logger(
+                f"[PRECHECK] open_orders_remaining count={len(remaining)}"
+            )
+            return False
+        return True
+
     def _cancel_open_orders_wait(self, timeout_s: float) -> float:
         start = time.monotonic()
         self.cancel_test_orders_margin(reason="stopped")
@@ -2737,6 +2968,9 @@ class TradeExecutor:
         self._reset_buy_retry()
         self._reset_sell_retry()
         self._reset_exit_intent()
+        self.entry_active_order_id = None
+        self.entry_active_price = None
+        self.entry_cancel_pending = False
         self.sell_active_order_id = None
         self.sell_cancel_pending = False
         self.sell_place_inflight = False

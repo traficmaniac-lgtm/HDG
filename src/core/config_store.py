@@ -63,8 +63,8 @@ class ConfigStore:
 
     @staticmethod
     def _log_removed_keys(removed_keys: list[str]) -> None:
-        if removed_keys:
-            print(f"[CFG_MIGRATE] removed_keys={removed_keys}")
+        for key in removed_keys:
+            print(f"[MIGRATE_DROP] key={key}")
 
     def load_settings(self) -> dict:
         try:

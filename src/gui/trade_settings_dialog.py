@@ -28,6 +28,7 @@ class TradeSettingsDialog(QDialog):
         int,
         int,
         int,
+        int,
         bool,
         bool,
     )
@@ -40,7 +41,7 @@ class TradeSettingsDialog(QDialog):
         self._settings = settings
         self.setWindowTitle("Параметры торговли")
         self.setMinimumWidth(360)
-        self.setFixedHeight(360)
+        self.setFixedHeight(400)
 
         layout = QVBoxLayout(self)
         tabs = QTabWidget()
@@ -116,13 +117,21 @@ class TradeSettingsDialog(QDialog):
         advanced_form = QFormLayout(advanced_tab)
         advanced_form.setVerticalSpacing(8)
 
-        self.mid_fresh_input = QSpinBox()
-        self.mid_fresh_input.setRange(200, 5000)
-        self.mid_fresh_input.setSingleStep(50)
-        self.mid_fresh_input.setValue(
-            int(getattr(settings, "mid_fresh_ms", 800) or 800) if settings else 800
+        self.entry_max_age_input = QSpinBox()
+        self.entry_max_age_input.setRange(200, 5000)
+        self.entry_max_age_input.setSingleStep(50)
+        self.entry_max_age_input.setValue(
+            int(getattr(settings, "entry_max_age_ms", 800) or 800) if settings else 800
         )
-        advanced_form.addRow("Fresh mid (ms)", self.mid_fresh_input)
+        advanced_form.addRow("Entry max age (ms)", self.entry_max_age_input)
+
+        self.exit_max_age_input = QSpinBox()
+        self.exit_max_age_input.setRange(500, 10000)
+        self.exit_max_age_input.setSingleStep(100)
+        self.exit_max_age_input.setValue(
+            int(getattr(settings, "exit_max_age_ms", 2500) or 2500) if settings else 2500
+        )
+        advanced_form.addRow("Exit max age (ms)", self.exit_max_age_input)
 
         self.http_fresh_input = QSpinBox()
         self.http_fresh_input.setRange(200, 10000)
@@ -157,7 +166,8 @@ class TradeSettingsDialog(QDialog):
         payload["take_profit_ticks"] = int(self.take_profit_input.value())
         payload["stop_loss_ticks"] = int(self.stop_loss_input.value())
         payload["cycle_count"] = int(self.cycle_count_input.value())
-        payload["mid_fresh_ms"] = int(self.mid_fresh_input.value())
+        payload["entry_max_age_ms"] = int(self.entry_max_age_input.value())
+        payload["exit_max_age_ms"] = int(self.exit_max_age_input.value())
         payload["http_fresh_ms"] = int(self.http_fresh_input.value())
         payload["allow_borrow"] = bool(self.allow_borrow_input.isChecked())
         payload["auto_exit_enabled"] = bool(self.auto_exit_input.isChecked())
@@ -170,7 +180,8 @@ class TradeSettingsDialog(QDialog):
             int(self.cycle_count_input.value()),
             int(self.take_profit_input.value()),
             int(self.stop_loss_input.value()),
-            int(self.mid_fresh_input.value()),
+            int(self.entry_max_age_input.value()),
+            int(self.exit_max_age_input.value()),
             int(self.http_fresh_input.value()),
             bool(self.allow_borrow_input.isChecked()),
             bool(self.auto_exit_input.isChecked()),
