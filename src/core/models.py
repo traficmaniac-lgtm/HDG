@@ -26,6 +26,10 @@ class Settings:
     repricing_cooldown_ms: int
     max_wait_price_ms: int
     price_wait_log_every_ms: int
+    tp_cross_after_ms: int
+    inflight_deadline_ms: int
+    sell_refresh_grace_ms: int
+    epsilon_qty: float
     position_guard_http: bool
     entry_mode: str
     account_mode: str

@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import re
 import time
+from collections import deque
 from decimal import Decimal, ROUND_FLOOR
 from enum import Enum
 from typing import Callable, Optional
@@ -29,6 +30,7 @@ class TradeState(Enum):
 class TradeExecutor:
     TAG = "PRE_V0_8_0"
     PRICE_MOVE_TICK_THRESHOLD = 1
+    MAX_FILL_KEYS = 50_000
 
     def __init__(
         self,
@@ -89,7 +91,8 @@ class TradeExecutor:
         self.state = TradeState.STATE_IDLE
         self._cycle_id_counter = 0
         self._current_cycle_id: Optional[int] = None
-        self._processed_fill_keys: set[tuple[int, str, float, float]] = set()
+        self._processed_fill_keys: set[tuple[object, ...]] = set()
+        self._processed_fill_queue: deque[tuple[object, ...]] = deque()
         self.wins = 0
         self.losses = 0
         self.cycles_target = self._normalize_cycle_target(
@@ -110,6 +113,16 @@ class TradeExecutor:
         self._recovery_residual_qty = 0.0
         self._recovery_active = False
         self._recovery_last_check_ts: Optional[float] = None
+        self._executed_qty_total = 0.0
+        self._entry_avg_price: Optional[float] = None
+        self._closed_qty_total = 0.0
+        self._remaining_qty = 0.0
+        self._last_pos_snapshot: Optional[tuple[float, float, float, Optional[float]]] = None
+        self._tp_maker_started_ts: Optional[float] = None
+        self._sell_last_seen_ts: Optional[float] = None
+        self._entry_inflight_deadline_ts: Optional[float] = None
+        self._sell_inflight_deadline_ts: Optional[float] = None
+        self._cycle_started_ts: Optional[float] = None
 
     def get_state_label(self) -> str:
         return self.state.value
@@ -162,6 +175,7 @@ class TradeExecutor:
         return self._current_cycle_id
 
     def _log_cycle_start(self, cycle_id: int) -> None:
+        self._cycle_started_ts = time.monotonic()
         self._logger(f"[CYCLE_START] id={cycle_id}")
 
     def _log_cycle_fill(self, cycle_id: Optional[int], side: str, delta: float, cum: float) -> None:
@@ -192,16 +206,27 @@ class TradeExecutor:
         cycle_label = "—" if cycle_id is None else str(cycle_id)
         self._logger(f"[CYCLE_CLEANUP] id={cycle_label} ok")
 
+    @staticmethod
+    def _extract_trade_id(order: Optional[dict]) -> Optional[object]:
+        if not order:
+            return None
+        for key in ("tradeId", "trade_id", "fillId", "fill_id"):
+            if order.get(key) is not None:
+                return order.get(key)
+        return None
+
     def _fill_event_key(
         self,
         order_id: Optional[int],
         side: str,
         cum_qty: float,
-        avg_price: float,
-    ) -> Optional[tuple[int, str, float, float]]:
+        trade_id: Optional[object] = None,
+    ) -> Optional[tuple[object, ...]]:
+        if trade_id is not None:
+            return ("trade", trade_id)
         if order_id is None:
             return None
-        return (int(order_id), side, float(cum_qty), float(avg_price))
+        return (int(order_id), side, float(cum_qty))
 
     def _should_process_fill(
         self,
@@ -210,8 +235,9 @@ class TradeExecutor:
         cum_qty: float,
         avg_price: float,
         cycle_id: Optional[int],
+        trade_id: Optional[object] = None,
     ) -> bool:
-        key = self._fill_event_key(order_id, side, cum_qty, avg_price)
+        key = self._fill_event_key(order_id, side, cum_qty, trade_id)
         if key is None:
             return True
         if key in self._processed_fill_keys:
@@ -223,6 +249,10 @@ class TradeExecutor:
             )
             return False
         self._processed_fill_keys.add(key)
+        self._processed_fill_queue.append(key)
+        if len(self._processed_fill_queue) > self.MAX_FILL_KEYS:
+            expired = self._processed_fill_queue.popleft()
+            self._processed_fill_keys.discard(expired)
         return True
 
     def _entry_plan_qty(self) -> float:
@@ -246,13 +276,13 @@ class TradeExecutor:
         if not sell_order:
             return 0.0
         reason = str(sell_order.get("reason") or "").upper()
-        if reason in {"TP", "TP_MAKER", "TP_FORCE"}:
+        if reason in {"TP", "TP_MAKER", "TP_FORCE", "TP_CROSS"}:
             return float(sell_order.get("qty") or 0.0)
         return 0.0
 
     def _log_trade_snapshot(self, reason: str, sl_mode: Optional[str] = None) -> None:
         pos_qty = self._resolve_remaining_qty_raw()
-        executed_qty = float(self.position_qty_base or 0.0)
+        executed_qty = float(self._executed_qty_total or self.position_qty_base or 0.0)
         entry_open_qty = self._entry_open_qty()
         plan_qty = self._entry_plan_qty()
         balance = self._get_base_balance_snapshot()
@@ -267,6 +297,117 @@ class TradeExecutor:
             f"base_free={base_free:.8f} base_locked={base_locked:.8f} "
             f"tp_order_qty={tp_order_qty:.8f} sl_mode={sl_label} reason={reason}"
         )
+
+    def _epsilon_qty(self) -> float:
+        return float(getattr(self._settings, "epsilon_qty", 1e-6) or 1e-6)
+
+    def _log_position_state(
+        self,
+        executed_qty: float,
+        closed_qty: float,
+        remaining_qty: float,
+        entry_avg: Optional[float],
+    ) -> None:
+        snapshot = (executed_qty, closed_qty, remaining_qty, entry_avg)
+        if self._last_pos_snapshot == snapshot:
+            return
+        tp_price, sl_price = self._compute_tp_sl_prices(entry_avg)
+        avg_label = "—" if entry_avg is None else f"{entry_avg:.8f}"
+        tp_label = "—" if tp_price is None else f"{tp_price:.8f}"
+        sl_label = "—" if sl_price is None else f"{sl_price:.8f}"
+        self._logger(
+            "[POS] "
+            f"executed={executed_qty:.8f} closed={closed_qty:.8f} "
+            f"remaining={remaining_qty:.8f} avg={avg_label} "
+            f"tp={tp_label} sl={sl_label}"
+        )
+        self._last_pos_snapshot = snapshot
+
+    def _reconcile_position_from_fills(self) -> None:
+        executed = 0.0
+        closed = 0.0
+        entry_notional = 0.0
+        for order in self.active_test_orders:
+            side = str(order.get("side") or "").upper()
+            cum_qty = float(order.get("cum_qty") or 0.0)
+            if cum_qty <= 0:
+                continue
+            if side == "BUY":
+                executed += cum_qty
+                avg_price = float(order.get("avg_fill_price") or 0.0)
+                if avg_price <= 0:
+                    avg_price = float(order.get("price") or 0.0)
+                if avg_price > 0:
+                    entry_notional += avg_price * cum_qty
+            elif side == "SELL":
+                closed += cum_qty
+
+        entry_avg = None
+        if executed > 0 and entry_notional > 0:
+            entry_avg = entry_notional / executed
+        elif executed > 0:
+            entry_avg = self._entry_avg_price or self.get_buy_price()
+        remaining_override = None
+        if executed == 0 and self.position is not None:
+            executed = float(self.position.get("initial_qty") or self.position.get("qty") or 0.0)
+            entry_avg = self.position.get("buy_price") or self._entry_avg_price or self.get_buy_price()
+            remaining_override = float(self.position.get("qty") or executed)
+            closed = max(executed - remaining_override, 0.0)
+
+        remaining = max(executed - closed, 0.0)
+        if remaining_override is not None:
+            remaining = max(remaining_override, 0.0)
+        self._executed_qty_total = executed
+        self._closed_qty_total = closed
+        self._remaining_qty = remaining
+        self._aggregate_sold_qty = closed
+        if entry_avg is not None:
+            self._entry_avg_price = entry_avg
+            self._last_buy_price = entry_avg
+
+        if executed > self._epsilon_qty():
+            now_ms = int(time.time() * 1000)
+            if self.position is None:
+                self.position = {
+                    "buy_price": entry_avg,
+                    "qty": remaining,
+                    "opened_ts": now_ms,
+                    "partial": True,
+                    "initial_qty": executed,
+                }
+            else:
+                if entry_avg is not None:
+                    self.position["buy_price"] = entry_avg
+                self.position["qty"] = remaining
+                if not self.position.get("opened_ts"):
+                    self.position["opened_ts"] = now_ms
+                self.position["initial_qty"] = executed
+
+        if executed > 0:
+            base_qty = executed
+            if self._profile.step_size:
+                base_qty = self._round_down(base_qty, self._profile.step_size)
+            self.position_qty_base = base_qty
+
+        self._log_position_state(executed, closed, remaining, entry_avg)
+
+    def _compute_tp_sl_prices(
+        self, entry_avg: Optional[float] = None
+    ) -> tuple[Optional[float], Optional[float]]:
+        if entry_avg is None:
+            entry_avg = self._entry_avg_price
+        tick_size = self._profile.tick_size
+        if entry_avg is None or tick_size is None or tick_size <= 0:
+            return None, None
+        tp_ticks = int(self._settings.take_profit_ticks)
+        sl_ticks = int(self._settings.stop_loss_ticks)
+        tp_price = None
+        sl_price = None
+        if tp_ticks > 0:
+            tp_price = self._round_to_step(entry_avg + (tp_ticks * tick_size), tick_size)
+        if sl_ticks > 0:
+            sl_price = self._round_to_step(entry_avg - (sl_ticks * tick_size), tick_size)
+        return tp_price, sl_price
 
     def _tp_trigger_price(
         self,
@@ -393,7 +534,13 @@ class TradeExecutor:
         self, required_qty: float, base_free: float, base_locked: float
     ) -> tuple[float, float, int]:
         attempts = 0
-        grace_ms = int(getattr(self._settings, "settlement_grace_ms", 400))
+        grace_ms = int(
+            getattr(
+                self._settings,
+                "sell_refresh_grace_ms",
+                getattr(self._settings, "settlement_grace_ms", 400),
+            )
+        )
         grace_s = max(0.05, grace_ms / 1000.0)
         for delay_s in (grace_s * 0.5, grace_s * 0.75, grace_s):
             if base_free + base_locked >= required_qty:
@@ -496,10 +643,12 @@ class TradeExecutor:
         self._entry_last_seen_bid = None
         self._entry_last_ws_bad_ts = None
         self._processed_fill_keys = set()
+        self._processed_fill_queue.clear()
         self.entry_active_order_id = None
         self.entry_active_price = None
         self.entry_cancel_pending = False
         self._current_cycle_id = None
+        self._cycle_started_ts = None
         self._log_cycle_cleanup(cycle_id)
 
     def set_margin_capabilities(
@@ -512,6 +661,8 @@ class TradeExecutor:
             self.last_action = "inflight"
             return 0
         self._inflight_trade_action = True
+        inflight_ms = int(getattr(self._settings, "inflight_deadline_ms", 2500))
+        self._entry_inflight_deadline_ts = time.monotonic() + (inflight_ms / 1000.0)
         cycle_pending = False
         buy_placed = False
         if self._current_cycle_id is None:
@@ -753,6 +904,7 @@ class TradeExecutor:
             if cycle_pending and not buy_placed:
                 self._current_cycle_id = None
             self._inflight_trade_action = False
+            self._entry_inflight_deadline_ts = None
 
     def start_cycle_run(self) -> int:
         self.run_active = True
@@ -861,7 +1013,12 @@ class TradeExecutor:
             self._set_exit_intent("MANUAL_CLOSE", mid=None)
         return self._place_sell_order(reason="manual", exit_intent=self.exit_intent)
 
-    def evaluate_exit_conditions(self) -> None:
+    def _enter_tick(self, open_orders: Optional[dict[int, dict]] = None) -> None:
+        if open_orders is None:
+            return
+        self._handle_entry_follow_top(open_orders)
+
+    def _exit_tick(self) -> None:
         if self.position is None:
             return
         if self.state not in {
@@ -872,114 +1029,145 @@ class TradeExecutor:
             return
         if not self._settings.auto_exit_enabled:
             return
-        if self._recovery_active:
-            self._attempt_recovery_sell()
+        self._watchdog_inflight()
         price_state, health_state = self._router.build_price_state()
-        mid = price_state.mid
+        self._ensure_exit_orders(price_state, health_state)
+
+    def _ensure_exit_orders(
+        self,
+        price_state: PriceState,
+        health_state: HealthState,
+        allow_replace: bool = True,
+    ) -> None:
+        self._reconcile_position_from_fills()
+        remaining_qty = self._remaining_qty
+        if remaining_qty <= self._epsilon_qty():
+            return
+        entry_avg = self._entry_avg_price or self.get_buy_price()
+        tp_price, sl_price = self._compute_tp_sl_prices(entry_avg)
         bid = price_state.bid
         ask = price_state.ask
-        exit_max_age_ms = int(getattr(self._settings, "exit_max_age_ms", 2500))
-        mid_age_ms = price_state.mid_age_ms
-        ws_lost = price_state.source == "WS" and not health_state.ws_connected
-        stale = (
-            price_state.source == "NONE"
-            or mid_age_ms is None
-            or mid_age_ms > exit_max_age_ms
-        )
-        if price_state.data_blind or ws_lost or stale:
-            self._log_trade_snapshot(reason="panic_exit", sl_mode="PANIC")
-            self._panic_exit(
-                reason="DATA_BLIND" if price_state.data_blind else "STALE_DATA",
-                bid=bid,
-                ask=ask,
-            )
-            return
-        exit_source = price_state.source
-        exit_age_ms = mid_age_ms
-        if not self._profile.tick_size:
-            return
-        buy_price = self.get_buy_price()
-        if buy_price is None:
-            return
-        tick_size = self._profile.tick_size
-        take_profit_ticks = int(self._settings.take_profit_ticks)
-        stop_loss_ticks = int(self._settings.stop_loss_ticks)
-        position_side = "LONG"
-        if self.position is not None:
-            position_side = str(self.position.get("side", "LONG") or "LONG").upper()
-        tp_price = self._tp_trigger_price(
-            buy_price, tick_size, take_profit_ticks, position_side
-        )
-        sl_price = self._sl_trigger_price(
-            buy_price, tick_size, stop_loss_ticks, position_side
-        )
-        mid_ref = mid
-        if mid_ref is None:
-            mid_ref = ask if position_side != "SHORT" else bid
-        if position_side == "SHORT":
-            tp_ready = tp_price is not None and mid_ref is not None and mid_ref <= tp_price
-            sl_ready = sl_price is not None and mid_ref is not None and mid_ref >= sl_price
-        else:
-            tp_ready = tp_price is not None and mid_ref is not None and mid_ref >= tp_price
-            sl_ready = sl_price is not None and mid_ref is not None and mid_ref <= sl_price
-        self._log_trade_snapshot(reason="exit_eval", sl_mode="SL" if sl_ready else "—")
-        if not self._should_dedup_log("exit_eval", 0.5):
-            bid_label = "—" if bid is None else f"{bid:.8f}"
-            ask_label = "—" if ask is None else f"{ask:.8f}"
-            mid_label = "—" if mid is None else f"{mid:.8f}"
-            entry_label = "—" if buy_price is None else f"{buy_price:.8f}"
-            tp_label = "—" if tp_price is None else f"{tp_price:.8f}"
-            sl_label = "—" if sl_price is None else f"{sl_price:.8f}"
-            self._logger(
-                "[EXIT_CHECK] "
-                f"side={position_side} bid={bid_label} ask={ask_label} mid={mid_label} "
-                f"entry={entry_label} tp_price={tp_label} sl_price={sl_label} "
-                f"TP_ready={tp_ready} SL_ready={sl_ready}"
-            )
-        if sl_ready:
-            self._set_exit_intent("SL", mid=mid, ticks=stop_loss_ticks, force=True)
-            self._override_to_sl(bid=bid, ask=ask)
-            return
-        if self.exit_intent is None and take_profit_ticks > 0:
-            self._set_exit_intent("TP", mid=mid, ticks=take_profit_ticks)
-        if tp_ready and self.exit_intent == "TP":
-            tp_max_age_ms = int(getattr(self._settings, "tp_max_age_ms", 400))
-            tp_age_ms = self._tp_order_age_ms()
-            if tp_age_ms is None or tp_age_ms > tp_max_age_ms:
-                self._force_tp_exit(bid=bid, ask=ask)
-                return
+        mid = price_state.mid
         if self.exit_intent is None:
-            return
-        if self.sell_place_inflight or self.sell_cancel_pending or self.sell_active_order_id:
-            if self.sell_place_inflight:
-                reason = "sell_inflight"
-            elif self.sell_cancel_pending:
-                reason = "cancel_pending"
-            else:
-                reason = "active_sell"
-            if not self._should_dedup_log(f"exit_suppressed:{reason}", 2.0):
-                self._logger(f"[EXIT_SUPPRESSED] reason={reason}")
-            return
-        if self._has_active_order("SELL"):
-            return
-        if not self._should_dedup_log(
-            f"exit_allowed:{exit_source}", 1.0
-        ):
-            age_label = exit_age_ms if exit_age_ms is not None else "?"
-            ws_age_label = health_state.ws_age_ms if health_state.ws_age_ms is not None else "?"
-            http_age_label = (
-                health_state.http_age_ms if health_state.http_age_ms is not None else "?"
-            )
+            self._set_exit_intent("TP", mid=mid, ticks=int(self._settings.take_profit_ticks))
+
+        if sl_price is not None and bid is not None and bid <= sl_price:
             self._logger(
-                "[EXIT_ALLOWED] "
-                f"src={exit_source} age={age_label} "
-                f"ws_age={ws_age_label} http_age={http_age_label}"
+                "[SELL_PLAN] "
+                f"phase=SL reason=SL qty={remaining_qty:.8f} price={sl_price:.8f} "
+                f"bid={bid:.8f} ask={ask if ask is not None else '—'} mid={mid if mid is not None else '—'}"
             )
-        self._place_sell_order(
-            reason=self._exit_order_reason(self.exit_intent),
-            mid_override=mid,
-            exit_intent=self.exit_intent,
+            self._cancel_active_sell(reason="SL")
+            self._set_exit_intent("SL", mid=mid, ticks=int(self._settings.stop_loss_ticks), force=True)
+            self._place_sell_order(
+                reason="SL_HARD",
+                price_override=bid if bid is not None else ask,
+                exit_intent="SL",
+                ref_bid=bid,
+                ref_ask=ask,
+            )
+            return
+
+        if tp_price is None:
+            return
+
+        now = time.monotonic()
+        cross_after_ms = int(getattr(self._settings, "tp_cross_after_ms", 900))
+        desired_phase = "MAKER"
+        if bid is not None and bid >= tp_price:
+            if self._tp_maker_started_ts is None:
+                self._tp_maker_started_ts = now
+            elapsed_ms = (now - self._tp_maker_started_ts) * 1000.0
+            if elapsed_ms >= cross_after_ms:
+                desired_phase = "CROSS"
+        else:
+            self._tp_maker_started_ts = None
+
+        active_sell_order = self._get_active_sell_order()
+        if active_sell_order and not self._sell_order_is_final(active_sell_order):
+            self._sell_last_seen_ts = now
+        else:
+            if self._sell_last_seen_ts is None:
+                self._sell_last_seen_ts = now
+
+        qty_to_sell = remaining_qty
+        if self._profile.step_size:
+            qty_to_sell = self._round_down(remaining_qty, self._profile.step_size)
+        if qty_to_sell <= 0:
+            return
+
+        if active_sell_order and not self._sell_order_is_final(active_sell_order):
+            existing_qty = float(active_sell_order.get("qty") or 0.0)
+            existing_price = float(active_sell_order.get("price") or 0.0)
+            reason = str(active_sell_order.get("reason") or "").upper()
+            replace_needed = False
+            if not math.isclose(
+                existing_qty, qty_to_sell, rel_tol=0.0, abs_tol=self._epsilon_qty()
+            ):
+                replace_needed = True
+            if desired_phase == "MAKER" and tp_price is not None and existing_price:
+                if not math.isclose(
+                    existing_price, tp_price, rel_tol=0.0, abs_tol=self._profile.tick_size or 0.0
+                ):
+                    replace_needed = True
+            if desired_phase == "CROSS" and reason != "TP_CROSS":
+                replace_needed = True
+            if (
+                replace_needed
+                and allow_replace
+                and not self.sell_cancel_pending
+                and not self.sell_place_inflight
+            ):
+                order_id = active_sell_order.get("orderId")
+                if order_id:
+                    self._logger(
+                        "[SELL_PLAN] "
+                        f"phase=CANCEL reason=TP qty={qty_to_sell:.8f} "
+                        f"price={tp_price:.8f} bid={bid if bid is not None else '—'} "
+                        f"ask={ask if ask is not None else '—'} mid={mid if mid is not None else '—'}"
+                    )
+                    self._cancel_margin_order(
+                        symbol=self._settings.symbol,
+                        order_id=order_id,
+                        is_isolated="TRUE" if self._settings.margin_isolated else "FALSE",
+                        tag=active_sell_order.get("tag", self.TAG),
+                    )
+                    self.sell_cancel_pending = True
+                    return
+            return
+
+        heartbeat_ms = int(getattr(self._settings, "sell_refresh_grace_ms", 400))
+        no_sell_elapsed_ms = (now - (self._sell_last_seen_ts or now)) * 1000.0
+        if no_sell_elapsed_ms < heartbeat_ms and self.sell_cancel_pending:
+            return
+        if self.sell_place_inflight or self.sell_cancel_pending:
+            return
+
+        exit_reason = "TP_MAKER" if desired_phase == "MAKER" else "TP_CROSS"
+        self._tp_exit_phase = desired_phase
+        if desired_phase == "CROSS":
+            price_override = bid if bid is not None else tp_price
+        else:
+            price_override = tp_price
+        self._sell_last_seen_ts = now
+        self._logger(
+            "[SELL_PLAN] "
+            f"phase={desired_phase} reason=TP qty={qty_to_sell:.8f} "
+            f"price={price_override:.8f} bid={bid if bid is not None else '—'} "
+            f"ask={ask if ask is not None else '—'} mid={mid if mid is not None else '—'}"
         )
+        self._place_sell_order(
+            reason=exit_reason,
+            price_override=price_override,
+            exit_intent="TP",
+            qty_override=qty_to_sell,
+            ref_bid=bid,
+            ref_ask=ask,
+            tick_size=self._profile.tick_size,
+        )
+
+    def evaluate_exit_conditions(self) -> None:
+        self._exit_tick()
 
     def _start_price_wait(self, stage: str) -> None:
         now = time.monotonic()
@@ -1267,12 +1455,18 @@ class TradeExecutor:
         self.sell_place_inflight = True
         self.sell_last_attempt_ts = now
         self._inflight_trade_action = True
+        inflight_ms = int(getattr(self._settings, "inflight_deadline_ms", 2500))
+        self._sell_inflight_deadline_ts = now + (inflight_ms / 1000.0)
         try:
             price_state, health_state = self._router.build_price_state()
             mid = mid_override if mid_override is not None else price_state.mid
             bid = ref_bid if ref_bid is not None else price_state.bid
             ask = ref_ask if ref_ask is not None else price_state.ask
             intent = self._normalize_exit_intent(exit_intent or self.exit_intent or reason)
+            if intent == "TP" and price_override is None:
+                tp_price, _ = self._compute_tp_sl_prices()
+                if tp_price is not None:
+                    price_override = tp_price
             if intent == "TP" and self._tp_exit_phase is None:
                 self._tp_exit_phase = "MAKER"
             if self._exit_started_ts is None and intent in {"TP", "SL", "MANUAL"}:
@@ -1352,6 +1546,12 @@ class TradeExecutor:
                     return 0
                 total_available = base_free + base_locked
                 if total_available < qty_to_sell:
+                    if not self._should_dedup_log("balance_mismatch", 1.0):
+                        self._logger(
+                            "[BALANCE_MISMATCH] "
+                            f"remaining={qty_to_sell:.8f} available={total_available:.8f} "
+                            f"free={base_free:.8f} locked={base_locked:.8f}"
+                        )
                     base_free, base_locked, attempts = self._settlement_balance_retry(
                         required_qty=qty_to_sell,
                         base_free=base_free,
@@ -1359,6 +1559,12 @@ class TradeExecutor:
                     )
                     total_available = base_free + base_locked
                     if total_available < qty_to_sell:
+                        if not self._should_dedup_log("balance_mismatch_retry", 1.0):
+                            self._logger(
+                                "[BALANCE_MISMATCH] "
+                                f"after_retry remaining={qty_to_sell:.8f} "
+                                f"available={total_available:.8f} attempts={attempts}"
+                            )
                         safety_epsilon = self._get_step_size_tolerance()
                         available_qty = max(0.0, total_available - safety_epsilon)
                         if self._profile.step_size:
@@ -1478,7 +1684,7 @@ class TradeExecutor:
                 f"http_age={http_age_label} ws_bad={ws_bad}"
             )
             self._transition_state(self._exit_state_for_intent(intent))
-            if reason_upper in {"TP", "TP_MAKER", "TP_FORCE"}:
+            if reason_upper in {"TP", "TP_MAKER", "TP_FORCE", "TP_CROSS"}:
                 self.last_action = "placing_sell_tp"
             else:
                 self.last_action = "placing_sell"
@@ -1528,7 +1734,7 @@ class TradeExecutor:
             price_label = (
                 f"{mid:.8f}" if sell_price is None else f"{sell_price:.8f}"
             )
-            if reason_upper in {"TP", "TP_MAKER", "TP_FORCE", "SL", "SL_HARD"}:
+            if reason_upper in {"TP", "TP_MAKER", "TP_FORCE", "TP_CROSS", "SL", "SL_HARD"}:
                 self._logger(
                     "[ORDER] SELL placed "
                     f"cycle_id={cycle_label} reason={reason_upper} type={order_type} "
@@ -1571,6 +1777,7 @@ class TradeExecutor:
         finally:
             self._inflight_trade_action = False
             self.sell_place_inflight = False
+            self._sell_inflight_deadline_ts = None
 
     def _place_emergency_market_sell(self, qty: float, force: bool = False) -> int:
         active_sell_order = self._get_active_sell_order()
@@ -1585,6 +1792,8 @@ class TradeExecutor:
             return 0
         self.sell_place_inflight = True
         self.sell_last_attempt_ts = time.monotonic()
+        inflight_ms = int(getattr(self._settings, "inflight_deadline_ms", 2500))
+        self._sell_inflight_deadline_ts = time.monotonic() + (inflight_ms / 1000.0)
         try:
             self._transition_state(self._exit_state_for_intent(self.exit_intent))
             self.last_action = "placing_sell"
@@ -1675,6 +1884,7 @@ class TradeExecutor:
             return 1
         finally:
             self.sell_place_inflight = False
+            self._sell_inflight_deadline_ts = None
 
     def _reset_sell_retry(self) -> None:
         self._sell_wait_started_ts = None
@@ -2255,146 +2465,9 @@ class TradeExecutor:
         intent = self._normalize_exit_intent(self.exit_intent or sell_reason)
         if intent != "TP":
             return
-        price_state, _ = self._router.build_price_state()
-        if price_state.data_blind:
-            self._logger(
-                "[REPRICE_SKIP reason=data_blind] "
-                f"exit_intent={intent} ref_old=— ref_new=— tick_delta=—"
-            )
-            return
-        tick_size = self._profile.tick_size
-        best_ask = price_state.ask
-        last_best_ask = (
-            self._last_sell_ref_price if self._last_sell_ref_side == "ask" else None
-        )
-        if best_ask is None or last_best_ask is None or not tick_size:
-            ref_old_label = "—" if last_best_ask is None else f"{last_best_ask:.8f}"
-            ref_new_label = "—" if best_ask is None else f"{best_ask:.8f}"
-            self._logger(
-                "[REPRICE_SKIP reason=ref_missing] "
-                f"exit_intent={intent} ref_old={ref_old_label} "
-                f"ref_new={ref_new_label} tick_delta=—"
-            )
-            return
-        if best_ask <= last_best_ask:
-            self._logger(
-                "[REPRICE_SKIP reason=follow_top_hold] "
-                f"exit_intent={intent} ref_old={last_best_ask:.8f} "
-                f"ref_new={best_ask:.8f} tick_delta=—"
-            )
-            return
-        cooldown_ms = max(0, int(getattr(self._settings, "repricing_cooldown_ms", 75)))
-        since_last_ms = (time.monotonic() - self._exit_reprice_last_ts) * 1000.0
-        if since_last_ms < cooldown_ms:
-            self._logger(
-                "[REPRICE_SKIP reason=cooldown] "
-                f"exit_intent={intent} wait_ms={since_last_ms:.0f} cooldown_ms={cooldown_ms}"
-            )
-            return
-        position_side = "LONG"
-        if self.position is not None:
-            position_side = str(self.position.get("side", "LONG") or "LONG").upper()
-        take_profit_ticks = int(self._settings.take_profit_ticks)
-        new_price = self._tp_follow_top_price(
-            entry_price=self.get_buy_price(),
-            best_ask=best_ask,
-            tick_size=tick_size,
-            ticks=take_profit_ticks,
-            position_side=position_side,
-        )
-        current_price = float(sell_order.get("price") or 0.0)
-        if new_price is None or current_price <= 0 or new_price <= current_price:
-            new_label = "—" if new_price is None else f"{new_price:.8f}"
-            current_label = "—" if current_price <= 0 else f"{current_price:.8f}"
-            self._logger(
-                "[REPRICE_SKIP reason=price_hold] "
-                f"exit_intent={intent} current={current_label} new={new_label}"
-            )
-            return
-        self._exit_reprice_last_ts = time.monotonic()
-        self._logger(
-            "[REPRICE_DO reason=follow_top] "
-            f"exit_intent={intent} ref_old={last_best_ask:.8f} "
-            f"ref_new={best_ask:.8f} new_price={new_price:.8f}"
-        )
-        if order_id:
-            live_order = self._get_margin_order_snapshot(order_id)
-            if live_order:
-                status = str(live_order.get("status") or "").upper()
-                executed_qty = float(
-                    live_order.get("executedQty", 0.0)
-                    or live_order.get("executedQuantity", 0.0)
-                    or 0.0
-                )
-                cum_quote = float(live_order.get("cummulativeQuoteQty", 0.0) or 0.0)
-                avg_price = 0.0
-                if executed_qty > 0 and cum_quote > 0:
-                    avg_price = cum_quote / executed_qty
-                else:
-                    avg_price = float(
-                        live_order.get("avgPrice", 0.0)
-                        or live_order.get("price", 0.0)
-                        or 0.0
-                    )
-                cycle_id = self._get_cycle_id_for_order(sell_order)
-                prev_cum = float(sell_order.get("cum_qty") or 0.0)
-                prev_avg = float(sell_order.get("avg_fill_price") or 0.0)
-                if status:
-                    sell_order["status"] = status
-                    sell_order["sell_status"] = status
-                delta = 0.0
-                if executed_qty > 0:
-                    delta = self._update_sell_execution(sell_order, executed_qty)
-                if avg_price > 0:
-                    prev_notional = prev_avg * prev_cum
-                    new_notional = avg_price * executed_qty
-                    notional_delta = max(new_notional - prev_notional, 0.0)
-                    if notional_delta > 0:
-                        self._aggregate_sold_notional += notional_delta
-                    sell_order["avg_fill_price"] = avg_price
-                    sell_order["last_fill_price"] = avg_price
-                if delta > 0:
-                    self._log_cycle_fill(cycle_id, "SELL", delta, executed_qty)
-                if status == "FILLED":
-                    sell_order["qty"] = (
-                        executed_qty if executed_qty > 0 else sell_order.get("qty")
-                    )
-                    if avg_price > 0:
-                        sell_order["price"] = avg_price
-                    self._apply_order_filled(sell_order)
-                    self.active_test_orders = [
-                        entry
-                        for entry in self.active_test_orders
-                        if entry.get("orderId") != order_id
-                    ]
-                    self.orders_count = len(self.active_test_orders)
-                    return
-                if status in {"CANCELED", "REJECTED", "EXPIRED"}:
-                    self._handle_sell_cancel_confirmed(sell_order, order_id)
-                    return
-        if order_id and order_id in open_orders:
-            if not self._should_dedup_log(f"sell_cancel_request:{order_id}", 2.0):
-                self._logger(f"[SELL_CANCEL_REQUEST] id={order_id}")
-            is_isolated = "TRUE" if self._settings.margin_isolated else "FALSE"
-            cancelled, error_code = self._cancel_margin_order_with_code(
-                symbol=self._settings.symbol,
-                order_id=order_id,
-                is_isolated=is_isolated,
-                tag=sell_order.get("tag", self.TAG),
-            )
-            if cancelled:
-                self.sell_cancel_pending = True
-                return
-            if error_code == -2011:
-                if order_id not in open_orders:
-                    self._handle_sell_cancel_confirmed(sell_order, order_id)
-                else:
-                    self.sell_cancel_pending = True
-                    if not self._should_dedup_log(f"sell_cancel_wait:{order_id}", 2.0):
-                        self._logger(f"[SELL_CANCEL_WAIT] id={order_id}")
-                return
-            return
-        self._handle_sell_cancel_confirmed(sell_order, order_id)
+        if not self._should_dedup_log("reprice_disabled", 2.0):
+            self._logger("[REPRICE_SKIP reason=deterministic_tp]")
+        return
 
     def _maybe_handle_sell_watchdog(self, open_orders: dict[int, dict]) -> bool:
         if not self._in_exit_workflow():
@@ -2432,6 +2505,44 @@ class TradeExecutor:
             return True
         self._finalize_sell_timeout()
         return True
+
+    def _watchdog_inflight(self) -> None:
+        now = time.monotonic()
+        if (
+            self._inflight_trade_action
+            and self._entry_inflight_deadline_ts is not None
+            and now >= self._entry_inflight_deadline_ts
+        ):
+            self._logger("[WATCHDOG] reset inflight entry")
+            self._inflight_trade_action = False
+            self._entry_inflight_deadline_ts = None
+            self._refresh_after_watchdog()
+        if (
+            self.sell_place_inflight
+            and self._sell_inflight_deadline_ts is not None
+            and now >= self._sell_inflight_deadline_ts
+        ):
+            self._logger("[WATCHDOG] reset inflight sell")
+            self.sell_place_inflight = False
+            self._inflight_trade_action = False
+            self._sell_inflight_deadline_ts = None
+            self._refresh_after_watchdog()
+
+    def _refresh_after_watchdog(self) -> None:
+        try:
+            open_orders = self._rest.get_margin_open_orders(self._settings.symbol)
+        except httpx.HTTPStatusError as exc:
+            self._log_binance_error(
+                "watchdog_open_orders",
+                exc,
+                {"symbol": self._settings.symbol},
+            )
+            return
+        except Exception as exc:
+            self._logger(f"[WATCHDOG] open_orders error: {exc}")
+            return
+        self.sync_open_orders(open_orders)
+        self._reconcile_position_from_fills()
 
     def _finalize_sell_timeout(self) -> None:
         self._sell_wait_started_ts = None
@@ -2587,12 +2698,13 @@ class TradeExecutor:
             if buy_order:
                 self.entry_active_order_id = buy_order.get("orderId")
                 self.entry_active_price = buy_order.get("price")
-        self._handle_entry_follow_top(open_map)
+        self._enter_tick(open_map)
         if self._maybe_handle_sell_watchdog(open_map):
             return
         self._maybe_handle_sell_reprice(open_map)
         self._maybe_place_sell_retry()
         self._attempt_recovery_sell()
+        self._watchdog_inflight()
 
     def handle_order_filled(
         self, order_id: int, side: str, price: float, qty: float, ts_ms: int
@@ -2605,7 +2717,8 @@ class TradeExecutor:
             return
         side_upper = str(side).upper()
         cycle_id = self._get_cycle_id_for_order(order)
-        if not self._should_process_fill(order_id, side_upper, qty, price, cycle_id):
+        trade_id = self._extract_trade_id(order)
+        if not self._should_process_fill(order_id, side_upper, qty, price, cycle_id, trade_id):
             return
         if order.get("status") == "FILLED":
             return
@@ -2634,7 +2747,10 @@ class TradeExecutor:
             return
         side_upper = str(side).upper()
         cycle_id = self._get_cycle_id_for_order(order)
-        if not self._should_process_fill(order_id, side_upper, cum_qty, avg_price, cycle_id):
+        trade_id = self._extract_trade_id(order)
+        if not self._should_process_fill(
+            order_id, side_upper, cum_qty, avg_price, cycle_id, trade_id
+        ):
             return
         if side_upper == "BUY":
             prev_cum = float(order.get("cum_qty") or 0.0)
@@ -2674,6 +2790,7 @@ class TradeExecutor:
                 if self.position is not None:
                     remaining_qty = self._resolve_remaining_qty_raw()
                     self.position["qty"] = remaining_qty
+                self._reconcile_position_from_fills()
                 self._transition_to_position_state()
                 action, sell_qty = self._sync_sell_for_partial(delta)
                 price_label = "—" if avg_price <= 0 else f"{avg_price:.8f}"
@@ -2712,6 +2829,7 @@ class TradeExecutor:
                 return
             remaining_qty = self._resolve_remaining_qty_raw()
             self.position["qty"] = remaining_qty
+            self._reconcile_position_from_fills()
             if delta > 0:
                 self._log_cycle_fill(cycle_id, "SELL", delta, cum_qty)
                 cycle_label = "—" if cycle_id is None else str(cycle_id)
@@ -2776,7 +2894,10 @@ class TradeExecutor:
         price = float(order.get("price") or 0.0)
         side_label = str(side or "UNKNOWN").upper()
         if not dedup_checked:
-            if not self._should_process_fill(order_id, side_label, qty, price, cycle_id):
+            trade_id = self._extract_trade_id(order)
+            if not self._should_process_fill(
+                order_id, side_label, qty, price, cycle_id, trade_id
+            ):
                 return
         cycle_label = "—" if cycle_id is None else str(cycle_id)
         if side == "BUY":
@@ -2806,6 +2927,7 @@ class TradeExecutor:
                 }
                 self._set_position_qty_base(qty)
                 self._reset_exit_intent()
+            self._reconcile_position_from_fills()
             self._transition_to_position_state()
             action, sell_qty = self._sync_sell_for_partial(delta)
             price_label = "—" if price <= 0 else f"{price:.8f}"
@@ -2828,6 +2950,7 @@ class TradeExecutor:
                         self._aggregate_sold_notional += notional_delta
                     order["avg_fill_price"] = price
                     order["last_fill_price"] = price
+            self._reconcile_position_from_fills()
             self._reset_sell_retry()
             self.sell_active_order_id = None
             self.sell_cancel_pending = False
@@ -2835,7 +2958,7 @@ class TradeExecutor:
             exit_intent = self._normalize_exit_intent(self.exit_intent or reason)
             if reason == "TP":
                 exit_reason = "TP_MAKER"
-            elif reason in {"TP_MAKER", "TP_FORCE"}:
+            elif reason in {"TP_MAKER", "TP_FORCE", "TP_CROSS"}:
                 exit_reason = reason
             elif reason in {"SL", "SL_HARD"}:
                 exit_reason = "SL_HARD"
@@ -2847,7 +2970,7 @@ class TradeExecutor:
                 exit_reason = "MANUAL"
             fill_price = order.get("price")
             buy_price = self.position.get("buy_price") if self.position else self._last_buy_price
-            if exit_reason in {"TP_MAKER", "TP_FORCE", "SL_HARD"}:
+            if exit_reason in {"TP_MAKER", "TP_FORCE", "TP_CROSS", "SL_HARD"}:
                 fill_price_label = "—" if fill_price is None else f"{fill_price:.8f}"
                 qty_label = "—" if qty <= 0 else f"{qty:.8f}"
                 self._logger(
@@ -2868,7 +2991,7 @@ class TradeExecutor:
                 self._log_cycle_fill(cycle_id, "SELL", delta, qty)
             pnl = self._finalize_close(order)
             self.last_exit_reason = exit_reason
-            if exit_reason in {"TP_MAKER", "TP_FORCE", "SL_HARD"}:
+            if exit_reason in {"TP_MAKER", "TP_FORCE", "TP_CROSS", "SL_HARD"}:
                 pnl_quote = "—" if pnl is None else f"{pnl:.8f}"
                 pnl_bps = "—"
                 if pnl is not None and buy_price and qty:
@@ -2932,6 +3055,7 @@ class TradeExecutor:
                 self.position["initial_qty"] = base_qty
             remaining_qty = self._resolve_remaining_qty_raw()
             self.position["qty"] = remaining_qty
+        self._reconcile_position_from_fills()
         action, sell_qty = self._sync_sell_for_partial(qty)
         price_label = "—" if price is None else f"{price:.8f}"
         self._logger(
@@ -2978,6 +3102,9 @@ class TradeExecutor:
         return self._resolve_remaining_qty_raw()
 
     def _resolve_remaining_qty_raw(self) -> float:
+        if self._executed_qty_total > 0 or self._closed_qty_total > 0:
+            remaining_qty = self._executed_qty_total - self._closed_qty_total
+            return max(remaining_qty, 0.0)
         if self.position_qty_base is None:
             if self.position is not None:
                 self._set_position_qty_base(self.position.get("initial_qty"))
@@ -3010,6 +3137,13 @@ class TradeExecutor:
         self.position_qty_base = None
         self._aggregate_sold_qty = 0.0
         self._aggregate_sold_notional = 0.0
+        self._executed_qty_total = 0.0
+        self._closed_qty_total = 0.0
+        self._remaining_qty = 0.0
+        self._entry_avg_price = None
+        self._last_pos_snapshot = None
+        self._tp_maker_started_ts = None
+        self._sell_last_seen_ts = None
         self._reset_exit_intent()
         self._clear_recovery(reason="reset")
 
@@ -3021,6 +3155,7 @@ class TradeExecutor:
         self._exit_started_ts = None
         self._tp_exit_phase = None
         self._exit_reprice_last_ts = 0.0
+        self._tp_maker_started_ts = None
 
     def _set_exit_intent(
         self,
@@ -3035,12 +3170,31 @@ class TradeExecutor:
         self.exit_intent_set_ts = time.monotonic()
         self._exit_started_ts = None
         self._tp_exit_phase = "MAKER" if intent == "TP" else None
+        self._tp_maker_started_ts = None
         self._logger(f"[EXIT_INTENT] {intent}")
         ticks_label = "?" if ticks is None else str(ticks)
         mid_label = "—" if mid is None else f"{mid:.8f}"
         self._logger(
             f"[EXIT_INTENT_SET] intent={intent} ticks={ticks_label} mid={mid_label}"
         )
+
+    def _cancel_active_sell(self, reason: str) -> None:
+        if not self.sell_active_order_id and not self._has_active_order("SELL"):
+            return
+        sell_order = self._get_active_sell_order()
+        order_id = sell_order.get("orderId") if sell_order else self.sell_active_order_id
+        if not order_id:
+            return
+        is_isolated = "TRUE" if self._settings.margin_isolated else "FALSE"
+        self._logger(f"[SELL_CANCEL] reason={reason} id={order_id}")
+        self._cancel_margin_order(
+            symbol=self._settings.symbol,
+            order_id=order_id,
+            is_isolated=is_isolated,
+            tag=sell_order.get("tag", self.TAG) if sell_order else self.TAG,
+        )
+        self.sell_active_order_id = None
+        self.sell_cancel_pending = True
 
     def _override_to_sl(self, bid: Optional[float], ask: Optional[float]) -> None:
         self._cancel_entry_before_exit(timeout_s=1.0)
@@ -3118,6 +3272,8 @@ class TradeExecutor:
         delta = max(cum_qty - prev_cum, 0.0)
         if delta > 0:
             self._aggregate_sold_qty += delta
+            self._closed_qty_total += delta
+            self._remaining_qty = max(self._executed_qty_total - self._closed_qty_total, 0.0)
         order["cum_qty"] = cum_qty
         order["sell_executed_qty"] = cum_qty
         if self.position is not None:
@@ -3128,83 +3284,16 @@ class TradeExecutor:
     def _sync_sell_for_partial(self, delta_qty: float, allow_replace: bool = True) -> tuple[str, float]:
         if delta_qty <= 0:
             return "SKIP_EMPTY", 0.0
-        remaining_qty_raw = self._resolve_remaining_qty_raw()
+        self._reconcile_position_from_fills()
+        remaining_qty_raw = self._remaining_qty
         qty_to_sell = remaining_qty_raw
         if self._profile.step_size:
             qty_to_sell = self._round_down(remaining_qty_raw, self._profile.step_size)
-        if qty_to_sell <= 0 or remaining_qty_raw <= self._get_step_size_tolerance():
+        if qty_to_sell <= 0 or remaining_qty_raw <= self._epsilon_qty():
             return "SKIP_EMPTY", qty_to_sell
-        active_sell_order = self._get_active_sell_order()
-        if active_sell_order and not self._sell_order_is_final(active_sell_order):
-            existing_qty = float(active_sell_order.get("qty") or 0.0)
-            if math.isclose(
-                existing_qty,
-                qty_to_sell,
-                rel_tol=0.0,
-                abs_tol=self._get_step_size_tolerance(),
-            ):
-                self._logger(
-                    f"[SELL_SYNC] qty={qty_to_sell:.8f} reason=partial_fill action=SKIP_SAME_QTY"
-                )
-                return "SKIP_SAME_QTY", qty_to_sell
-            if not allow_replace:
-                self._logger(
-                    f"[SELL_SYNC] qty={qty_to_sell:.8f} reason=partial_fill action=SKIP_ACTIVE_SELL"
-                )
-                return "SKIP_ACTIVE_SELL", qty_to_sell
-            if self.sell_cancel_pending:
-                self._logger(
-                    f"[SELL_SYNC] qty={qty_to_sell:.8f} reason=partial_fill action=SKIP_CANCEL_PENDING"
-                )
-                return "SKIP_CANCEL_PENDING", qty_to_sell
-            order_id = active_sell_order.get("orderId")
-            if order_id is None:
-                self._logger(
-                    f"[SELL_SYNC] qty={qty_to_sell:.8f} reason=partial_fill action=SKIP_NO_ID"
-                )
-                return "SKIP_NO_ID", qty_to_sell
-            if not self._should_dedup_log(f"sell_replace_request:{order_id}", 1.0):
-                self._logger(
-                    f"[SELL_REPLACE_REQUEST] id={order_id} old_qty={existing_qty:.8f} "
-                    f"new_qty={qty_to_sell:.8f}"
-                )
-            is_isolated = "TRUE" if self._settings.margin_isolated else "FALSE"
-            cancelled, error_code = self._cancel_margin_order_with_code(
-                symbol=self._settings.symbol,
-                order_id=order_id,
-                is_isolated=is_isolated,
-                tag=active_sell_order.get("tag", self.TAG),
-            )
-            if cancelled or error_code == -2011:
-                self.sell_cancel_pending = False
-                self.sell_active_order_id = None
-                self.active_test_orders = [
-                    entry
-                    for entry in self.active_test_orders
-                    if entry.get("orderId") != order_id
-                ]
-                self.orders_count = len(self.active_test_orders)
-                self._logger(
-                    f"[SELL_SYNC] qty={qty_to_sell:.8f} reason=partial_fill action=REPLACE"
-                )
-                self._place_sell_order(
-                    reason=self._exit_order_reason(self.exit_intent),
-                    exit_intent=self.exit_intent,
-                )
-                return "REPLACE", qty_to_sell
-            self.sell_cancel_pending = True
-            self._logger(
-                f"[SELL_SYNC] qty={qty_to_sell:.8f} reason=partial_fill action=WAIT_CANCEL"
-            )
-            return "WAIT_CANCEL", qty_to_sell
-        self._logger(
-            f"[SELL_SYNC] qty={qty_to_sell:.8f} reason=partial_fill action=PLACE"
-        )
-        self._place_sell_order(
-            reason=self._exit_order_reason(self.exit_intent),
-            exit_intent=self.exit_intent,
-        )
-        return "PLACE", qty_to_sell
+        price_state, health_state = self._router.build_price_state()
+        self._ensure_exit_orders(price_state, health_state, allow_replace=allow_replace)
+        return "ENSURE_EXIT", qty_to_sell
 
     def _handle_sell_insufficient_balance(self, reason: str) -> int:
         balance = self._get_base_balance_snapshot()
@@ -3300,6 +3389,17 @@ class TradeExecutor:
             if notion > 0:
                 pnl_bps = (pnl / notion) * 10000
         self._log_cycle_close(cycle_id, pnl, pnl_bps, reason)
+        duration_ms = None
+        if self._cycle_started_ts is not None:
+            duration_ms = int((time.monotonic() - self._cycle_started_ts) * 1000.0)
+        pnl_quote_label = "—" if pnl is None else f"{pnl:.8f}"
+        pnl_bps_label = "—" if pnl_bps is None else f"{pnl_bps:.2f}"
+        duration_label = "—" if duration_ms is None else str(duration_ms)
+        self._logger(
+            "[CYCLE_DONE] "
+            f"pnl_quote={pnl_quote_label} pnl_bps={pnl_bps_label} "
+            f"mode={reason} duration_ms={duration_label}"
+        )
         self._handle_cycle_completion(reason=reason)
         self._transition_state(TradeState.STATE_FLAT)
         if self.run_active and self.cycles_done < self.cycles_target:
@@ -3324,7 +3424,7 @@ class TradeExecutor:
         cycle_id = self._get_cycle_id_for_order(self._find_order("SELL"))
         if cycle_id is None:
             cycle_id = self._current_cycle_id
-        qty = self.position_qty_base
+        qty = self._executed_qty_total or self.position_qty_base
         buy_price = self.position.get("buy_price") if self.position else self._last_buy_price
         pnl = None
         if qty and buy_price and self._aggregate_sold_notional > 0:
