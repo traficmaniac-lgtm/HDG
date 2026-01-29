@@ -1793,13 +1793,50 @@ class TradeExecutor:
             return
         side_upper = str(side).upper()
         if side_upper == "BUY":
+            prev_cum = float(order.get("cum_qty") or 0.0)
             order["cum_qty"] = cum_qty
             if avg_price > 0:
                 order["avg_fill_price"] = avg_price
                 order["last_fill_price"] = avg_price
             order["updated_ts"] = ts_ms
+            delta = max(cum_qty - prev_cum, 0.0)
+            if delta > 0:
+                fill_price = avg_price if avg_price > 0 else order.get("price")
+                if self.position is None:
+                    self.position = {
+                        "buy_price": fill_price,
+                        "qty": cum_qty,
+                        "opened_ts": ts_ms,
+                        "partial": True,
+                        "initial_qty": cum_qty,
+                    }
+                    self._reset_exit_intent()
+                else:
+                    if fill_price is not None:
+                        self.position["buy_price"] = fill_price
+                    self.position["partial"] = True
+                    if not self.position.get("opened_ts"):
+                        self.position["opened_ts"] = ts_ms
+                if self.position_qty_base is None:
+                    self._set_position_qty_base(cum_qty)
+                else:
+                    base_qty = float(cum_qty)
+                    if self._profile.step_size:
+                        base_qty = self._round_down(base_qty, self._profile.step_size)
+                    self.position_qty_base = base_qty
+                    if self.position is not None:
+                        self.position["initial_qty"] = base_qty
+                if self.position is not None:
+                    remaining_qty = self._resolve_remaining_qty_raw()
+                    self.position["qty"] = remaining_qty
+                self._transition_state(TradeState.STATE_POSITION_OPEN)
+                self._sync_sell_for_partial(delta)
+            pos_qty = self.position.get("qty") if self.position is not None else 0.0
+            avg_value = avg_price
+            if avg_value <= 0 and self.position is not None:
+                avg_value = float(self.position.get("buy_price") or 0.0)
             self._logger(
-                f"[BUY_PARTIAL] cum_qty={cum_qty:.8f} avg={avg_price:.8f}"
+                f"[BUY_PARTIAL] delta={delta:.8f} pos_qty={pos_qty:.8f} avg={avg_value:.8f}"
             )
             return
         if side_upper == "SELL":
@@ -1934,6 +1971,21 @@ class TradeExecutor:
             }
             self._set_position_qty_base(qty)
             self._reset_exit_intent()
+        else:
+            if price is not None:
+                self.position["buy_price"] = price
+            self.position["partial"] = True
+            if self.position_qty_base is None:
+                self._set_position_qty_base(qty)
+            else:
+                base_qty = float(qty)
+                if self._profile.step_size:
+                    base_qty = self._round_down(base_qty, self._profile.step_size)
+                self.position_qty_base = base_qty
+                self.position["initial_qty"] = base_qty
+            remaining_qty = self._resolve_remaining_qty_raw()
+            self.position["qty"] = remaining_qty
+        self._sync_sell_for_partial(qty)
         self._transition_state(TradeState.STATE_POSITION_OPEN)
 
     def get_orders_snapshot(self) -> list[dict]:
@@ -2037,6 +2089,25 @@ class TradeExecutor:
         if self.position is not None:
             remaining_qty = self._resolve_remaining_qty_raw()
             self.position["qty"] = remaining_qty
+
+    def _sync_sell_for_partial(self, delta_qty: float) -> None:
+        if delta_qty <= 0:
+            return
+        remaining_qty_raw = self._resolve_remaining_qty_raw()
+        qty_to_sell = remaining_qty_raw
+        if self._profile.step_size:
+            qty_to_sell = self._round_down(remaining_qty_raw, self._profile.step_size)
+        if qty_to_sell <= 0 or remaining_qty_raw <= self._get_step_size_tolerance():
+            return
+        active_sell_order = self._get_active_sell_order()
+        if active_sell_order and not self._sell_order_is_final(active_sell_order):
+            active_sell_order["qty"] = qty_to_sell
+            self._logger(
+                f"[SELL_SYNC] qty={qty_to_sell:.8f} reason=partial_fill"
+            )
+            return
+        self._logger(f"[SELL_SYNC] qty={qty_to_sell:.8f} reason=partial_fill")
+        self._place_sell_order(reason="partial_fill", exit_intent=self.exit_intent)
 
     def _handle_sell_insufficient_balance(self, reason: str) -> int:
         balance = self._get_base_balance_snapshot()
