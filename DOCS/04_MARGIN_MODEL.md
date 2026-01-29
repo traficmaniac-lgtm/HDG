@@ -1,21 +1,25 @@
 # Margin Model
 
-## Только Cross Margin
-- Используется только **Cross Margin** (isolated не применяется).
-- Плечо: **x3**.
+## Режим маржи
+- Поддерживаются **Cross** и **Isolated** через флаг `margin_isolated`.
+- В запросах Binance используется `isIsolated = TRUE|FALSE`.
 
 ## sideEffectType
-- **BUY** может использовать:
-  - `AUTO_BORROW_REPAY`
-  - `MARGIN_BUY`
-  - `NONE`
-- **SELL** использует `AUTO_REPAY`, когда разрешён borrow и это поддерживается API (независимо от LIMIT/MARKET выхода).
+### BUY
+- Значение берётся из настройки `side_effect_type`.
+- Нормализация:
+  - `AUTO_BORROW_REPAY` или `MARGIN_BUY` — принимаются как есть.
+  - `NONE` — не передаётся в запрос.
+  - Любое другое значение → `AUTO_BORROW_REPAY`.
 
-## BORROW: OK / FAIL
-- `BORROW = OK|FAIL` отражает результат `probe_margin_borrow_access`.
-- `FAIL` фиксируется при HTTP 401 или коде `-1002`.
-- `OK` означает доступность borrow-эндпоинта, но не гарантию фактического займа.
+### SELL
+- При `allow_borrow = True` и если API не запретил borrow, SELL использует `AUTO_REPAY`.
+- Если borrow недоступен → `sideEffectType` не указывается.
 
-## Почему явный borrow не используется в цикле
-- Цикл опирается на `sideEffectType` в ордерах.
-- Явные `borrow/repay` — только вспомогательные методы вне основного цикла.
+## Проверка доступа к borrow
+- GUI получает флаг `borrow_allowed_by_api` (через тестовый запрос к borrow‑эндпоинту).
+- Ошибки `401` и `-1002` фиксируют запрет borrow и отключают `AUTO_REPAY` для SELL.
+
+## Что НЕ делает текущая логика
+- Нет явного borrow/repay в основном цикле — только sideEffectType.
+- Explicit borrow/repay методы существуют как вспомогательные, но цикл ими не пользуется.
