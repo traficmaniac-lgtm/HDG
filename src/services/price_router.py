@@ -124,7 +124,6 @@ class PriceRouter:
         bool,
         bool,
         Optional[int],
-        bool,
     ]:
         now = time.monotonic()
         ws_age_ms = (
@@ -263,19 +262,15 @@ class PriceRouter:
         data_blind = False
         from_cache = False
         cache_age_ms = None
-        ttl_expired = False
         if mid is None:
             data_blind = True
             if self._last_good_ts is not None:
                 cache_age_ms = int((now - self._last_good_ts) * 1000)
-                if cache_age_ms <= self._settings.good_quote_ttl_ms:
-                    bid = self._last_good_bid
-                    ask = self._last_good_ask
-                    mid = self._last_good_mid
-                    quote_source = self._last_good_source
-                    from_cache = True
-                else:
-                    ttl_expired = True
+                bid = self._last_good_bid
+                ask = self._last_good_ask
+                mid = self._last_good_mid
+                quote_source = self._last_good_source
+                from_cache = True
         if mid is not None:
             min_interval_s = 0.2
             should_update = (
@@ -287,7 +282,13 @@ class PriceRouter:
                 self._stable_mid = mid
                 self._stable_ts = self._last_good_ts if from_cache else now
                 self._stable_source = quote_source if quote_source != "NONE" else effective_source
-        elif ttl_expired:
+        elif from_cache:
+            self._stable_bid = bid
+            self._stable_ask = ask
+            self._stable_mid = mid
+            self._stable_ts = self._last_good_ts
+            self._stable_source = quote_source if quote_source != "NONE" else effective_source
+        else:
             self._stable_bid = None
             self._stable_ask = None
             self._stable_mid = None
@@ -310,7 +311,6 @@ class PriceRouter:
             data_blind,
             from_cache,
             cache_age_ms,
-            ttl_expired,
         )
 
     def build_price_state(self) -> tuple[PriceState, HealthState]:
@@ -325,7 +325,6 @@ class PriceRouter:
             data_blind,
             from_cache,
             cache_age_ms,
-            ttl_expired,
         ) = self.get_best_quote()
 
         if source != self._last_source:
@@ -358,7 +357,6 @@ class PriceRouter:
             data_blind=data_blind,
             from_cache=from_cache,
             cache_age_ms=cache_age_ms,
-            ttl_expired=ttl_expired,
         )
         health_state = HealthState(
             ws_connected=self._ws_connected,

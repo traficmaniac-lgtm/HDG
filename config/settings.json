@@ -34,14 +34,6 @@
   "auto_exit_enabled": true,
   "max_sell_retries": 3,
   "max_wait_sell_ms": 15000,
-  "max_exit_total_ms": 120000,
   "allow_force_close": false,
-  "api": {
-    "key": "QqafeYMR0spwlghqligrK5n2XHq5YLvzGDK2hLicHCoDmFtGUb81xFwXbwKxPS0v",
-    "secret": "CPgVuOSM0nsJiQvOMW5hmBu26DcXztUU2Hnf2SVup2MtJsb2d5oACgONnJcMq4pY"
-  },
-  "api_storage": {
-    "source": "settings.json"
-  },
   "cycle_count": 1000
 }

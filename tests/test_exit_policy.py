@@ -12,7 +12,6 @@ def test_sl_policy_crossing() -> None:
         bid=bid,
         ask=ask,
         tick_size=tick,
-        sl_offset_ticks=0,
     )
     assert policy == "SL_CROSS"
     assert price is not None
@@ -28,7 +27,6 @@ def test_tp_policy_maker() -> None:
         bid=bid,
         ask=ask,
         tick_size=tick,
-        sl_offset_ticks=0,
     )
     assert policy == "TP_MAKER"
     assert price is not None
@@ -44,6 +42,5 @@ def test_tick_rounding() -> None:
         bid=bid,
         ask=ask,
         tick_size=tick,
-        sl_offset_ticks=0,
     )
     assert price == 1.1967

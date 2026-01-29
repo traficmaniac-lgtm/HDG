@@ -3,6 +3,7 @@ from __future__ import annotations
 from importlib import import_module
 from importlib.util import find_spec
 from pathlib import Path
+import os
 from typing import Optional
 
 from datetime import datetime
@@ -92,9 +93,7 @@ class MainWindow(QMainWindow):
         self._order_tracker: Optional[OrderTracker] = None
         self._last_ws_status_log_ts = 0.0
         self._data_blind_active = False
-        self._ttl_expired_logged = False
         self._last_data_blind_log_ts = 0.0
-        self._last_ttl_expired_log_ts = 0.0
         self._open_order_rows: dict[str, int] = {}
         self._fills_history: list[dict] = []
         self._fill_rows_by_event_key: dict[str, int] = {}
@@ -272,10 +271,8 @@ class MainWindow(QMainWindow):
         timers_layout.setContentsMargins(10, 10, 10, 10)
         timers_layout.setHorizontalSpacing(8)
         timers_layout.setVerticalSpacing(6)
-        self.max_exit_total_label = self._make_value_label("—", min_chars=8, fixed_width=180)
         self.cycles_target_label = self._make_value_label("—", min_chars=6, fixed_width=180)
-        self._add_card_row(timers_layout, 0, "max_exit_total_ms", self.max_exit_total_label)
-        self._add_card_row(timers_layout, 1, "cycles_target", self.cycles_target_label)
+        self._add_card_row(timers_layout, 0, "cycles_target", self.cycles_target_label)
 
         hud_layout.addWidget(market_hud)
         hud_layout.addWidget(health_group)
@@ -792,9 +789,6 @@ class MainWindow(QMainWindow):
         self.exit_policy_label.setText(exit_policy or "—")
         self.exit_age_label.setText(self._fmt_int(self._exit_age_ms(), width=8))
 
-        self.max_exit_total_label.setText(
-            self._fmt_int(getattr(self._settings, "max_exit_total_ms", None), width=8)
-        )
         cycles_target = None
         if self._trade_executor:
             cycles_target = self._trade_executor.cycles_target
@@ -980,7 +974,6 @@ class MainWindow(QMainWindow):
             ws_stale_grace_ms=self._bounded_int(
                 payload.get("ws_stale_grace_ms", 3000), 0, 60000, 3000
             ),
-            good_quote_ttl_ms=int(payload.get("good_quote_ttl_ms", 3000)),
             mid_fresh_ms=self._bounded_int(payload.get("mid_fresh_ms", 800), 200, 5000, 800),
             max_wait_price_ms=self._bounded_int(
                 payload.get("max_wait_price_ms", 5000), 1000, 30000, 5000
@@ -1035,15 +1028,8 @@ class MainWindow(QMainWindow):
                 payload.get("auto_exit_enabled", payload.get("auto_close", True))
             ),
             max_sell_retries=int(payload.get("max_sell_retries", 3)),
-            max_sl_ttl_retries=self._bounded_int(
-                payload.get("max_sl_ttl_retries", 2), 0, 20, 2
-            ),
-            force_close_on_ttl=bool(payload.get("force_close_on_ttl", True)),
             max_wait_sell_ms=self._bounded_int(
                 payload.get("max_wait_sell_ms", 15000), 1000, 120000, 15000
-            ),
-            max_exit_total_ms=self._bounded_int(
-                payload.get("max_exit_total_ms", 120000), 1000, 300000, 120000
             ),
             allow_force_close=bool(payload.get("allow_force_close", False)),
             cycle_count=self._bounded_int(payload.get("cycle_count", 1), 1, 1000, 1),
@@ -1066,19 +1052,19 @@ class MainWindow(QMainWindow):
                 self._append_log(
                     f"[DATA] mid_from_cache age_ms={age_label} state={state_label}"
                 )
-            self._ttl_expired_logged = False
-        elif price_state.data_blind and price_state.ttl_expired:
-            if not self._ttl_expired_logged or now - self._last_ttl_expired_log_ts >= 5.0:
-                self._ttl_expired_logged = True
-                self._last_ttl_expired_log_ts = now
+        elif price_state.data_blind:
+            if not self._data_blind_active or now - self._last_data_blind_log_ts >= 5.0:
+                self._data_blind_active = True
+                self._last_data_blind_log_ts = now
                 self._append_log(
-                    f"[DATA_BLIND] ttl_expired state={state_label} action=freeze_exits"
+                    f"[DATA_BLIND] no_cache state={state_label} action=freeze_exits"
                 )
         else:
             self._data_blind_active = False
 
     def _load_api_state(self) -> None:
-        creds = self._config_store.load_api_credentials()
+        env = self._load_env()
+        creds = self._resolve_api_credentials(env)
         self._api_credentials = ApiCredentials(
             key=self._sanitize_api_value(creds.key),
             secret=self._sanitize_api_value(creds.secret),
@@ -1087,11 +1073,15 @@ class MainWindow(QMainWindow):
             self._append_log("[API] missing, trading disabled")
 
     def _resolve_api_credentials(self, env: dict) -> ApiCredentials:
-        if self._has_valid_api_credentials(self._api_credentials):
-            return self._api_credentials
-        env_key = self._sanitize_api_value(env.get("BINANCE_KEY", ""))
-        env_secret = self._sanitize_api_value(env.get("BINANCE_SECRET", ""))
-        return ApiCredentials(key=env_key, secret=env_secret)
+        env_key = self._sanitize_api_value(env.get("BINANCE_API_KEY", ""))
+        env_secret = self._sanitize_api_value(env.get("BINANCE_API_SECRET", ""))
+        if self._is_valid_api_value(env_key) and self._is_valid_api_value(env_secret):
+            return ApiCredentials(key=env_key, secret=env_secret)
+        local_creds = self._config_store.load_api_credentials()
+        return ApiCredentials(
+            key=self._sanitize_api_value(local_creds.key),
+            secret=self._sanitize_api_value(local_creds.secret),
+        )
 
     def _has_valid_api_credentials(self, creds: ApiCredentials) -> bool:
         return self._is_valid_api_value(creds.key) and self._is_valid_api_value(
@@ -1233,17 +1223,21 @@ class MainWindow(QMainWindow):
         return symbol[:-3], symbol[-3:]
 
     def _load_env(self) -> dict:
+        env = dict(os.environ)
         env_path = Path(__file__).resolve().parents[2] / "config" / ".env"
         if not env_path.exists():
-            return {}
+            return env
         if find_spec("dotenv") is None:
             self._append_log("python-dotenv is not installed; skipping .env load.")
-            return {}
+            return env
         dotenv = import_module("dotenv")
-        return {
+        file_env = {
             key: value or ""
             for key, value in dotenv.dotenv_values(env_path).items()
         }
+        for key, value in file_env.items():
+            env.setdefault(key, value)
+        return env
 
     def _update_exit_status(self, mid: Optional[float]) -> None:
         buy_price = None
@@ -1561,7 +1555,6 @@ class MainWindow(QMainWindow):
         self.exit_intent_label.setText("—")
         self.exit_policy_label.setText("—")
         self.exit_age_label.setText("—")
-        self.max_exit_total_label.setText("—")
         self.cycles_target_label.setText("—")
         self.summary_label.setText(
             "EURIUSDT | SRC NONE | ages —/— | spread — | FSM —/— | pos — | "
