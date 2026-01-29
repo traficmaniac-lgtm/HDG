@@ -37,6 +37,19 @@ python -m src.app
    - `[CYCLE] END n=10 ...`
    - `[ENGINE] max_cycles reached -> stop`
 
+## Stability checklist (v0.7.29.7)
+
+- CONNECT → START and let it run for ~10 minutes.
+- Observe at least 5 full ENTRY→EXIT cycles.
+- On a sharp price jump, ensure:
+  - No FSM freeze (watchdog triggers reconcile/recover, not a stall).
+  - Either TP/SL closes the position, RECOVER places exit, or SAFE_STOP logs a clear reason.
+- Logs to confirm:
+  - `[ENTRY] placed` / `[ENTRY] repriced` / `[ENTRY] filled`
+  - `[EXIT] maker_armed` / `[EXIT] cross_armed` / `[EXIT] filled`
+  - `[RECOVER] start` / `[RECOVER] snapshot` / `[RECOVER] result`
+  - `[RECONCILE_INVALID] ... order_ids=[...]`
+
 ## Запуск в один клик (Windows)
 
 1. Скачайте репозиторий и распакуйте в удобную папку.

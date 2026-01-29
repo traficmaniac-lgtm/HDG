@@ -1321,12 +1321,14 @@ class TradeExecutor:
         desired_phase = "CROSS" if cross_reason and self._tp_armed else "MAKER"
         if desired_phase == "MAKER" and self._tp_exit_phase != "MAKER":
             self._logger("[TP_MAKER_ARMED]")
+            self._logger("[EXIT] maker_armed")
         if desired_phase == "CROSS" and self._tp_exit_phase != "CROSS":
             elapsed_label = elapsed_ms
             reason_label = cross_reason or "trigger"
             self._logger(
                 f"[TP_CROSS_ARMED] reason={reason_label} elapsed_ms={elapsed_label}"
             )
+            self._logger(f"[EXIT] cross_armed reason={reason_label}")
 
         active_sell_order = self._get_active_sell_order()
         if active_sell_order and not self._sell_order_is_final(active_sell_order):
@@ -2468,7 +2470,7 @@ class TradeExecutor:
         ask_label = "?" if ask is None else f"{ask:.8f}"
         cycle_label = self._cycle_id_label()
         self._logger(
-            f"[ENTRY_PLACE] cycle_id={cycle_label} price={price:.8f} "
+            f"[ENTRY] placed cycle_id={cycle_label} price={price:.8f} "
             f"bid={bid_label} ask={ask_label} {entry_context}"
         )
 
@@ -2572,9 +2574,12 @@ class TradeExecutor:
             last_ref_bid = bid
         moved_ticks = 0
         ref_moved = False
+        min_reprice_ticks = max(
+            1, int(getattr(self._settings, "entry_reprice_min_ticks", 1) or 1)
+        )
         if bid is not None and last_ref_bid is not None:
             moved_ticks = self._ticks_between(last_ref_bid, bid, tick_size)
-            ref_moved = moved_ticks >= 1
+            ref_moved = moved_ticks >= min_reprice_ticks
         if self._entry_order_price is None:
             self._entry_order_price = current_price
         self._entry_consecutive_fresh_reads = 0
@@ -2590,6 +2595,15 @@ class TradeExecutor:
             elif new_price == current_price:
                 reprice_reason = "already_at_best_bid"
                 can_reprice = False
+        if can_reprice:
+            cooldown_ms = int(
+                getattr(self._settings, "entry_reprice_cooldown_ms", 1200) or 0
+            )
+            if cooldown_ms > 0 and self._entry_reprice_last_ts:
+                elapsed_s = time.monotonic() - self._entry_reprice_last_ts
+                if elapsed_s * 1000.0 < cooldown_ms:
+                    can_reprice = False
+                    reprice_reason = "cooldown"
         order_id = buy_order.get("orderId")
         order_price_label = f"{current_price:.8f}"
         reason_label = reprice_reason
@@ -2714,6 +2728,9 @@ class TradeExecutor:
         self._logger(
             f"[ORDER] BUY placed cycle_id={cycle_label} qty={qty:.8f} "
             f"price={new_price:.8f} id={buy_order.get('orderId')}"
+        )
+        self._logger(
+            f"[ENTRY] repriced cycle_id={cycle_label} price={new_price:.8f}"
         )
         self._entry_reprice_last_ts = now
         self._entry_consecutive_fresh_reads = 0
@@ -2941,10 +2958,25 @@ class TradeExecutor:
         trades = snapshot.get("trades") or []
         balance = snapshot.get("balance")
         self.sync_open_orders(open_orders)
+        trades_filtered = self._filter_trades_for_cycle(trades)
         executed, closed, remaining, entry_avg = self._build_reconcile_state(
-            trades=trades,
+            trades=trades_filtered,
             balance=balance,
         )
+        planned_qty = self._entry_plan_qty()
+        max_allowed = planned_qty * 1.10 if planned_qty > 0 else 0.0
+        if planned_qty <= 0 or executed > max_allowed:
+            if not self._should_dedup_log("reconcile_invalid_totals_recover", 5.0):
+                order_ids = sorted(self._cycle_order_ids)
+                self._logger(
+                    "[RECONCILE_INVALID] "
+                    f"reason=recover executed={executed:.8f} planned={planned_qty:.8f} "
+                    f"max_allowed={max_allowed:.8f} order_ids={order_ids}"
+                )
+            executed, closed, remaining, entry_avg = self._build_reconcile_state(
+                trades=[],
+                balance=balance,
+            )
         self._apply_reconcile_snapshot(executed, closed, remaining, entry_avg)
         decided = "snapshot"
 
@@ -2989,10 +3021,28 @@ class TradeExecutor:
                 trades = snapshot.get("trades") or []
                 balance = snapshot.get("balance")
                 self.sync_open_orders(open_orders)
+                trades_filtered = self._filter_trades_for_cycle(trades)
                 executed, closed, remaining, entry_avg = self._build_reconcile_state(
-                    trades=trades,
+                    trades=trades_filtered,
                     balance=balance,
                 )
+                planned_qty = self._entry_plan_qty()
+                max_allowed = planned_qty * 1.10 if planned_qty > 0 else 0.0
+                if planned_qty <= 0 or executed > max_allowed:
+                    if not self._should_dedup_log(
+                        "reconcile_invalid_totals_recover_retry", 5.0
+                    ):
+                        order_ids = sorted(self._cycle_order_ids)
+                        self._logger(
+                            "[RECONCILE_INVALID] "
+                            f"reason=recover_retry executed={executed:.8f} "
+                            f"planned={planned_qty:.8f} "
+                            f"max_allowed={max_allowed:.8f} order_ids={order_ids}"
+                        )
+                    executed, closed, remaining, entry_avg = self._build_reconcile_state(
+                        trades=[],
+                        balance=balance,
+                    )
                 self._apply_reconcile_snapshot(executed, closed, remaining, entry_avg)
                 have_open_entry = any(
                     str(order.get("side") or "").upper() == "BUY" for order in open_orders
@@ -3367,6 +3417,13 @@ class TradeExecutor:
                         "[RECONCILE_INVALID_TOTALS] "
                         f"planned={planned_qty:.8f} reason=planned_qty_zero"
                     )
+                if not self._should_dedup_log("reconcile_invalid_planned_marker", 5.0):
+                    order_ids = sorted(self._cycle_order_ids)
+                    self._logger(
+                        "[RECONCILE_INVALID] "
+                        f"reason=planned_qty_zero planned={planned_qty:.8f} "
+                        f"order_ids={order_ids}"
+                    )
                 self._reconcile_refresh_requested = True
                 self._apply_open_orders_balance_only(
                     open_orders=open_orders,
@@ -3382,6 +3439,14 @@ class TradeExecutor:
                         "[RECONCILE_INVALID_TOTALS] "
                         f"executed={executed:.8f} planned={planned_qty:.8f} "
                         f"max_allowed={max_allowed:.8f}"
+                    )
+                if not self._should_dedup_log("reconcile_invalid_totals_marker", 5.0):
+                    order_ids = sorted(self._cycle_order_ids)
+                    self._logger(
+                        "[RECONCILE_INVALID] "
+                        f"reason=totals_exceed_plan executed={executed:.8f} "
+                        f"planned={planned_qty:.8f} max_allowed={max_allowed:.8f} "
+                        f"order_ids={order_ids}"
                     )
                 self._reconcile_refresh_requested = True
                 self._apply_open_orders_balance_only(
@@ -3860,6 +3925,9 @@ class TradeExecutor:
                 f"cycle_id={cycle_label} qty={qty:.8f} "
                 f"price={price:.8f}"
             )
+            self._logger(
+                f"[ENTRY] filled cycle_id={cycle_label} qty={qty:.8f} price={price:.8f}"
+            )
             delta = max(qty - prev_cum, 0.0)
             if delta > 0:
                 self._log_cycle_fill(cycle_id, "BUY", delta, qty)
@@ -3938,6 +4006,10 @@ class TradeExecutor:
                     f"cycle_id={cycle_label} qty={qty_label} "
                     f"price={fill_price_label}"
                 )
+            fill_price_label = "—" if fill_price is None else f"{fill_price:.8f}"
+            self._logger(
+                f"[EXIT] filled reason={exit_reason} qty={qty:.8f} price={fill_price_label}"
+            )
             delta = max(qty - prev_cum, 0.0)
             if delta > 0:
                 self._log_cycle_fill(cycle_id, "SELL", delta, qty)
