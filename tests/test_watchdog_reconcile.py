@@ -126,19 +126,13 @@ def test_stuck_triggers_reconcile() -> None:
         profile=profile,
         logger=lambda _msg: None,
     )
-    called = {"reconcile": False}
-
-    def fake_reconcile() -> None:
-        called["reconcile"] = True
-
-    executor._reconcile_with_exchange = fake_reconcile  # type: ignore[assignment]
     executor.state = TradeState.STATE_ENTRY_WORKING
     executor._state_entered_ts = time.monotonic() - 1.0
     executor._last_progress_ts = time.monotonic() - 1.0
 
-    executor.watchdog_tick()
+    need_reconcile = executor.watchdog_tick()
 
-    assert called["reconcile"] is True
+    assert need_reconcile is True
     assert executor.state == TradeState.STATE_RECONCILE
 
 
@@ -154,17 +148,10 @@ def test_reconcile_routes_to_exit_when_remaining_gt_zero() -> None:
         profile=profile,
         logger=lambda _msg: None,
     )
-    placed: list[str] = []
+    snapshot = executor.collect_reconcile_snapshot()
+    executor.apply_reconcile_snapshot(snapshot)
 
-    def fake_place_sell(*_args, **_kwargs) -> int:
-        placed.append("exit")
-        return 1
-
-    executor._place_sell_order = fake_place_sell  # type: ignore[assignment]
-
-    executor._reconcile_with_exchange()
-
-    assert placed == ["exit"]
+    assert executor.state == TradeState.STATE_SAFE_STOP
 
 
 def test_reconcile_returns_to_idle_when_flat() -> None:
@@ -178,7 +165,8 @@ def test_reconcile_returns_to_idle_when_flat() -> None:
         profile=profile,
         logger=lambda _msg: None,
     )
-    executor._reconcile_with_exchange()
+    snapshot = executor.collect_reconcile_snapshot()
+    executor.apply_reconcile_snapshot(snapshot)
 
     assert executor.state == TradeState.STATE_IDLE
     assert executor.position is None

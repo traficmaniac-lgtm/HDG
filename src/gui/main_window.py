@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from importlib import import_module
 from importlib.util import find_spec
 from pathlib import Path
 import os
+import threading
 from typing import Optional
 
 from datetime import datetime
 import time
+from collections import deque
 
 import httpx
 from PySide6.QtCore import Qt, QTimer, Slot
@@ -100,6 +103,13 @@ class MainWindow(QMainWindow):
         self._cycle_id_counter = 0
         self._last_buy_fill_price: Optional[float] = None
         self._profile_info_text = "—"
+        self._log_queue = deque(maxlen=5000)
+        self._log_lock = threading.Lock()
+        self._last_log_message: Optional[str] = None
+        self._last_log_ts = 0.0
+        self._log_max_lines = 3000
+        self._log_flush_limit = 200
+        self._auth_warning_pending = False
 
         self._ui_timer = QTimer(self)
         self._ui_timer.timeout.connect(self._refresh_ui)
@@ -109,13 +119,18 @@ class MainWindow(QMainWindow):
         self._orders_timer.timeout.connect(self._refresh_orders)
         self._watchdog_timer = QTimer(self)
         self._watchdog_timer.timeout.connect(self._watchdog_tick)
+        self._log_flush_timer = QTimer(self)
+        self._log_flush_timer.timeout.connect(self._flush_log_queue)
 
         self._ws_thread = None
         self._ws_worker = None
+        self._rest_exec = ThreadPoolExecutor(max_workers=1)
+        self._rest_future = None
 
         self._build_ui()
         self._load_api_state()
         self._update_status(False)
+        self._log_flush_timer.start(200)
 
     def _build_ui(self) -> None:
         central = QWidget()
@@ -382,7 +397,7 @@ class MainWindow(QMainWindow):
 
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
-        self.log.setMaximumBlockCount(500)
+        self.log.document().setMaximumBlockCount(self._log_max_lines)
         self._log_dialog = QDialog(self)
         self._log_dialog.setWindowTitle("Logs")
         log_layout = QVBoxLayout(self._log_dialog)
@@ -606,6 +621,9 @@ class MainWindow(QMainWindow):
         if self._order_tracker:
             self._order_tracker.stop()
             self._order_tracker = None
+        if self._rest_future is not None:
+            self._rest_future.cancel()
+            self._rest_future = None
 
         if self._ws_worker is not None:
             self._ws_worker.stop()
@@ -747,8 +765,28 @@ class MainWindow(QMainWindow):
             self._append_log(f"HTTP ticker error: {exc}")
 
     def _watchdog_tick(self) -> None:
-        if self._trade_executor:
-            self._trade_executor.watchdog_tick()
+        if not self._trade_executor:
+            return
+        if self._rest_future is not None and self._rest_future.done():
+            try:
+                snapshot = self._rest_future.result(timeout=0)
+            except Exception as exc:
+                self._append_log(f"[WD] reconcile failed: {exc}")
+                self._trade_executor.mark_reconcile_failed(str(exc))
+            else:
+                if snapshot is None:
+                    self._append_log("[WD] reconcile failed: empty snapshot")
+                    self._trade_executor.mark_reconcile_failed("snapshot_missing")
+                else:
+                    self._trade_executor.apply_reconcile_snapshot(snapshot)
+                    self._append_log("[WD] reconcile applied")
+            self._rest_future = None
+        if self._rest_future is None:
+            if self._trade_executor.watchdog_tick():
+                self._rest_future = self._rest_exec.submit(
+                    self._trade_executor.collect_reconcile_snapshot
+                )
+                self._append_log("[WD] reconcile submitted")
 
     def _refresh_ui(self) -> None:
         if not self._router:
@@ -931,11 +969,35 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _clear_log(self) -> None:
+        with self._log_lock:
+            self._log_queue.clear()
+        self._last_log_message = None
+        self._last_log_ts = 0.0
         self.log.clear()
 
     def _append_log(self, message: str) -> None:
-        self.log.appendPlainText(message)
+        now = time.monotonic()
+        if (
+            self._last_log_message == message
+            and now - self._last_log_ts < 0.5
+        ):
+            return
+        self._last_log_message = message
+        self._last_log_ts = now
         if self._should_warn_invalid_api(message):
+            self._auth_warning_pending = True
+        with self._log_lock:
+            self._log_queue.append(message)
+
+    def _flush_log_queue(self) -> None:
+        batch: list[str] = []
+        with self._log_lock:
+            while self._log_queue and len(batch) < self._log_flush_limit:
+                batch.append(self._log_queue.popleft())
+        if batch:
+            self.log.appendPlainText("\n".join(batch))
+        if self._auth_warning_pending:
+            self._auth_warning_pending = False
             self._show_auth_warning_once()
 
     def _should_warn_invalid_api(self, message: str) -> bool:
