@@ -11,6 +11,7 @@ class Settings:
     ws_stale_ms: int
     http_fresh_ms: int
     http_poll_ms: int
+    http_timeout_s: float
     ui_refresh_ms: int
     ws_log_throttle_ms: int
     ws_reconnect_dedup_ms: int
@@ -53,6 +54,7 @@ class Settings:
     order_quote: float
     max_budget: float
     budget_reserve: float
+    rest_timeout_s: float
 
 
 @dataclass

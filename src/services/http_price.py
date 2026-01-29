@@ -4,8 +4,8 @@ import httpx
 
 
 class HttpPriceService:
-    def __init__(self) -> None:
-        self._client = httpx.Client(timeout=5.0)
+    def __init__(self, timeout_s: float = 5.0) -> None:
+        self._client = httpx.Client(timeout=httpx.Timeout(timeout_s))
         self._base_url = "https://api.binance.com"
 
     def fetch_book_ticker(self, symbol: str) -> dict:
