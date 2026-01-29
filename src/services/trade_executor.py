@@ -1088,7 +1088,11 @@ class TradeExecutor:
         self.cycles_done = 0
         self.cycles_target = self._normalize_cycle_target(self._settings.cycle_count)
         self._next_cycle_ready_ts = None
-        return self._attempt_cycle_start()
+        placed = self._attempt_cycle_start()
+        if not placed:
+            self._next_cycle_ready_ts = time.monotonic() + self._cycle_cooldown_s
+            self._logger("[CYCLE_START] delayed: waiting for next cycle window")
+        return placed
 
     def stop_run_by_user(self, reason: str = "user") -> None:
         self.run_active = False
