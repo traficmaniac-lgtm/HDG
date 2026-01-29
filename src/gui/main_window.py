@@ -107,6 +107,8 @@ class MainWindow(QMainWindow):
         self._http_timer.timeout.connect(self._poll_http)
         self._orders_timer = QTimer(self)
         self._orders_timer.timeout.connect(self._refresh_orders)
+        self._watchdog_timer = QTimer(self)
+        self._watchdog_timer.timeout.connect(self._watchdog_tick)
 
         self._ws_thread = None
         self._ws_worker = None
@@ -584,6 +586,7 @@ class MainWindow(QMainWindow):
         self._http_timer.start(self._settings.http_poll_ms)
         self._ui_timer.start(self._settings.ui_refresh_ms)
         self._orders_timer.start(1000)
+        self._watchdog_timer.start(self._settings.watchdog_poll_ms)
 
         self._connected = True
         self._update_status(True)
@@ -599,6 +602,7 @@ class MainWindow(QMainWindow):
         self._ui_timer.stop()
         self._http_timer.stop()
         self._orders_timer.stop()
+        self._watchdog_timer.stop()
         if self._order_tracker:
             self._order_tracker.stop()
             self._order_tracker = None
@@ -654,6 +658,8 @@ class MainWindow(QMainWindow):
     def _on_ws_tick(self, bid: float, ask: float) -> None:
         if self._router:
             self._router.update_ws(bid, ask)
+        if self._trade_executor:
+            self._trade_executor.note_progress("ws_tick")
 
     @Slot(bool)
     def _on_ws_status(self, status: bool) -> None:
@@ -724,6 +730,8 @@ class MainWindow(QMainWindow):
                 "EXIT_TP_WORKING",
                 "EXIT_SL_WORKING",
                 "RECOVERY",
+                "RECONCILE",
+                "SAFE_STOP",
             }
             if not in_position and not self._router.is_ws_stale():
                 return
@@ -733,8 +741,14 @@ class MainWindow(QMainWindow):
             ask = float(payload.get("askPrice", 0.0))
             if self._router:
                 self._router.update_http(bid, ask)
+            if self._trade_executor:
+                self._trade_executor.note_progress("http_tick")
         except Exception as exc:
             self._append_log(f"HTTP ticker error: {exc}")
+
+    def _watchdog_tick(self) -> None:
+        if self._trade_executor:
+            self._trade_executor.watchdog_tick()
 
     def _refresh_ui(self) -> None:
         if not self._router:
@@ -1006,6 +1020,18 @@ class MainWindow(QMainWindow):
             ),
             inflight_deadline_ms=self._bounded_int(
                 payload.get("inflight_deadline_ms", 2500), 500, 10000, 2500
+            ),
+            watchdog_poll_ms=self._bounded_int(
+                payload.get("watchdog_poll_ms", 250), 200, 1000, 250
+            ),
+            max_state_stuck_ms=self._bounded_int(
+                payload.get("max_state_stuck_ms", 8000), 2000, 120000, 8000
+            ),
+            max_no_progress_ms=self._bounded_int(
+                payload.get("max_no_progress_ms", 5000), 1000, 60000, 5000
+            ),
+            max_reconcile_retries=self._bounded_int(
+                payload.get("max_reconcile_retries", 3), 1, 10, 3
             ),
             sell_refresh_grace_ms=self._bounded_int(
                 payload.get("sell_refresh_grace_ms", 400), 100, 3000, 400
