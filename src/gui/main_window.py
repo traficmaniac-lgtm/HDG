@@ -990,14 +990,10 @@ class MainWindow(QMainWindow):
             ),
             position_guard_http=bool(payload.get("position_guard_http", True)),
             entry_mode=str(payload.get("entry_mode", "NORMAL")).upper(),
-            aggressive_offset_ticks=self._bounded_int(
-                payload.get("aggressive_offset_ticks", 0), 0, 2, 0
-            ),
             account_mode=str(payload.get("account_mode", "CROSS_MARGIN")),
             leverage_hint=int(
                 payload.get("leverage_hint", payload.get("max_leverage_hint", 3))
             ),
-            offset_ticks=int(payload.get("offset_ticks", payload.get("test_tick_offset", 1))),
             entry_reprice_min_ticks=self._bounded_int(
                 payload.get(
                     "reprice_min_tick_moves",
@@ -1029,8 +1025,6 @@ class MainWindow(QMainWindow):
             stop_loss_ticks=int(payload.get("stop_loss_ticks", 2)),
             order_type=str(payload.get("order_type", "LIMIT")).upper(),
             exit_order_type=str(payload.get("exit_order_type", "LIMIT")).upper(),
-            sl_offset_ticks=int(payload.get("sl_offset_ticks", 0)),
-            buy_ttl_ms=self._bounded_int(payload.get("buy_ttl_ms", 2500), 500, 20000, 2500),
             max_buy_retries=self._bounded_int(
                 payload.get("max_buy_retries", 3), 0, 10, 3
             ),
@@ -1040,7 +1034,6 @@ class MainWindow(QMainWindow):
             auto_exit_enabled=bool(
                 payload.get("auto_exit_enabled", payload.get("auto_close", True))
             ),
-            sell_ttl_ms=int(payload.get("sell_ttl_ms", 8000)),
             max_sell_retries=int(payload.get("max_sell_retries", 3)),
             max_sl_ttl_retries=self._bounded_int(
                 payload.get("max_sl_ttl_retries", 2), 0, 20, 2
