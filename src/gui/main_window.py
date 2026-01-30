@@ -884,7 +884,7 @@ class MainWindow(QMainWindow):
         self.entry_age_label.setText(self._fmt_int(entry_age_ms, width=8))
         self.entry_reprice_reason_label.setText("—")
 
-        self._update_exit_status(price_state.mid)
+        self._update_exit_status(price_state.bid, price_state.ask, price_state.mid)
 
         exit_intent = self._trade_executor.exit_intent if self._trade_executor else None
         exit_policy = "—"
@@ -1516,7 +1516,12 @@ class MainWindow(QMainWindow):
             env.setdefault(key, value)
         return env
 
-    def _update_exit_status(self, mid: Optional[float]) -> None:
+    def _update_exit_status(
+        self,
+        bid: Optional[float],
+        ask: Optional[float],
+        mid: Optional[float],
+    ) -> None:
         buy_price = None
         tp_price = None
         sl_price = None
@@ -1528,10 +1533,21 @@ class MainWindow(QMainWindow):
             if buy_price is not None and tick_size:
                 tp_price = buy_price + self._settings.take_profit_ticks * tick_size
                 sl_price = buy_price - self._settings.stop_loss_ticks * tick_size
-                if mid is not None and mid >= tp_price:
-                    tp_ready = True
-                if mid is not None and mid <= sl_price:
-                    sl_ready = True
+                best_bid = bid if bid is not None else mid
+                best_ask = ask if ask is not None else mid
+                position_side = (
+                    "SHORT" if self._trade_executor.get_entry_side() == "SELL" else "LONG"
+                )
+                if position_side == "SHORT":
+                    if best_ask is not None and best_ask <= tp_price:
+                        tp_ready = True
+                    if best_bid is not None and best_bid >= sl_price:
+                        sl_ready = True
+                else:
+                    if best_bid is not None and best_bid >= tp_price:
+                        tp_ready = True
+                    if best_ask is not None and best_ask <= sl_price:
+                        sl_ready = True
 
         self.tp_price_label.setText(self._fmt_price(tp_price, width=12))
         self.sl_price_label.setText(self._fmt_price(sl_price, width=12))

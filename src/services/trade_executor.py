@@ -2041,6 +2041,7 @@ class TradeExecutor:
         bid = price_state.bid
         ask = price_state.ask
         mid = price_state.mid
+        best_bid, best_ask = self._book_refs(price_state)
         position_side = self._position_side()
         exit_side = self._exit_side()
         if self.exit_intent is None:
@@ -2049,24 +2050,27 @@ class TradeExecutor:
         sl_triggered = False
         if sl_price is not None:
             if position_side == "SHORT":
-                sl_triggered = bid is not None and bid >= sl_price
+                sl_triggered = best_bid is not None and best_bid >= sl_price
             else:
-                sl_triggered = ask is not None and ask <= sl_price
+                sl_triggered = best_ask is not None and best_ask <= sl_price
         if sl_triggered:
+            best_bid_label = "—" if best_bid is None else f"{best_bid:.8f}"
+            best_ask_label = "—" if best_ask is None else f"{best_ask:.8f}"
             self._logger(
                 "[SELL_PLAN] "
                 f"phase=SL reason=SL qty={remaining_qty:.8f} price={sl_price:.8f} "
-                f"bid={bid:.8f} ask={ask if ask is not None else '—'} mid={mid if mid is not None else '—'}"
+                f"bid={best_bid_label} ask={best_ask_label} "
+                f"mid={mid if mid is not None else '—'}"
             )
             self._cancel_active_sell(reason="SL")
             self._set_exit_intent("SL", mid=mid, ticks=int(self._settings.stop_loss_ticks), force=True)
-            sl_override = bid if exit_side == "SELL" else ask
+            sl_override = best_bid if exit_side == "SELL" else best_ask
             self._place_sell_order(
                 reason="SL_HARD",
-                price_override=sl_override if sl_override is not None else bid if bid is not None else ask,
+                price_override=sl_override if sl_override is not None else best_bid if best_bid is not None else best_ask,
                 exit_intent="SL",
-                ref_bid=bid,
-                ref_ask=ask,
+                ref_bid=best_bid,
+                ref_ask=best_ask,
             )
             return
 
@@ -2082,34 +2086,21 @@ class TradeExecutor:
         tp_triggered = False
         if tp_price is not None:
             if position_side == "SHORT":
-                tp_triggered = ask is not None and ask <= tp_price
+                tp_triggered = best_ask is not None and best_ask <= tp_price
             else:
-                tp_triggered = bid is not None and bid >= tp_price
+                tp_triggered = best_bid is not None and best_bid >= tp_price
         if tick_size and tp_price is not None and not self._tp_armed:
             arm_level = tp_price - tick_size if position_side != "SHORT" else tp_price + tick_size
             if position_side == "SHORT":
-                bid_reached = ask is not None and ask <= arm_level
+                bid_reached = best_ask is not None and best_ask <= arm_level
             else:
-                bid_reached = bid is not None and bid >= arm_level
+                bid_reached = best_bid is not None and best_bid >= arm_level
             if bid_reached:
                 self._tp_armed = True
-        spread_tight = False
-        if bid is not None and ask is not None and tick_size:
-            spread_tight = (ask - bid) <= tick_size
-        ws_bad = price_state.source == "WS" and self._entry_ws_bad(health_state.ws_connected)
-        http_fresh_ms = int(getattr(self._settings, "http_fresh_ms", 1000) or 0)
-        http_fresh = (
-            health_state.http_age_ms is not None
-            and health_state.http_age_ms <= http_fresh_ms
-        )
         cross_reason = None
         if tp_triggered and self._tp_armed:
             if elapsed_ms >= cross_after_ms:
                 cross_reason = "timeout"
-            elif spread_tight:
-                cross_reason = "tight_spread"
-            elif ws_bad and http_fresh:
-                cross_reason = "ws_unstable_http"
         desired_phase = "CROSS" if cross_reason and self._tp_armed else "MAKER"
         if price_state.data_blind and desired_phase == "CROSS":
             if not self._should_dedup_log("exit_cross_blocked_data_blind", 2.0):
@@ -2131,8 +2122,8 @@ class TradeExecutor:
                         reason="TP_MAKER",
                         price_override=tp_price,
                         exit_intent="TP",
-                        ref_bid=bid,
-                        ref_ask=ask,
+                        ref_bid=best_bid,
+                        ref_ask=best_ask,
                     )
                 self._enter_safe_stop(reason="DATA_BLIND_EXIT_HARD", allow_rest=False)
                 return
@@ -2252,23 +2243,28 @@ class TradeExecutor:
         exit_reason = "TP_MAKER" if desired_phase == "MAKER" else "TP_CROSS"
         self._tp_exit_phase = desired_phase
         if desired_phase == "CROSS":
-            price_override = bid if bid is not None else tp_price
+            if exit_side == "SELL":
+                price_override = best_bid if best_bid is not None else tp_price
+            else:
+                price_override = best_ask if best_ask is not None else tp_price
         else:
             price_override = tp_price
         self._sell_last_seen_ts = now
+        best_bid_label = "—" if best_bid is None else f"{best_bid:.8f}"
+        best_ask_label = "—" if best_ask is None else f"{best_ask:.8f}"
         self._logger(
             "[SELL_PLAN] "
             f"phase={desired_phase} reason=TP qty={qty_to_sell:.8f} "
-            f"price={price_override:.8f} bid={bid if bid is not None else '—'} "
-            f"ask={ask if ask is not None else '—'} mid={mid if mid is not None else '—'}"
+            f"price={price_override:.8f} bid={best_bid_label} "
+            f"ask={best_ask_label} mid={mid if mid is not None else '—'}"
         )
         self._place_sell_order(
             reason=exit_reason,
             price_override=price_override,
             exit_intent="TP",
             qty_override=qty_to_sell,
-            ref_bid=bid,
-            ref_ask=ask,
+            ref_bid=best_bid,
+            ref_ask=best_ask,
             tick_size=self._profile.tick_size,
         )
 
@@ -2319,9 +2315,27 @@ class TradeExecutor:
             configured = 8000
         return self._clamp_int(configured, 6000, 9000)
 
+    def _book_refs(self, price_state: PriceState) -> tuple[Optional[float], Optional[float]]:
+        bid = price_state.bid
+        ask = price_state.ask
+        if bid is None or ask is None:
+            mid = price_state.mid
+            if mid is not None:
+                bid = mid if bid is None else bid
+                ask = mid if ask is None else ask
+            if not self._should_dedup_log("book_missing", 2.0):
+                bid_label = "—" if price_state.bid is None else f"{price_state.bid:.8f}"
+                ask_label = "—" if price_state.ask is None else f"{price_state.ask:.8f}"
+                mid_label = "—" if price_state.mid is None else f"{price_state.mid:.8f}"
+                self._logger(
+                    f"[BOOK_MISSING] bid={bid_label} ask={ask_label} mid={mid_label}"
+                )
+        return bid, ask
+
     def _sl_breached(self, price_state: PriceState, sl_price: Optional[float]) -> bool:
         if sl_price is None:
             return False
+        best_bid, best_ask = self._book_refs(price_state)
         tick_size = self._profile.tick_size or 0.0
         allowed_ticks = int(
             getattr(self._settings, "exit_sl_emergency_ticks", self.EXIT_SL_EMERGENCY_TICKS)
@@ -2329,14 +2343,14 @@ class TradeExecutor:
         buffer = allowed_ticks * tick_size if tick_size else 0.0
         position_side = self._position_side()
         if position_side == "SHORT":
-            if price_state.ask is None:
+            if best_ask is None:
                 return False
             threshold = sl_price + buffer
-            return price_state.ask >= threshold
-        if price_state.bid is None:
+            return best_ask >= threshold
+        if best_bid is None:
             return False
         threshold = sl_price - buffer
-        return price_state.bid <= threshold
+        return best_bid <= threshold
 
     def _exit_elapsed_ms(self) -> Optional[int]:
         if self._exit_started_ts is None:
@@ -4176,8 +4190,16 @@ class TradeExecutor:
             f"limit_ms={max_wait_ms} side={exit_side}"
         )
         entry_avg = self._entry_avg_price or self.get_buy_price()
-        _, sl_price = self._compute_tp_sl_prices(entry_avg)
+        tp_price, sl_price = self._compute_tp_sl_prices(entry_avg)
         sl_breached = self._sl_breached(price_state, sl_price)
+        best_bid, best_ask = self._book_refs(price_state)
+        position_side = self._position_side()
+        tp_triggered = False
+        if tp_price is not None:
+            if position_side == "SHORT":
+                tp_triggered = best_ask is not None and best_ask <= tp_price
+            else:
+                tp_triggered = best_bid is not None and best_bid >= tp_price
         max_cross_attempts = int(
             getattr(self._settings, "exit_cross_attempts", self.EXIT_CROSS_MAX_ATTEMPTS)
         )
@@ -4186,6 +4208,10 @@ class TradeExecutor:
             status_missing_ms = int(
                 (time.monotonic() - self._exit_missing_since_ts) * 1000.0
             )
+        if not sl_breached and not tp_triggered:
+            if not self._should_dedup_log("exit_cross_blocked_tp_unmet", 2.0):
+                self._logger("[EXIT_CROSS_BLOCKED] reason=tp_unmet_by_book")
+            return False
         if not sl_breached or self._exit_cross_attempts < max_cross_attempts:
             if self._exit_cross_attempts >= max_cross_attempts:
                 self._logger(
@@ -4453,6 +4479,22 @@ class TradeExecutor:
                     decided = "entry_placed"
         else:
             force_cross = reason == "progress_deadline_exit"
+            if force_cross and not have_open_exit:
+                price_state, _ = self._router.build_price_state()
+                best_bid, best_ask = self._book_refs(price_state)
+                entry_avg = self._entry_avg_price or self.get_buy_price()
+                tp_price, _ = self._compute_tp_sl_prices(entry_avg)
+                position_side = self._position_side()
+                tp_triggered = False
+                if tp_price is not None:
+                    if position_side == "SHORT":
+                        tp_triggered = best_ask is not None and best_ask <= tp_price
+                    else:
+                        tp_triggered = best_bid is not None and best_bid >= tp_price
+                if not tp_triggered:
+                    if not self._should_dedup_log("exit_cross_blocked_tp_unmet", 2.0):
+                        self._logger("[EXIT_CROSS_BLOCKED] reason=tp_unmet_by_book")
+                    force_cross = False
             if force_cross and not have_open_exit:
                 self._tp_exit_phase = "CROSS"
                 if self.exit_intent is None:
