@@ -15,3 +15,4 @@
     - test_data_blind_false_when_http_fresh
     - test_fsm_no_stuck_entry_working
 - 0.7.30.5: Fixed cache-aware data_blind gating, raised ENTRY freshness window, and added dust accumulate flow for minNotional partial fills.
+- 0.7.30.7: Carry dust tails instead of TOPUP spam, enforce single-flight START, correct SHORT entry/exit sides/logs, and base TP/SL triggers + maker prices on book quotes.
