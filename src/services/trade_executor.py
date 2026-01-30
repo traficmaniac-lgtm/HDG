@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import re
+import secrets
 import time
 from collections import deque
 from decimal import Decimal, ROUND_FLOOR
@@ -12,6 +13,7 @@ from typing import Callable, Optional
 import httpx
 
 from src.core.models import HealthState, PriceState, Settings, SymbolProfile
+from src.core.order_registry import OrderMeta, OrderRegistry, OrderRole
 from src.core.trade_ledger import CycleStatus, TradeLedger
 from src.services.binance_rest import BinanceRestClient
 from src.services.price_router import PriceRouter
@@ -61,7 +63,7 @@ class TradeExecutor:
         self._logger = logger
         self.active_test_orders: list[dict] = []
         self._client_tag = self._sanitize_client_order_id(
-            f"HDG_{self._settings.symbol}"
+            f"HDG-{self._settings.symbol}-"
         )
         self.borrowed_assets: dict[str, float] = {}
         self.last_action = "idle"
@@ -76,6 +78,7 @@ class TradeExecutor:
         self.pnl_session: float = 0.0
         self.last_exit_reason: Optional[str] = None
         self.ledger = TradeLedger(logger=self._logger)
+        self._order_registry = OrderRegistry()
         self._last_ledger_unreal_ts = 0.0
         self._last_buy_price: Optional[float] = None
         self._buy_wait_started_ts: Optional[float] = None
@@ -193,6 +196,7 @@ class TradeExecutor:
         self._exit_cross_attempts = 0
         self._direction = "LONG"
         self._order_roles: dict[int, dict] = {}
+        self._pending_replace_clients: dict[OrderRole, str] = {}
         self._last_entry_wait_payload: Optional[tuple[object, ...]] = None
         self._dust_accumulate = False
         self._dust_carry_qty = 0.0
@@ -219,10 +223,14 @@ class TradeExecutor:
         return "BUY" if self._direction == "SHORT" else "SELL"
 
     def _entry_role_tag(self) -> str:
-        return f"ENTRY_{self._direction}"
+        return "ENTRY"
 
     def _exit_role_tag(self, role: str) -> str:
-        return f"{role}_{self._direction}"
+        if role == "EXIT_TP":
+            return "XTP"
+        if role == "EXIT_CROSS":
+            return "XCR"
+        return role
 
     def _set_start_inflight(self) -> bool:
         with self._start_inflight_lock:
@@ -454,6 +462,117 @@ class TradeExecutor:
             "created_ts": int(time.time() * 1000),
         }
 
+    def _normalize_order_role(self, role: str) -> OrderRole:
+        role_upper = role.upper()
+        if role_upper in {"ENTRY", "ENTRY_TOPUP"}:
+            return OrderRole.ENTRY
+        if role_upper == "EXIT_TP":
+            return OrderRole.EXIT_TP
+        if role_upper == "EXIT_CROSS":
+            return OrderRole.EXIT_CROSS
+        return OrderRole.CANCEL_ONLY
+
+    def _register_order_meta(
+        self,
+        client_id: str,
+        role: str,
+        side: str,
+        price: float,
+        qty: float,
+    ) -> None:
+        cycle_id = self._current_cycle_id or 0
+        now = time.time()
+        meta = OrderMeta(
+            client_id=client_id,
+            order_id=None,
+            symbol=self._settings.symbol,
+            cycle_id=cycle_id,
+            direction=self._direction,
+            role=self._normalize_order_role(role),
+            side=side,
+            price=price,
+            orig_qty=qty,
+            created_ts=now,
+            last_update_ts=now,
+            status="NEW",
+        )
+        self._order_registry.register_new(meta)
+        if not self._should_dedup_log(f"order_reg:{client_id}", 0.5):
+            self._logger(
+                "[ORDER_REG] "
+                f"client_id={client_id} role={meta.role.value} cycle={cycle_id} "
+                f"side={side} price={price:.8f} qty={qty:.8f}"
+            )
+
+    def _bind_order_meta(self, client_id: str, order_id: Optional[int]) -> None:
+        if not isinstance(order_id, int):
+            return
+        self._order_registry.bind_order_id(client_id, order_id)
+        self._order_registry.update_status(client_id, "WORKING")
+        if not self._should_dedup_log(f"order_bind:{client_id}:{order_id}", 0.5):
+            self._logger(
+                f"[ORDER_BIND] client_id={client_id} order_id={order_id}"
+            )
+
+    def _update_registry_status_by_order(
+        self,
+        order_id: Optional[int],
+        status: str,
+        filled_qty_delta: float = 0.0,
+    ) -> None:
+        if not isinstance(order_id, int):
+            return
+        meta = self._order_registry.get_meta_by_order_id(order_id)
+        if meta is None:
+            return
+        self._order_registry.update_status(
+            meta.client_id, status, filled_qty_delta=filled_qty_delta
+        )
+
+    def _log_role_active_skip(
+        self,
+        cycle_id: int,
+        role: str,
+        client_id: Optional[str],
+    ) -> None:
+        key = f"role_active_skip:{cycle_id}:{role}"
+        if self._should_dedup_log(key, 0.5):
+            return
+        client_label = client_id or "?"
+        self._logger(
+            f"[ROLE_ACTIVE_SKIP] cycle={cycle_id} role={role} client_id={client_label}"
+        )
+
+    def _get_active_meta_for_role(
+        self,
+        cycle_id: int,
+        role: str,
+    ) -> Optional[OrderMeta]:
+        role_enum = self._normalize_order_role(role)
+        return self._order_registry.get_active_for_role(cycle_id, role_enum)
+
+    def _note_pending_replace(self, order_id: Optional[int]) -> None:
+        if not isinstance(order_id, int):
+            return
+        meta = self._order_registry.get_meta_by_order_id(order_id)
+        if meta is None:
+            return
+        self._pending_replace_clients[meta.role] = meta.client_id
+
+    def _apply_pending_replace(
+        self,
+        role: str,
+        new_client_id: str,
+        new_order_id: Optional[int],
+    ) -> None:
+        role_enum = self._normalize_order_role(role)
+        old_client_id = self._pending_replace_clients.pop(role_enum, None)
+        if not old_client_id:
+            return
+        self._order_registry.mark_replaced(
+            old_client_id, new_client_id, new_order_id
+        )
+
     def _clear_order_role(self, order_id: Optional[int]) -> None:
         if not isinstance(order_id, int):
             return
@@ -483,13 +602,19 @@ class TradeExecutor:
             tag = self._exit_role_tag(role)
         if not tag:
             return False
-        return f"-{tag}" in client_order_id
+        return f"-{tag}-" in client_order_id
 
     def _has_active_role(self, role: str) -> bool:
         role_upper = role.upper()
+        cycle_id = self._current_cycle_id or 0
+        active_meta = self._get_active_meta_for_role(cycle_id, role_upper)
+        if active_meta is not None:
+            return True
         for order in self.active_test_orders:
             order_role = str(order.get("role") or "").upper()
-            if order_role != role_upper:
+            if order_role != role_upper and not (
+                role_upper == "ENTRY" and order_role == "ENTRY_TOPUP"
+            ):
                 continue
             if role_upper == "ENTRY":
                 if not self._entry_order_is_final(order):
@@ -564,9 +689,9 @@ class TradeExecutor:
         self, order_id: Optional[int], side_upper: str
     ) -> tuple[str, str]:
         if isinstance(order_id, int):
-            role_entry = self._order_roles.get(order_id)
-            if role_entry is not None:
-                return str(role_entry.get("role", "ENTRY")), "registry"
+            meta = self._order_registry.get_meta_by_order_id(order_id)
+            if meta is not None:
+                return meta.role.value, "registry"
         fallback_role = None
         fallback_reason = "unknown"
         if isinstance(order_id, int) and order_id == self.entry_active_order_id:
@@ -596,6 +721,27 @@ class TradeExecutor:
             f"dir={self._direction} side={side_upper}"
         )
         return fallback_role, fallback_reason
+
+    def _get_meta_for_fill(
+        self,
+        order_id: Optional[int],
+        qty: float,
+        price: float,
+    ) -> Optional[OrderMeta]:
+        if not isinstance(order_id, int):
+            return None
+        meta = self._order_registry.get_meta_by_order_id(order_id)
+        if meta is None:
+            if not self._should_dedup_log(f"fill_unmapped:{order_id}", 0.5):
+                self._logger(f"[FILL_UNMAPPED] order_id={order_id}")
+            return None
+        if not self._should_dedup_log(f"fill_map:{order_id}", 0.5):
+            self._logger(
+                "[FILL_MAP] "
+                f"order_id={order_id} -> cycle={meta.cycle_id} "
+                f"role={meta.role.value} qty={qty:.8f} price={price:.8f}"
+            )
+        return meta
 
     def _trade_gate_age_ms(self, action: str) -> int:
         if action == "ENTRY":
@@ -902,13 +1048,14 @@ class TradeExecutor:
         self._logger(f"[CYCLE_START] id={cycle_id}")
         if self.ledger._next_id <= cycle_id:
             self.ledger._next_id = cycle_id
-        self.ledger.start_cycle(
+        ledger_cycle_id = self.ledger.start_cycle(
             symbol=self._settings.symbol,
             direction=self._direction,
             entry_qty=0.0,
             entry_avg=0.0,
             notes="START",
         )
+        self._current_cycle_id = ledger_cycle_id
 
     def _log_cycle_fill(self, cycle_id: Optional[int], side: str, delta: float, cum: float) -> None:
         if cycle_id is None:
@@ -2564,6 +2711,7 @@ class TradeExecutor:
         )
         is_isolated = "TRUE" if self._settings.margin_isolated else "FALSE"
         if order_id:
+            self._note_pending_replace(order_id)
             self._cancel_margin_order(
                 symbol=self._settings.symbol,
                 order_id=order_id,
@@ -2689,11 +2837,26 @@ class TradeExecutor:
             or reason_upper in {"TP_CROSS", "TP_FORCE", "SL_HARD", "EMERGENCY", "RECOVERY"}
             or self._tp_exit_phase == "CROSS"
         )
-        if self._has_active_role("EXIT_CROSS"):
+        active_cycle_id = self._current_cycle_id or 0
+        active_cross_meta = self._get_active_meta_for_role(
+            active_cycle_id, "EXIT_CROSS"
+        )
+        if active_cross_meta is not None or self._has_active_role("EXIT_CROSS"):
+            client_id = active_cross_meta.client_id if active_cross_meta else None
+            self._log_role_active_skip(
+                active_cycle_id, "EXIT_CROSS", client_id
+            )
             self._log_guard_active_order("EXIT_CROSS")
             self.last_action = "exit_cross_active_guard"
             return 0
-        if self._has_active_role("EXIT_TP") and not is_cross_intent:
+        active_tp_meta = self._get_active_meta_for_role(
+            active_cycle_id, "EXIT_TP"
+        )
+        if (active_tp_meta is not None or self._has_active_role("EXIT_TP")) and not is_cross_intent:
+            client_id = active_tp_meta.client_id if active_tp_meta else None
+            self._log_role_active_skip(
+                active_cycle_id, "EXIT_TP", client_id
+            )
             self._log_guard_active_order("EXIT_TP")
             self.last_action = "exit_tp_active_guard"
             return 0
@@ -3073,6 +3236,13 @@ class TradeExecutor:
             )
             if self.position is not None and self.position.get("partial"):
                 self._logger(f"[SELL_FOR_PARTIAL] qty={qty:.8f}")
+            self._register_order_meta(
+                client_id=exit_client_id,
+                role=exit_role,
+                side=exit_side,
+                price=sell_price if sell_price is not None else mid or 0.0,
+                qty=qty,
+            )
             exit_order = self._place_margin_order(
                 symbol=self._settings.symbol,
                 side=exit_side,
@@ -3084,6 +3254,7 @@ class TradeExecutor:
                 order_type=order_type,
             )
             if not exit_order:
+                self._order_registry.update_status(exit_client_id, "REJECTED")
                 if self._last_place_error_code == -2010:
                     return self._handle_sell_insufficient_balance(reason)
                 if (
@@ -3110,6 +3281,8 @@ class TradeExecutor:
             if isinstance(exit_order_id, int):
                 self._cycle_order_ids.add(exit_order_id)
             self._register_order_role(exit_order_id, exit_role)
+            self._bind_order_meta(exit_client_id, exit_order_id)
+            self._apply_pending_replace(exit_role, exit_client_id, exit_order_id)
             if reason_upper in {"TP", "TP_MAKER", "TP_FORCE", "TP_CROSS", "SL", "SL_HARD"}:
                 self._logger(
                     f"[ORDER] {exit_side} placed "
@@ -3163,7 +3336,17 @@ class TradeExecutor:
 
     def _place_emergency_market_sell(self, qty: float, force: bool = False) -> int:
         exit_side = self._exit_side()
-        if self._has_active_role("EXIT_CROSS"):
+        active_cycle_id = self._current_cycle_id or 0
+        active_cross_meta = self._get_active_meta_for_role(
+            active_cycle_id, "EXIT_CROSS"
+        )
+        if active_cross_meta is not None or self._has_active_role("EXIT_CROSS"):
+            client_id = active_cross_meta.client_id if active_cross_meta else None
+            self._log_role_active_skip(
+                active_cycle_id,
+                "EXIT_CROSS",
+                client_id,
+            )
             self._log_guard_active_order("EXIT_CROSS")
             self.last_action = "exit_cross_active_guard"
             return 0
@@ -3237,6 +3420,13 @@ class TradeExecutor:
                 if self._settings.allow_borrow and self._borrow_allowed_by_api is not False
                 else None
             )
+            self._register_order_meta(
+                client_id=sell_client_id,
+                role="EXIT_CROSS",
+                side=exit_side,
+                price=price_state.mid or 0.0,
+                qty=qty,
+            )
             sell_order = self._place_margin_order(
                 symbol=self._settings.symbol,
                 side=exit_side,
@@ -3248,6 +3438,7 @@ class TradeExecutor:
                 order_type="MARKET",
             )
             if not sell_order:
+                self._order_registry.update_status(sell_client_id, "REJECTED")
                 self._logger(f"[ORDER] {exit_side} rejected")
                 self.last_action = "place_failed"
                 self._transition_to_position_state()
@@ -3256,6 +3447,8 @@ class TradeExecutor:
             if isinstance(sell_order_id, int):
                 self._cycle_order_ids.add(sell_order_id)
             self._register_order_role(sell_order_id, "EXIT_CROSS")
+            self._bind_order_meta(sell_client_id, sell_order_id)
+            self._apply_pending_replace("EXIT_CROSS", sell_client_id, sell_order_id)
             self._logger(
                 f"[ORDER] {exit_side} placed "
                 f"cycle_id={cycle_label} reason=EMERGENCY type=MARKET "
@@ -3701,10 +3894,15 @@ class TradeExecutor:
         entry_context: str,
         reason: str,
     ) -> bool:
-        if reason not in {"reprice", "deadline_replace"} and self._has_active_role("ENTRY"):
-            self._log_guard_active_order("ENTRY")
-            self.last_action = "entry_active_guard"
-            return False
+        if reason not in {"reprice", "deadline_replace"}:
+            cycle_id = self._current_cycle_id or 0
+            active_meta = self._get_active_meta_for_role(cycle_id, "ENTRY")
+            if active_meta is not None or self._has_active_role("ENTRY"):
+                client_id = active_meta.client_id if active_meta else None
+                self._log_role_active_skip(cycle_id, "ENTRY", client_id)
+                self._log_guard_active_order("ENTRY")
+                self.last_action = "entry_active_guard"
+                return False
         if not self._profile.tick_size or not self._profile.step_size:
             return False
         new_price = self._calculate_entry_price(price)
@@ -3727,6 +3925,13 @@ class TradeExecutor:
         side_effect_type = self._normalize_side_effect_type(
             self._settings.side_effect_type
         )
+        self._register_order_meta(
+            client_id=entry_client_id,
+            role="ENTRY",
+            side=entry_side,
+            price=new_price,
+            qty=qty,
+        )
         self._log_entry_place(new_price, bid, ask, entry_context)
         entry_order = self._place_margin_order(
             symbol=self._settings.symbol,
@@ -3739,11 +3944,14 @@ class TradeExecutor:
             order_type="LIMIT",
         )
         if not entry_order:
+            self._order_registry.update_status(entry_client_id, "REJECTED")
             return False
         entry_order_id = entry_order.get("orderId")
         if isinstance(entry_order_id, int):
             self._cycle_order_ids.add(entry_order_id)
             self._clear_start_inflight()
+        self._bind_order_meta(entry_client_id, entry_order_id)
+        self._apply_pending_replace("ENTRY", entry_client_id, entry_order_id)
         cycle_label = self._cycle_id_label()
         self._logger(
             f"[ORDER] {entry_side} placed cycle_id={cycle_label} qty={qty:.8f} "
@@ -3824,6 +4032,13 @@ class TradeExecutor:
         side_effect_type = self._normalize_side_effect_type(
             self._settings.side_effect_type
         )
+        self._register_order_meta(
+            client_id=entry_client_id,
+            role="ENTRY",
+            side=entry_side,
+            price=new_price,
+            qty=qty,
+        )
         self._log_entry_place(new_price, bid, ask, entry_context)
         entry_order = self._place_margin_order(
             symbol=self._settings.symbol,
@@ -3836,11 +4051,14 @@ class TradeExecutor:
             order_type="LIMIT",
         )
         if not entry_order:
+            self._order_registry.update_status(entry_client_id, "REJECTED")
             return False
         entry_order_id = entry_order.get("orderId")
         if isinstance(entry_order_id, int):
             self._cycle_order_ids.add(entry_order_id)
             self._clear_start_inflight()
+        self._bind_order_meta(entry_client_id, entry_order_id)
+        self._apply_pending_replace("ENTRY", entry_client_id, entry_order_id)
         cycle_label = self._cycle_id_label()
         self._logger(
             f"[ORDER] {entry_side} placed cycle_id={cycle_label} qty={qty:.8f} "
@@ -3850,7 +4068,7 @@ class TradeExecutor:
         self._entry_consecutive_fresh_reads = 0
         self._entry_order_price = new_price
         now_ms = int(time.time() * 1000)
-        self._register_order_role(entry_order_id, "ENTRY_TOPUP")
+        self._register_order_role(entry_order_id, "ENTRY")
         self.active_test_orders = [
             {
                 "orderId": entry_order_id,
@@ -3867,7 +4085,7 @@ class TradeExecutor:
                 "tag": self.TAG,
                 "clientOrderId": entry_order.get("clientOrderId", entry_client_id),
                 "cycle_id": self._current_cycle_id,
-                "role": "ENTRY_TOPUP",
+                "role": "ENTRY",
             }
         ]
         self.entry_active_order_id = entry_order.get("orderId")
@@ -4083,6 +4301,7 @@ class TradeExecutor:
                 cancel_result = False
                 final_status = "UNKNOWN"
                 if order_id in open_orders:
+                    self._note_pending_replace(order_id)
                     cancel_result = self._cancel_margin_order(
                         symbol=self._settings.symbol,
                         order_id=order_id,
@@ -5236,14 +5455,23 @@ class TradeExecutor:
         self, order_id: int, side: str, price: float, qty: float, ts_ms: int
     ) -> None:
         self.mark_progress(reason="fill", reset_reconcile=True)
+        meta = self._get_meta_for_fill(order_id, qty, price)
+        if meta is None:
+            return
         order = next(
             (entry for entry in self.active_test_orders if entry.get("orderId") == order_id),
             None,
         )
-        if order is None:
-            return
         side_upper = str(side).upper()
-        cycle_id = self._get_cycle_id_for_order(order)
+        cycle_id = meta.cycle_id
+        role = meta.role.value
+        if order is None:
+            if role == "ENTRY":
+                self.ledger.on_entry_fill(cycle_id, qty, price)
+            elif role in {"EXIT_TP", "EXIT_CROSS"}:
+                self.ledger.on_exit_fill(cycle_id, qty, price)
+            self._update_registry_status_by_order(order_id, "FILLED")
+            return
         trade_id = self._extract_trade_id(order)
         if not self._should_process_fill(order_id, side_upper, qty, price, cycle_id, trade_id):
             return
@@ -5255,7 +5483,7 @@ class TradeExecutor:
         order["updated_ts"] = ts_ms
         order["price"] = price
         order["qty"] = qty
-        self._apply_order_filled(order, dedup_checked=True)
+        self._apply_order_filled(order, dedup_checked=True, meta=meta)
         self.orders_count = len(self.active_test_orders)
 
     def handle_order_partial(
@@ -5266,6 +5494,9 @@ class TradeExecutor:
         avg_price: float,
         ts_ms: int,
     ) -> None:
+        meta = self._get_meta_for_fill(order_id, cum_qty, avg_price)
+        if meta is None:
+            return
         order = next(
             (entry for entry in self.active_test_orders if entry.get("orderId") == order_id),
             None,
@@ -5273,13 +5504,13 @@ class TradeExecutor:
         if order is None:
             return
         side_upper = str(side).upper()
-        cycle_id = self._get_cycle_id_for_order(order)
+        cycle_id = meta.cycle_id
         trade_id = self._extract_trade_id(order)
         if not self._should_process_fill(
             order_id, side_upper, cum_qty, avg_price, cycle_id, trade_id
         ):
             return
-        role, _ = self._resolve_fill_role(order_id, side_upper)
+        role = meta.role.value
         entry_side = self._entry_side()
         exit_side = self._exit_side()
         if role == "ENTRY":
@@ -5295,7 +5526,8 @@ class TradeExecutor:
                 self._log_cycle_fill(cycle_id, entry_side, delta, cum_qty)
                 fill_price = avg_price if avg_price > 0 else order.get("price")
                 if fill_price is not None:
-                    self.ledger.on_entry_fill(delta, float(fill_price))
+                    self.ledger.on_entry_fill(cycle_id, delta, float(fill_price))
+                self._update_registry_status_by_order(order_id, "PARTIAL", delta)
                 if self.position is None:
                     self.position = {
                         "buy_price": fill_price,
@@ -5375,7 +5607,8 @@ class TradeExecutor:
                 self._log_cycle_fill(cycle_id, exit_side, delta, cum_qty)
                 fill_price = avg_price if avg_price > 0 else order.get("price")
                 if fill_price is not None:
-                    self.ledger.on_exit_fill(delta, float(fill_price))
+                    self.ledger.on_exit_fill(cycle_id, delta, float(fill_price))
+                self._update_registry_status_by_order(order_id, "PARTIAL", delta)
                 cycle_label = "—" if cycle_id is None else str(cycle_id)
                 self._logger(
                     f"[SELL_PARTIAL] {self._direction_tag()} "
@@ -5406,6 +5639,7 @@ class TradeExecutor:
         self._logger(
             f"[ORDER] {side} {status} cycle_id={cycle_label} id={order_id}"
         )
+        self._update_registry_status_by_order(order_id, status)
         self._clear_order_role(order_id)
         self.active_test_orders = [
             entry for entry in self.active_test_orders if entry.get("orderId") != order_id
@@ -5431,20 +5665,29 @@ class TradeExecutor:
             else:
                 self._transition_state(TradeState.STATE_IDLE)
 
-    def _apply_order_filled(self, order: dict, dedup_checked: bool = False) -> None:
+    def _apply_order_filled(
+        self,
+        order: dict,
+        dedup_checked: bool = False,
+        meta: Optional[OrderMeta] = None,
+    ) -> None:
         side = order.get("side")
-        cycle_id = self._get_cycle_id_for_order(order)
         order_id = order.get("orderId")
         qty = float(order.get("qty") or 0.0)
         price = float(order.get("price") or 0.0)
         side_label = str(side or "UNKNOWN").upper()
+        if meta is None:
+            meta = self._get_meta_for_fill(order_id, qty, price)
+        if meta is None:
+            return
+        cycle_id = meta.cycle_id
         if not dedup_checked:
             trade_id = self._extract_trade_id(order)
             if not self._should_process_fill(
                 order_id, side_label, qty, price, cycle_id, trade_id
             ):
                 return
-        role, _ = self._resolve_fill_role(order_id, side_label)
+        role = meta.role.value
         entry_side = self._entry_side()
         exit_side = self._exit_side()
         cycle_label = "—" if cycle_id is None else str(cycle_id)
@@ -5463,7 +5706,7 @@ class TradeExecutor:
             delta = max(qty - prev_cum, 0.0)
             if delta > 0:
                 self._log_cycle_fill(cycle_id, entry_side, delta, qty)
-                self.ledger.on_entry_fill(delta, price)
+                self.ledger.on_entry_fill(cycle_id, delta, price)
             self._reset_buy_retry()
             self._clear_entry_attempt()
             if self.entry_active_order_id == order_id:
@@ -5550,7 +5793,7 @@ class TradeExecutor:
             if delta > 0:
                 self._log_cycle_fill(cycle_id, exit_side, delta, qty)
                 if fill_price is not None:
-                    self.ledger.on_exit_fill(delta, float(fill_price))
+                    self.ledger.on_exit_fill(cycle_id, delta, float(fill_price))
             pnl = self._finalize_close(order)
             self.last_exit_reason = exit_reason
             if exit_reason in {"TP_MAKER", "TP_FORCE", "TP_CROSS", "SL_HARD"}:
@@ -5572,6 +5815,7 @@ class TradeExecutor:
                 reason=exit_reason, pnl=pnl, qty=qty, buy_price=buy_price, cycle_id=cycle_id
             )
             self._clear_order_role(order_id)
+        self._update_registry_status_by_order(order_id, "FILLED")
 
     def _apply_entry_partial_fill(
         self,
@@ -5582,7 +5826,10 @@ class TradeExecutor:
         if qty <= 0:
             return
         entry_side = self._entry_side()
-        cycle_id = self._get_cycle_id_for_order(self._find_order(entry_side))
+        meta = self._get_meta_for_fill(order_id, qty, price or 0.0)
+        if meta is None:
+            return
+        cycle_id = meta.cycle_id
         avg_price = price if price is not None else 0.0
         if not self._should_process_fill(order_id, entry_side, qty, avg_price, cycle_id):
             return
@@ -5594,7 +5841,8 @@ class TradeExecutor:
         )
         self._log_cycle_fill(cycle_id, entry_side, qty, qty)
         if price is not None:
-            self.ledger.on_entry_fill(qty, float(price))
+            self.ledger.on_entry_fill(cycle_id, qty, float(price))
+            self._update_registry_status_by_order(order_id, "PARTIAL", qty)
         self._reset_buy_retry()
         self._clear_entry_attempt()
         if self.position is None:
@@ -5816,6 +6064,7 @@ class TradeExecutor:
             return
         is_isolated = "TRUE" if self._settings.margin_isolated else "FALSE"
         self._logger(f"[SELL_CANCEL] reason={reason} id={order_id}")
+        self._note_pending_replace(order_id)
         self._cancel_margin_order(
             symbol=self._settings.symbol,
             order_id=order_id,
@@ -6028,7 +6277,7 @@ class TradeExecutor:
             if notion > 0:
                 pnl_bps = (pnl / notion) * 10000
         self._log_cycle_close(cycle_id, pnl, pnl_bps, reason)
-        self.ledger.close_cycle(notes=reason)
+        self.ledger.close_cycle(cycle_id, notes=reason)
         duration_ms = None
         if self._cycle_started_ts is not None:
             duration_ms = int((time.monotonic() - self._cycle_started_ts) * 1000.0)
@@ -6132,6 +6381,7 @@ class TradeExecutor:
         self._clear_cancel_wait()
         if order_id is None:
             return
+        self._update_registry_status_by_order(order_id, status)
         buy_order["status"] = status
         self.active_test_orders = [
             entry for entry in self.active_test_orders if entry.get("orderId") != order_id
@@ -6231,6 +6481,7 @@ class TradeExecutor:
     def _finalize_sell_cancel(self, order_id: Optional[int]) -> None:
         if order_id is not None:
             self._logger(f"[SELL_CANCEL_CONFIRMED] id={order_id}")
+            self._update_registry_status_by_order(order_id, "CANCELED")
         self.mark_progress(reason="sell_cancel_confirmed", reset_reconcile=True)
         self.sell_cancel_pending = False
         self._clear_cancel_wait()
@@ -6264,6 +6515,8 @@ class TradeExecutor:
         live_order = self._get_margin_order_snapshot(order_id)
         if live_order:
             status = str(live_order.get("status") or "").upper()
+            if status:
+                self._update_registry_status_by_order(order_id, status)
             executed_qty = float(
                 live_order.get("executedQty", 0.0)
                 or live_order.get("executedQuantity", 0.0)
@@ -6641,12 +6894,20 @@ class TradeExecutor:
         self, side: str, timestamp: int, role_tag: Optional[str] = None
     ) -> str:
         cycle_id = self._current_cycle_id or 0
-        suffix = f"-{role_tag}" if role_tag else ""
-        raw = f"{self._client_tag}_C{cycle_id}_{side}_{timestamp}{suffix}"
+        direction = self._direction
+        role_label = role_tag or "GEN"
+        nonce = self._build_client_nonce(timestamp, side)
+        raw = (
+            f"HDG-{self._settings.symbol}-{direction}-C{cycle_id}-{role_label}-{nonce}"
+        )
         sanitized = self._sanitize_client_order_id(raw)
         if len(sanitized) > 36:
             sanitized = sanitized[:36]
         return sanitized
+
+    def _build_client_nonce(self, timestamp: int, side: str) -> str:
+        token = secrets.token_hex(3)
+        return token[:6]
 
     @staticmethod
     def _sanitize_client_order_id(value: str) -> str:
