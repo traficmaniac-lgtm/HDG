@@ -41,6 +41,9 @@ class OrderRegistry:
         if isinstance(meta.order_id, int):
             self.by_order_id[meta.order_id] = meta.client_id
 
+    def get_meta_by_client_id(self, client_id: str) -> Optional[OrderMeta]:
+        return self.by_client.get(client_id)
+
     def bind_order_id(self, client_id: str, order_id: int) -> None:
         meta = self.by_client.get(client_id)
         if meta is None:
@@ -66,6 +69,22 @@ class OrderRegistry:
         if not client_id:
             return None
         return self.by_client.get(client_id)
+
+    def get_meta_by_role_cycle_direction(
+        self,
+        cycle_id: int,
+        role: OrderRole,
+        direction: str,
+    ) -> Optional[OrderMeta]:
+        for meta in self.by_client.values():
+            if meta.cycle_id != cycle_id:
+                continue
+            if meta.role != role:
+                continue
+            if meta.direction != direction:
+                continue
+            return meta
+        return None
 
     def get_active_for_role(self, cycle_id: int, role: OrderRole) -> Optional[OrderMeta]:
         active_status = {"NEW", "WORKING", "PARTIAL"}
