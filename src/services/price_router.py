@@ -138,6 +138,8 @@ class PriceRouter:
         )
         ws_fresh = ws_age_ms is not None and ws_age_ms <= self._settings.ws_fresh_ms
         http_fresh = http_age_ms is not None and http_age_ms <= self._settings.http_fresh_ms
+        ws_has_quote = self._ws_bid is not None and self._ws_ask is not None
+        http_has_quote = self._http_bid is not None and self._http_ask is not None
         http_blind_ms = int(
             getattr(
                 self._settings,
@@ -154,7 +156,9 @@ class PriceRouter:
         )
         http_blind = http_age_ms is None or http_age_ms > http_blind_ms
         ws_blind = ws_age_ms is None or ws_age_ms > ws_blind_ms
-        data_blind = http_blind and ws_blind
+        data_blind = not ((ws_fresh and ws_has_quote) or (http_fresh and http_has_quote))
+        if data_blind:
+            self._last_switch_reason = "no_fresh_data"
 
         stable_ms = (
             int((now - self._ws_stable_since) * 1000)
@@ -180,9 +184,9 @@ class PriceRouter:
         effective_source = self._stable_source
         current_has_quote = False
         if effective_source == "WS":
-            current_has_quote = self._ws_bid is not None and self._ws_ask is not None
+            current_has_quote = ws_has_quote
         elif effective_source == "HTTP":
-            current_has_quote = self._http_bid is not None and self._http_ask is not None
+            current_has_quote = http_has_quote
         force_break_hold = (
             (effective_source == "WS" and not ws_acceptable) or not current_has_quote
         )
@@ -253,7 +257,6 @@ class PriceRouter:
             elif not current_has_quote:
                 self._source_hold_until_ts = None
                 hold_remaining_ms = 0
-        http_has_quote = self._http_bid is not None and self._http_ask is not None
         if http_fresh and http_has_quote and effective_source == "NONE":
             effective_source = "HTTP"
             self._last_switch_reason = "http_fresh"
@@ -292,6 +295,7 @@ class PriceRouter:
             self._last_good_source = quote_source
 
         if data_blind:
+            self._last_switch_reason = "no_fresh_data"
             effective_source = "NONE"
             quote_source = "NONE"
         from_cache = False

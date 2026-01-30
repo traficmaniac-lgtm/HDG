@@ -14,7 +14,7 @@ INFO_EVENT_LEVEL = logging.INFO + 5
 logging.addLevelName(INFO_EVENT_LEVEL, "INFO_EVENT")
 
 
-_SESSION_DIR: Optional[Path] = None
+_SESSION_PREFIX: Optional[str] = None
 _SESSION_CONTEXT: dict[str, str] = {
     "version": "unknown",
     "symbol": "UNKNOWN",
@@ -26,7 +26,8 @@ def configure_log_session(version: str, symbol: str, mode: str) -> Path:
     _SESSION_CONTEXT.update(
         {"version": str(version), "symbol": str(symbol), "mode": str(mode)}
     )
-    return _ensure_session_dir()
+    _ensure_session_prefix()
+    return _session_root()
 
 
 def _log_dir() -> Path:
@@ -43,24 +44,23 @@ def _session_root() -> Path:
     return path
 
 
-def _ensure_session_dir() -> Path:
-    global _SESSION_DIR
-    if _SESSION_DIR is not None:
-        return _SESSION_DIR
-    session_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{os.getpid()}"
-    session_dir = _session_root() / session_id
-    session_dir.mkdir(parents=True, exist_ok=True)
+def _ensure_session_prefix() -> str:
+    global _SESSION_PREFIX
+    if _SESSION_PREFIX is not None:
+        return _SESSION_PREFIX
+    session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    session_dir = _session_root()
     session_meta = {
         "version": _SESSION_CONTEXT["version"],
         "symbol": _SESSION_CONTEXT["symbol"],
         "mode": _SESSION_CONTEXT["mode"],
         "start_time": datetime.now().isoformat(timespec="seconds"),
     }
-    with (session_dir / "session.json").open("w", encoding="utf-8") as handle:
+    with (session_dir / f"{session_id}_session.json").open("w", encoding="utf-8") as handle:
         json.dump(session_meta, handle, indent=2, ensure_ascii=False)
         handle.write("\n")
-    _SESSION_DIR = session_dir
-    return session_dir
+    _SESSION_PREFIX = session_id
+    return session_id
 
 
 def _gzip_namer(name: str) -> str:
@@ -102,9 +102,10 @@ def get_logger() -> logging.Logger:
         return logger
     logger.setLevel(logging.DEBUG)
     logger.propagate = False
-    log_dir = _ensure_session_dir()
+    session_prefix = _ensure_session_prefix()
+    log_dir = _session_root()
     app_handler = BufferedRotatingFileHandler(
-        log_dir / "app.log",
+        log_dir / f"{session_prefix}_app.log",
         maxBytes=5 * 1024 * 1024,
         backupCount=3,
         encoding="utf-8",
@@ -115,7 +116,7 @@ def get_logger() -> logging.Logger:
     app_handler.namer = _gzip_namer
     app_handler.rotator = _gzip_rotator
     debug_handler = BufferedRotatingFileHandler(
-        log_dir / "debug.log",
+        log_dir / f"{session_prefix}_debug.log",
         maxBytes=10 * 1024 * 1024,
         backupCount=5,
         encoding="utf-8",
