@@ -303,12 +303,12 @@ class TradeLedger:
         cycle = self.active_cycle
         if not cycle or cycle.status != CycleStatus.OPEN:
             return
-        if cycle.entry_qty <= 0:
+        if cycle.remaining_qty <= 0:
             return
         if cycle.direction == "SHORT":
-            unreal = (cycle.entry_avg - mark_price) * cycle.entry_qty
+            unreal = (cycle.entry_avg - mark_price) * cycle.remaining_qty
         else:
-            unreal = (mark_price - cycle.entry_avg) * cycle.entry_qty
+            unreal = (mark_price - cycle.entry_avg) * cycle.remaining_qty
         unreal -= cycle.fees_quote
         cycle.unrealized_pnl_quote = unreal
         now = time.monotonic()
@@ -326,21 +326,21 @@ class TradeLedger:
         for cycle in reversed(self.cycles):
             if len(rows) >= limit:
                 break
-            qty = cycle.executed_qty or cycle.entry_qty or cycle.exit_qty
             unreal = cycle.unrealized_pnl_quote if cycle.status == CycleStatus.OPEN else None
             exit_avg = cycle.exit_avg if cycle.status == CycleStatus.CLOSED else None
             rows.append(
                 {
+                    "time_open": cycle.started_ts,
                     "cycle_id": cycle.cycle_id,
                     "direction": cycle.direction,
                     "entry_avg": cycle.entry_avg,
                     "exit_avg": exit_avg,
-                    "qty": qty,
+                    "executed_qty": cycle.executed_qty,
+                    "closed_qty": cycle.closed_qty,
+                    "remaining_qty": cycle.remaining_qty,
                     "status": cycle.status.value,
                     "unreal_pnl": unreal,
                     "realized_pnl": cycle.realized_pnl_quote,
-                    "win": cycle.win,
-                    "notes": cycle.notes,
                 }
             )
         return rows

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import time
+
 from src.core.models import HealthState, PriceState, Settings, SymbolProfile
+from src.core.order_registry import OrderMeta, OrderRole
 from src.services.trade_executor import TradeExecutor
 
 
@@ -10,7 +13,10 @@ class DummyRest:
 
 class DummyRouter:
     def build_price_state(self) -> tuple[PriceState, HealthState]:
-        return PriceState(), HealthState()
+        return (
+            PriceState(bid=1.0, ask=1.01, mid=1.005, source="TEST", mid_age_ms=10),
+            HealthState(ws_connected=True, ws_age_ms=10, http_age_ms=10),
+        )
 
     def get_ws_issue_counts(self) -> tuple[int, int]:
         return (0, 0)
@@ -76,20 +82,83 @@ def make_settings() -> Settings:
 
 def make_executor() -> TradeExecutor:
     profile = SymbolProfile(tick_size=0.0001, step_size=0.0001, min_qty=0.0001, min_notional=0.0)
-    return TradeExecutor(
+    executor = TradeExecutor(
         rest=DummyRest(),
         router=DummyRouter(),
         settings=make_settings(),
         profile=profile,
         logger=lambda _msg, **_kwargs: None,
     )
+    executor._place_sell_order = lambda *_args, **_kwargs: 0  # type: ignore[assignment]
+    return executor
 
 
-def test_fill_dedup_by_order_id_and_cum_qty() -> None:
+def _register_order(
+    executor: TradeExecutor,
+    order_id: int,
+    cycle_id: int,
+    role: OrderRole,
+    side: str,
+) -> None:
+    now = time.time()
+    executor._order_registry.register_new(
+        OrderMeta(
+            client_id=f"client-{order_id}",
+            order_id=order_id,
+            symbol="TESTUSDT",
+            cycle_id=cycle_id,
+            direction="LONG",
+            role=role,
+            side=side,
+            price=1.0,
+            orig_qty=1.0,
+            created_ts=now,
+            last_update_ts=now,
+            status="NEW",
+        )
+    )
+
+
+def test_double_fill_same_cum_qty_applied_once() -> None:
     executor = make_executor()
+    cycle_id = executor.ledger.start_cycle("TESTUSDT", "LONG", 0.0, 0.0)
+    executor._current_cycle_id = cycle_id
+    _register_order(executor, 101, cycle_id, OrderRole.ENTRY, "BUY")
 
-    first = executor._should_process_fill(10, "BUY", 5.0, 1.2, 1)
-    second = executor._should_process_fill(10, "BUY", 5.0, 1.3, 1)
+    executor.handle_order_partial(101, "BUY", 1.0, 1.0, 1000)
+    executor.handle_order_partial(101, "BUY", 1.0, 1.0, 2000)
 
-    assert first is True
-    assert second is False
+    cycle = executor.ledger.get_cycle(cycle_id)
+    assert cycle is not None
+    assert cycle.executed_qty == 1.0
+
+
+def test_exit_fill_duplicate_does_not_double_close() -> None:
+    executor = make_executor()
+    cycle_id = executor.ledger.start_cycle("TESTUSDT", "LONG", 0.0, 0.0)
+    executor._current_cycle_id = cycle_id
+    _register_order(executor, 201, cycle_id, OrderRole.ENTRY, "BUY")
+    _register_order(executor, 202, cycle_id, OrderRole.EXIT_TP, "SELL")
+
+    executor.handle_order_partial(201, "BUY", 1.0, 1.0, 1000)
+    executor.handle_order_partial(202, "SELL", 1.0, 1.01, 1100)
+    executor.handle_order_partial(202, "SELL", 1.0, 1.01, 1200)
+
+    cycle = executor.ledger.get_cycle(cycle_id)
+    assert cycle is not None
+    assert cycle.closed_qty == 1.0
+
+
+def test_remaining_qty_never_negative() -> None:
+    executor = make_executor()
+    cycle_id = executor.ledger.start_cycle("TESTUSDT", "LONG", 0.0, 0.0)
+    executor._current_cycle_id = cycle_id
+    _register_order(executor, 301, cycle_id, OrderRole.ENTRY, "BUY")
+    _register_order(executor, 302, cycle_id, OrderRole.EXIT_TP, "SELL")
+
+    executor.handle_order_partial(301, "BUY", 1.0, 1.0, 1000)
+    executor.handle_order_partial(302, "SELL", 2.0, 1.01, 1100)
+
+    cycle = executor.ledger.get_cycle(cycle_id)
+    assert cycle is not None
+    assert cycle.remaining_qty >= 0.0
