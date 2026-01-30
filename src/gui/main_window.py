@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 from importlib import import_module
 from importlib.util import find_spec
 from pathlib import Path
+import logging
 import os
 import threading
 from typing import Optional
@@ -38,6 +39,7 @@ from PySide6.QtWidgets import (
 )
 
 from src.core.config_store import ApiCredentials, ConfigStore
+from src.core.logger import INFO_EVENT_LEVEL, get_logger, resolve_level
 from src.core.models import PriceState, Settings, SymbolProfile
 from src.core.version import VERSION
 from src.gui.api_settings_dialog import ApiSettingsDialog
@@ -113,10 +115,12 @@ class MainWindow(QMainWindow):
         self._log_dropped_lines = 0
         self._last_log_message: Optional[str] = None
         self._last_log_ts = 0.0
-        self._log_max_lines = 3000
-        self._log_max_buffer = 5000
+        self._log_max_lines = 2000
+        self._log_max_buffer = 3000
         self._log_flush_limit = 200
         self._auth_warning_pending = False
+        self._logger = get_logger()
+        self._verbose_log_last_ts: dict[str, float] = {}
 
         self._ui_timer = QTimer(self)
         self._ui_timer.timeout.connect(self._refresh_ui)
@@ -137,7 +141,7 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._load_api_state()
         self._update_status(False)
-        self._log_flush_timer.start(200)
+        self._log_flush_timer.start(250)
 
     def _build_ui(self) -> None:
         central = QWidget()
@@ -831,7 +835,11 @@ class MainWindow(QMainWindow):
         price_state, health_state = self._router.build_price_state()
         self._last_mid = price_state.mid
         for log_message in self._router.consume_logs():
-            self._append_log(log_message)
+            if isinstance(log_message, tuple):
+                message, level = log_message
+                self._append_log(message, level=level)
+            else:
+                self._append_log(log_message)
 
         tick_size = self._symbol_profile.tick_size
         spread_ticks = self._calculate_spread_ticks(
@@ -1023,19 +1031,26 @@ class MainWindow(QMainWindow):
             self._log_dropped_lines = 0
         self._last_log_message = None
         self._last_log_ts = 0.0
+        self._verbose_log_last_ts.clear()
         self.log.clear()
 
-    def _append_log(self, message: str) -> None:
+    def _append_log(self, message: str, level: str = "INFO", key: Optional[str] = None) -> None:
+        if self._should_warn_invalid_api(message):
+            self._auth_warning_pending = True
+        log_level = resolve_level(level)
+        is_event = self._is_event_log(message)
+        if is_event:
+            log_level = INFO_EVENT_LEVEL
+        self._logger.log(log_level, message)
+        if not self._should_emit_ui_log(message, log_level, is_event):
+            return
+        if log_level == logging.DEBUG and not self._allow_verbose_log(key, message):
+            return
         now = time.monotonic()
-        if (
-            self._last_log_message == message
-            and now - self._last_log_ts < 0.5
-        ):
+        if self._last_log_message == message and now - self._last_log_ts < 0.5:
             return
         self._last_log_message = message
         self._last_log_ts = now
-        if self._should_warn_invalid_api(message):
-            self._auth_warning_pending = True
         with self._log_lock:
             overflow = len(self._log_queue) + 1 - self._log_max_buffer
             if overflow > 0:
@@ -1043,6 +1058,55 @@ class MainWindow(QMainWindow):
                     self._log_queue.popleft()
                 self._log_dropped_lines += overflow
             self._log_queue.append(message)
+
+    def _should_emit_ui_log(self, message: str, level: int, is_event: bool) -> bool:
+        if is_event:
+            return True
+        if level == logging.DEBUG and self._settings and self._settings.verbose_ui_log:
+            return True
+        return False
+
+    def _allow_verbose_log(self, key: Optional[str], message: str) -> bool:
+        if not self._settings or not self._settings.verbose_ui_log:
+            return False
+        log_key = key or self._derive_log_key(message)
+        now = time.monotonic()
+        last_ts = self._verbose_log_last_ts.get(log_key)
+        if last_ts is not None and now - last_ts < 0.5:
+            return False
+        self._verbose_log_last_ts[log_key] = now
+        return True
+
+    @staticmethod
+    def _derive_log_key(message: str) -> str:
+        if message.startswith("["):
+            end = message.find("]")
+            if end != -1:
+                return message[: end + 1]
+        return message.split(" ", 1)[0]
+
+    @staticmethod
+    def _is_event_log(message: str) -> bool:
+        tags = (
+            "[STATE]",
+            "[ENTRY]",
+            "[FILL]",
+            "[EXIT]",
+            "[RECOVER]",
+            "[ERROR]",
+            "[START]",
+            "[STOP]",
+            "[CYCLE]",
+            "[LOG]",
+        )
+        if message.startswith("[ENTRY]"):
+            return any(token in message for token in ("placed", "repriced", "replaced"))
+        if message.startswith("[EXIT]"):
+            return "maker" in message or "cross" in message
+        lowered = message.lower()
+        if "error" in lowered or lowered.startswith("failed"):
+            return True
+        return message.startswith(tags)
 
     def _flush_log_queue(self) -> None:
         batch: list[str] = []
@@ -1219,6 +1283,7 @@ class MainWindow(QMainWindow):
             order_quote=order_quote,
             max_budget=max_budget,
             budget_reserve=budget_reserve,
+            verbose_ui_log=bool(payload.get("verbose_ui_log", False)),
         )
 
     def _log_data_blind_state(self, price_state: PriceState, state_label: str) -> None:
@@ -1324,6 +1389,7 @@ class MainWindow(QMainWindow):
         http_fresh_ms: int,
         allow_borrow: bool,
         auto_exit_enabled: bool,
+        verbose_ui_log: bool,
     ) -> None:
         if self._settings:
             self._settings.order_quote = order_quote
@@ -1343,6 +1409,7 @@ class MainWindow(QMainWindow):
             )
             self._settings.allow_borrow = allow_borrow
             self._settings.auto_exit_enabled = auto_exit_enabled
+            self._settings.verbose_ui_log = verbose_ui_log
         self._append_log("[SETTINGS] saved")
 
     def _on_api_saved(self, key: str, secret: str) -> None:

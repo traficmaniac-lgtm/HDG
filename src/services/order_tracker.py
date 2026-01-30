@@ -18,7 +18,7 @@ class OrderTracker(QObject):
         rest: BinanceRestClient,
         symbol: str,
         poll_ms: int,
-        logger: Callable[[str], None],
+        logger: Callable[..., None],
         owns_rest: bool = False,
         parent: QObject | None = None,
     ) -> None:

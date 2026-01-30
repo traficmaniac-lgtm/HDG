@@ -93,7 +93,7 @@ def make_executor(router: DummyRouter) -> TradeExecutor:
         router=router,
         settings=make_settings(),
         profile=profile,
-        logger=lambda _msg: None,
+        logger=lambda _msg, **_kwargs: None,
     )
 
 

@@ -99,7 +99,7 @@ def test_exit_not_frozen_when_http_fresh() -> None:
         router=router,
         settings=make_settings(),
         profile=profile,
-        logger=lambda _msg: None,
+        logger=lambda _msg, **_kwargs: None,
     )
     executor.state = TradeState.STATE_POSITION_OPEN
     executor.position = {"buy_price": buy_price, "qty": 1.0, "opened_ts": 0, "partial": False}

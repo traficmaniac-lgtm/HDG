@@ -98,7 +98,7 @@ def test_tp_cross_after_timeout() -> None:
         router=DummyRouter(bid=1.1969, ask=1.1970),
         settings=make_settings(),
         profile=profile,
-        logger=lambda _msg: None,
+        logger=lambda _msg, **_kwargs: None,
     )
 
     executor.active_test_orders = [

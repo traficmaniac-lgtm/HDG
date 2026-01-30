@@ -35,7 +35,7 @@ class PriceRouter:
         self._last_good_ts: Optional[float] = None
         self._last_good_source: str = "NONE"
         self._tick_size: Optional[float] = None
-        self._log_queue: list[str] = []
+        self._log_queue: list[tuple[str, str]] = []
         self._last_source_log_ts = 0.0
         self._last_effective_source = "NONE"
         self._last_summary_log_ts = 0.0
@@ -102,7 +102,7 @@ class PriceRouter:
             return http_age_ms <= self._settings.http_fresh_ms + grace_ms
         return False
 
-    def consume_logs(self) -> list[str]:
+    def consume_logs(self) -> list[tuple[str, str]]:
         if not self._log_queue:
             return []
         logs = list(self._log_queue)
@@ -243,9 +243,12 @@ class PriceRouter:
                     else:
                         reason = self._last_switch_reason
                     self._log_queue.append(
-                        "[SOURCE_LATCH] "
-                        f"from={from_source} to={effective_source} reason={reason} "
-                        f"hold_ms={min_hold_ms}"
+                        (
+                            "[SOURCE_LATCH] "
+                            f"from={from_source} to={effective_source} reason={reason} "
+                            f"hold_ms={min_hold_ms}",
+                            "INFO",
+                        )
                     )
             elif not current_has_quote:
                 self._source_hold_until_ts = None
@@ -270,8 +273,11 @@ class PriceRouter:
 
         if bid is not None and ask is not None and bid > ask:
             self._log_queue.append(
-                "[DATA] quote_inverted "
-                f"bid={bid:.8f} ask={ask:.8f} src={quote_source}"
+                (
+                    "[DATA] quote_inverted "
+                    f"bid={bid:.8f} ask={ask:.8f} src={quote_source}",
+                    "INFO",
+                )
             )
             bid, ask = min(bid, ask), max(bid, ask)
 
@@ -370,10 +376,13 @@ class PriceRouter:
                     else "?"
                 )
                 self._log_queue.append(
-                    "[DATA] "
-                    f"chosen_source={source} last_source={self._last_effective_source} "
-                    f"hold_remaining_ms={hold_label} "
-                    f"reason={self._last_switch_reason} ws_age={ws_age_label}"
+                    (
+                        "[DATA] "
+                        f"chosen_source={source} last_source={self._last_effective_source} "
+                        f"hold_remaining_ms={hold_label} "
+                        f"reason={self._last_switch_reason} ws_age={ws_age_label}",
+                        "INFO",
+                    )
                 )
             self._last_effective_source = source
 
@@ -391,10 +400,13 @@ class PriceRouter:
             ws_age_label = ws_age_ms if ws_age_ms is not None else "?"
             http_age_label = http_age_ms if http_age_ms is not None else "?"
             self._log_queue.append(
-                "[DATA_SUMMARY] "
-                f"ws_state={ws_state} last_reason={self._last_switch_reason} "
-                f"ws_age_ms={ws_age_label} http_age_ms={http_age_label} "
-                f"effective_source={source} data_blind={data_blind}"
+                (
+                    "[DATA_SUMMARY] "
+                    f"ws_state={ws_state} last_reason={self._last_switch_reason} "
+                    f"ws_age_ms={ws_age_label} http_age_ms={http_age_label} "
+                    f"effective_source={source} data_blind={data_blind}",
+                    "DEBUG",
+                )
             )
 
         price_state = PriceState(

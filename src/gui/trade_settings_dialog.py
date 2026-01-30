@@ -31,6 +31,7 @@ class TradeSettingsDialog(QDialog):
         int,
         bool,
         bool,
+        bool,
     )
 
     def __init__(
@@ -41,7 +42,7 @@ class TradeSettingsDialog(QDialog):
         self._settings = settings
         self.setWindowTitle("Параметры торговли")
         self.setMinimumWidth(360)
-        self.setFixedHeight(400)
+        self.setFixedHeight(430)
 
         layout = QVBoxLayout(self)
         tabs = QTabWidget()
@@ -141,6 +142,12 @@ class TradeSettingsDialog(QDialog):
         )
         advanced_form.addRow("HTTP fresh (ms)", self.http_fresh_input)
 
+        self.verbose_ui_log_input = QCheckBox("Verbose UI log")
+        self.verbose_ui_log_input.setChecked(
+            bool(getattr(settings, "verbose_ui_log", False))
+        )
+        advanced_form.addRow("", self.verbose_ui_log_input)
+
         layout.addWidget(tabs)
 
         buttons_layout = QHBoxLayout()
@@ -171,6 +178,7 @@ class TradeSettingsDialog(QDialog):
         payload["http_fresh_ms"] = int(self.http_fresh_input.value())
         payload["allow_borrow"] = bool(self.allow_borrow_input.isChecked())
         payload["auto_exit_enabled"] = bool(self.auto_exit_input.isChecked())
+        payload["verbose_ui_log"] = bool(self.verbose_ui_log_input.isChecked())
         payload = self._store.normalize_settings(payload)
         self._store.save_settings(payload)
         self.saved.emit(
@@ -185,5 +193,6 @@ class TradeSettingsDialog(QDialog):
             int(self.http_fresh_input.value()),
             bool(self.allow_borrow_input.isChecked()),
             bool(self.auto_exit_input.isChecked()),
+            bool(self.verbose_ui_log_input.isChecked()),
         )
         self.accept()

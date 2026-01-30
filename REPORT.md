@@ -6,3 +6,4 @@
 - 0.7.29.8: Fix freeze-after-start: data_blind semantics + entry deadlines + progress watchdog.
 - 0.7.29.9: Fixed UI freeze via buffered log flush + throttled noisy logs.
 - 0.7.30.0: Added dual start buttons (LONG/SHORT). Shared settings. LONG unchanged.
+- 0.7.30.1: UI log is event-only, debug spam moved to file, buffered flush.
