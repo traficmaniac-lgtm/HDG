@@ -19,3 +19,4 @@
 - 0.7.30.8: Stop order spam: guard against duplicate place when active order exists.
 - 0.7.30.9: Reset wait timers on place/reprice; prevent instant timeouts.
 - 0.7.30.10: Fix SHORT semantics (SELL entry / BUY cover exit) + direction-aware tags.
+- 0.7.30.11: TP/SL by bid/ask + maker pricing by book; prevent premature CROSS.
