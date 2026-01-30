@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
+from decimal import Decimal, ROUND_FLOOR
 from enum import Enum
 from typing import Callable, Optional
 
@@ -23,6 +24,9 @@ class TradeCycle:
     entry_avg: float
     exit_qty: float
     exit_avg: float
+    executed_qty: float
+    closed_qty: float
+    remaining_qty: float
     fees_quote: float
     realized_pnl_quote: float
     unrealized_pnl_quote: float
@@ -39,6 +43,30 @@ class TradeLedger:
         self.active_cycle: Optional[TradeCycle] = None
         self._logger = logger
         self._last_unreal_log_ts = 0.0
+        self._last_qty_snapshot: dict[int, tuple[float, float, float]] = {}
+
+    @staticmethod
+    def _round_qty(value: float) -> float:
+        return float(Decimal(value).quantize(Decimal("0.000000000001"), rounding=ROUND_FLOOR))
+
+    def _update_remaining_qty(self, cycle: TradeCycle) -> None:
+        if cycle.closed_qty > cycle.executed_qty:
+            cycle.closed_qty = cycle.executed_qty
+        remaining = cycle.executed_qty - cycle.closed_qty
+        cycle.remaining_qty = max(self._round_qty(remaining), 0.0)
+
+    def _log_cycle_qty(self, cycle: TradeCycle) -> None:
+        snapshot = (cycle.executed_qty, cycle.closed_qty, cycle.remaining_qty)
+        last = self._last_qty_snapshot.get(cycle.cycle_id)
+        if last == snapshot:
+            return
+        self._last_qty_snapshot[cycle.cycle_id] = snapshot
+        if self._logger:
+            self._logger(
+                "[CYCLE_QTY] "
+                f"id={cycle.cycle_id} exec={cycle.executed_qty:.8f} "
+                f"closed={cycle.closed_qty:.8f} rem={cycle.remaining_qty:.8f}"
+            )
 
     def start_cycle(
         self,
@@ -62,6 +90,9 @@ class TradeLedger:
             entry_avg=entry_avg,
             exit_qty=0.0,
             exit_avg=0.0,
+            executed_qty=0.0,
+            closed_qty=0.0,
+            remaining_qty=0.0,
             fees_quote=0.0,
             realized_pnl_quote=0.0,
             unrealized_pnl_quote=0.0,
@@ -80,25 +111,34 @@ class TradeLedger:
             return self.cycles_by_id.get(cycle_id)
         return self.active_cycle
 
+    def get_cycle(self, cycle_id: Optional[int]) -> Optional[TradeCycle]:
+        return self._resolve_cycle(cycle_id)
+
     def on_entry_fill(self, cycle_id: Optional[int], qty: float, price: float) -> None:
         cycle = self._resolve_cycle(cycle_id)
         if not cycle or cycle.status != CycleStatus.OPEN or qty <= 0:
             return
-        new_qty = cycle.entry_qty + qty
+        new_qty = cycle.executed_qty + qty
         if new_qty <= 0:
             return
-        cycle.entry_avg = ((cycle.entry_avg * cycle.entry_qty) + (price * qty)) / new_qty
+        cycle.entry_avg = ((cycle.entry_avg * cycle.executed_qty) + (price * qty)) / new_qty
+        cycle.executed_qty = new_qty
         cycle.entry_qty = new_qty
+        self._update_remaining_qty(cycle)
+        self._log_cycle_qty(cycle)
 
     def on_exit_fill(self, cycle_id: Optional[int], qty: float, price: float) -> None:
         cycle = self._resolve_cycle(cycle_id)
         if not cycle or cycle.status != CycleStatus.OPEN or qty <= 0:
             return
-        new_qty = cycle.exit_qty + qty
+        new_qty = cycle.closed_qty + qty
         if new_qty <= 0:
             return
-        cycle.exit_avg = ((cycle.exit_avg * cycle.exit_qty) + (price * qty)) / new_qty
+        cycle.exit_avg = ((cycle.exit_avg * cycle.closed_qty) + (price * qty)) / new_qty
+        cycle.closed_qty = new_qty
         cycle.exit_qty = new_qty
+        self._update_remaining_qty(cycle)
+        self._log_cycle_qty(cycle)
 
     def close_cycle(self, cycle_id: Optional[int], notes: str = "") -> None:
         cycle = self._resolve_cycle(cycle_id)
@@ -116,6 +156,7 @@ class TradeLedger:
         cycle.win = None if cycle.exit_qty <= 0 else realized > 0
         cycle.status = CycleStatus.CLOSED
         cycle.closed_ts = time.time()
+        self._update_remaining_qty(cycle)
         if notes:
             if cycle.notes:
                 cycle.notes = f"{cycle.notes},{notes}"
@@ -164,7 +205,7 @@ class TradeLedger:
         for cycle in reversed(self.cycles):
             if len(rows) >= limit:
                 break
-            qty = cycle.entry_qty if cycle.entry_qty else cycle.exit_qty
+            qty = cycle.executed_qty or cycle.entry_qty or cycle.exit_qty
             unreal = cycle.unrealized_pnl_quote if cycle.status == CycleStatus.OPEN else None
             exit_avg = cycle.exit_avg if cycle.status == CycleStatus.CLOSED else None
             rows.append(
