@@ -1659,7 +1659,99 @@ class TradeExecutor:
             return
         self._watchdog_inflight()
         price_state, health_state = self._router.build_price_state()
+        if self._dust_accumulate and not self._entry_order_active():
+            remaining_qty = self._remaining_qty
+            if remaining_qty > self._epsilon_qty():
+                entry_avg = self._entry_avg_price or self.get_buy_price()
+                ref_price = self._resolve_dust_reference_price(
+                    price_state.bid,
+                    price_state.ask,
+                    price_state.mid,
+                    entry_avg,
+                )
+                current_notional = 0.0
+                if ref_price is not None:
+                    current_notional = remaining_qty * ref_price
+                if self._attempt_dust_entry_topup(
+                    price_state,
+                    health_state,
+                    current_notional,
+                ):
+                    return
         self._ensure_exit_orders(price_state, health_state)
+
+    def _attempt_dust_entry_topup(
+        self,
+        price_state: PriceState,
+        health_state: HealthState,
+        current_notional: float,
+    ) -> bool:
+        if not self._profile.tick_size or not self._profile.step_size:
+            return False
+        min_notional = self._profile.min_notional
+        if min_notional is None or min_notional <= 0:
+            return False
+        bid = price_state.bid
+        ask = price_state.ask
+        ref_price, ref_label = self._entry_reference(bid, ask)
+        if ref_price is None:
+            return False
+        entry_price = self._calculate_entry_price(ref_price)
+        if entry_price is None:
+            return False
+        _, quote_asset = self._split_symbol(self._settings.symbol)
+        quote_state = self._get_margin_asset(quote_asset)
+        if quote_state is None:
+            return False
+        order_quote = float(self._settings.order_quote)
+        missing_notional = (min_notional * 1.2) - current_notional
+        min_topup_quote = float(
+            getattr(self._settings, "min_topup_quote", 0.0) or 0.0
+        )
+        topup_quote = max(missing_notional, min_topup_quote)
+        topup_quote = min(topup_quote, order_quote * 0.25)
+        max_budget = float(self._settings.max_budget)
+        budget_reserve = float(self._settings.budget_reserve)
+        allowed_budget = max(0.0, max_budget - budget_reserve)
+        free_quote = float(quote_state.get("free", 0.0))
+        if free_quote <= 0:
+            if not self._should_dedup_log("dust_wait_funds", 2.0):
+                self._logger("[DUST_WAIT_FUNDS] free_quote=0")
+            return False
+        topup_quote = min(topup_quote, allowed_budget, free_quote)
+        if topup_quote <= 0:
+            return False
+        qty = self._round_down(topup_quote / entry_price, self._profile.step_size)
+        if qty <= 0:
+            return False
+        ws_bad = price_state.source == "WS" and self._entry_ws_bad(health_state.ws_connected)
+        entry_context = self._entry_log_context(
+            price_state.source,
+            ws_bad,
+            health_state.ws_age_ms,
+            health_state.http_age_ms,
+        )
+        if not self._should_dedup_log("dust_no_entry", 2.0):
+            self._logger("[DUST_NO_ENTRY] placing ENTRY_TOPUP")
+        self._logger(
+            "[ENTRY_TOPUP] "
+            f"price={ref_label} {ref_label}={ref_price:.8f} "
+            f"quote={topup_quote:.8f} qty={qty:.8f} "
+            f"src={price_state.source}"
+        )
+        if self._place_entry_topup_order(
+            price=ref_price,
+            qty=qty,
+            bid=bid,
+            ask=ask,
+            entry_context=entry_context,
+        ):
+            self._logger(
+                f"[DUST_TOPUP_PLACED] qty={qty:.8f} notional={(qty * entry_price):.8f}"
+            )
+            self._transition_state(TradeState.STATE_ENTRY_WORKING)
+            return True
+        return False
 
     def _ensure_exit_orders(
         self,
@@ -1819,6 +1911,8 @@ class TradeExecutor:
         if min_notional is not None and min_notional > 0:
             dust_threshold = min_notional * 1.05
         if dust_threshold is not None and notional is not None and notional >= dust_threshold:
+            if self._dust_accumulate:
+                self._logger(f"[DUST_EXIT_READY] notional={notional:.8f}")
             self._dust_accumulate = False
         if (
             min_notional is not None
@@ -1839,51 +1933,9 @@ class TradeExecutor:
                 if self.state != TradeState.STATE_ENTRY_WORKING:
                     self._transition_state(TradeState.STATE_ENTRY_WORKING)
                 return
-            ref_price, ref_label = self._entry_reference(bid, ask)
-            if ref_price is None:
-                return
-            entry_price = self._calculate_entry_price(ref_price)
-            if entry_price is None:
-                return
-            _, quote_asset = self._split_symbol(self._settings.symbol)
-            quote_state = self._get_margin_asset(quote_asset)
-            if quote_state is None:
-                return
-            order_quote = float(self._settings.order_quote)
-            topup_target = min_notional * 1.2
             current_notional = notional or 0.0
-            topup_quote = max(topup_target - current_notional, order_quote * 0.25)
-            max_budget = float(self._settings.max_budget)
-            budget_reserve = float(self._settings.budget_reserve)
-            allowed_budget = max(0.0, max_budget - budget_reserve)
-            free_quote = float(quote_state.get("free", 0.0))
-            topup_quote = min(topup_quote, allowed_budget, free_quote)
-            if topup_quote <= 0:
+            if self._attempt_dust_entry_topup(price_state, health_state, current_notional):
                 return
-            qty = self._round_down(topup_quote / entry_price, self._profile.step_size)
-            if qty <= 0:
-                return
-            ws_bad = price_state.source == "WS" and self._entry_ws_bad(health_state.ws_connected)
-            entry_context = self._entry_log_context(
-                price_state.source,
-                ws_bad,
-                health_state.ws_age_ms,
-                health_state.http_age_ms,
-            )
-            self._logger(
-                "[ENTRY_TOPUP] "
-                f"price={ref_label} {ref_label}={ref_price:.8f} "
-                f"quote={topup_quote:.8f} qty={qty:.8f} "
-                f"src={price_state.source}"
-            )
-            if self._place_entry_topup_order(
-                price=ref_price,
-                qty=qty,
-                bid=bid,
-                ask=ask,
-                entry_context=entry_context,
-            ):
-                self._transition_state(TradeState.STATE_ENTRY_WORKING)
             return
 
         if active_sell_order and not self._sell_order_is_final(active_sell_order):
@@ -4453,6 +4505,39 @@ class TradeExecutor:
                     self._last_place_error_msg
                     and "NOTIONAL" in self._last_place_error_msg.upper()
                 )
+                if self._dust_accumulate and not have_open_entry:
+                    self._reconcile_recovery_attempts += 1
+                    attempt_label = self._reconcile_recovery_attempts
+                    if not self._should_dedup_log("reconcile_plan_dust_topup", 2.0):
+                        self._logger(
+                            "[RECONCILE_PLAN] "
+                            f"action=PLACE_ENTRY_TOPUP attempt={attempt_label}"
+                        )
+                    price_state, health_state = self._router.build_price_state()
+                    if not self._can_trade_now(
+                        price_state,
+                        action="RECONCILE",
+                        max_age_ms=self._trade_gate_age_ms("RECONCILE"),
+                    ):
+                        self._transition_to_position_state()
+                        return
+                    entry_avg_local = entry_avg or self._entry_avg_price or self.get_buy_price()
+                    ref_price = self._resolve_dust_reference_price(
+                        price_state.bid,
+                        price_state.ask,
+                        price_state.mid,
+                        entry_avg_local,
+                    )
+                    current_notional = 0.0
+                    if ref_price is not None:
+                        current_notional = remaining * ref_price
+                    self._attempt_dust_entry_topup(
+                        price_state,
+                        health_state,
+                        current_notional,
+                    )
+                    self._transition_to_position_state()
+                    return
                 needs_cancel_entry = have_open_entry and executed > self._epsilon_qty()
                 if dust_guard:
                     needs_cancel_entry = False
