@@ -27,6 +27,7 @@ class OrderMeta:
     created_ts: float
     last_update_ts: float
     status: str
+    tp_key: Optional[tuple[object, ...]] = None
 
 
 class OrderRegistry:
