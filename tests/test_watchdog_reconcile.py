@@ -124,7 +124,7 @@ def test_stuck_triggers_reconcile() -> None:
         router=router,
         settings=make_settings(),
         profile=profile,
-        logger=lambda _msg: None,
+        logger=lambda _msg, **_kwargs: None,
     )
     executor.state = TradeState.STATE_ENTRY_WORKING
     executor._state_entered_ts = time.monotonic() - 1.0
@@ -147,7 +147,7 @@ def test_reconcile_routes_to_exit_when_remaining_gt_zero() -> None:
         router=router,
         settings=make_settings(),
         profile=profile,
-        logger=lambda _msg: None,
+        logger=lambda _msg, **_kwargs: None,
     )
     executor.active_test_orders = [
         {"orderId": 101, "side": "BUY", "qty": 1.0, "cum_qty": 0.0, "status": "NEW"}
@@ -171,7 +171,7 @@ def test_reconcile_returns_to_idle_when_flat() -> None:
         router=router,
         settings=make_settings(),
         profile=profile,
-        logger=lambda _msg: None,
+        logger=lambda _msg, **_kwargs: None,
     )
     snapshot = executor.collect_reconcile_snapshot()
     executor.apply_reconcile_snapshot(snapshot)
@@ -194,7 +194,7 @@ def test_reconcile_filters_by_cycle_order_ids() -> None:
         router=router,
         settings=make_settings(),
         profile=profile,
-        logger=lambda _msg: None,
+        logger=lambda _msg, **_kwargs: None,
     )
     executor._current_cycle_id = 1
     executor._cycle_start_ts_ms = now_ms - 1000
@@ -219,7 +219,7 @@ def test_invalid_totals_trigger_openorders_only_mode() -> None:
         router=router,
         settings=make_settings(),
         profile=profile,
-        logger=lambda _msg: None,
+        logger=lambda _msg, **_kwargs: None,
     )
     executor.active_test_orders = [
         {"orderId": 9001, "side": "BUY", "qty": 1.0, "cum_qty": 0.0, "status": "NEW"}
@@ -246,7 +246,7 @@ def test_watchdog_skips_entry_when_best_bid() -> None:
         router=router,
         settings=make_settings(),
         profile=profile,
-        logger=lambda _msg: None,
+        logger=lambda _msg, **_kwargs: None,
     )
     executor.state = TradeState.STATE_ENTRY_WORKING
     executor._state_entered_ts = time.monotonic() - 1.0

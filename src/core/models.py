@@ -59,6 +59,7 @@ class Settings:
     order_quote: float
     max_budget: float
     budget_reserve: float
+    verbose_ui_log: bool = False
 
 
 @dataclass

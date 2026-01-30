@@ -46,7 +46,7 @@ class TradeExecutor:
         router: PriceRouter,
         settings: Settings,
         profile: SymbolProfile,
-        logger: Callable[[str], None],
+        logger: Callable[..., None],
     ) -> None:
         self._rest = rest
         self._router = router
@@ -2883,7 +2883,9 @@ class TradeExecutor:
                     age_label = age_ms if age_ms is not None else "?"
                     self._logger(
                         f"[ENTRY_REPRICE_SKIP] reason=ws_bad age_ms={age_label} "
-                        f"{entry_context}"
+                        f"{entry_context}",
+                        level="DEBUG",
+                        key="ENTRY_REPRICE",
                     )
             else:
                 if not self._should_dedup_log("entry_hold_stale", 2.0):
@@ -2896,7 +2898,9 @@ class TradeExecutor:
                     age_label = age_ms if age_ms is not None else "?"
                     self._logger(
                         f"[ENTRY_REPRICE_SKIP] reason=stale age_ms={age_label} "
-                        f"{entry_context}"
+                        f"{entry_context}",
+                        level="DEBUG",
+                        key="ENTRY_REPRICE",
                     )
             order_id = buy_order.get("orderId")
             order_price = float(buy_order.get("price") or 0.0)
@@ -2917,7 +2921,11 @@ class TradeExecutor:
         self._clear_price_wait("ENTRY")
         elapsed_ms = self._entry_attempt_elapsed_ms()
         if elapsed_ms is not None and not self._should_dedup_log("entry_wait", 1.5):
-            self._logger(f"[ENTRY_WAIT] ms={elapsed_ms} {entry_context}")
+            self._logger(
+                f"[ENTRY_WAIT] ms={elapsed_ms} {entry_context}",
+                level="DEBUG",
+                key="ENTRY_WAIT",
+            )
         if not self._profile.tick_size or not self._profile.step_size:
             return
         current_price = float(buy_order.get("price") or 0.0)
@@ -2999,7 +3007,9 @@ class TradeExecutor:
             self._logger(
                 "[ENTRY_REPRICE] action=SKIP "
                 f"reason={reason_label} old_price={order_price_label} "
-                f"new_price={new_price_label} {entry_context}"
+                f"new_price={new_price_label} {entry_context}",
+                level="DEBUG",
+                key="ENTRY_REPRICE",
             )
             return
         if not self._should_dedup_log("entry_reprice_do", 0.4):
@@ -4247,7 +4257,7 @@ class TradeExecutor:
                 f"price={price:.8f}"
             )
             self._logger(
-                f"[ENTRY] {self._direction_tag()} filled cycle_id={cycle_label} "
+                f"[FILL] {self._direction_tag()} entry cycle_id={cycle_label} "
                 f"qty={qty:.8f} price={price:.8f}"
             )
             delta = max(qty - prev_cum, 0.0)
@@ -4331,7 +4341,7 @@ class TradeExecutor:
                 )
             fill_price_label = "—" if fill_price is None else f"{fill_price:.8f}"
             self._logger(
-                f"[EXIT] {self._direction_tag()} filled reason={exit_reason} "
+                f"[FILL] {self._direction_tag()} exit reason={exit_reason} "
                 f"qty={qty:.8f} price={fill_price_label}"
             )
             delta = max(qty - prev_cum, 0.0)

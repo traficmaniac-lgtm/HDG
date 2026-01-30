@@ -105,7 +105,7 @@ def test_entry_single_active_order() -> None:
         router=router,
         settings=make_settings(),
         profile=profile,
-        logger=lambda _msg: None,
+        logger=lambda _msg, **_kwargs: None,
     )
     executor.state = TradeState.STATE_WAIT_BUY
     executor.active_test_orders = [

@@ -100,7 +100,7 @@ def test_tp_cross_not_before_armed() -> None:
         router=DummyRouter(bid=1.0000, ask=1.0001),
         settings=make_settings(),
         profile=profile,
-        logger=lambda _msg: None,
+        logger=lambda _msg, **_kwargs: None,
     )
 
     executor.active_test_orders = [
@@ -144,7 +144,7 @@ def test_reconcile_filters_by_cycle_order_ids() -> None:
         router=DummyRouter(bid=1.0, ask=1.01),
         settings=make_settings(),
         profile=profile,
-        logger=lambda _msg: None,
+        logger=lambda _msg, **_kwargs: None,
     )
     executor._cycle_order_ids = {101}
     executor._cycle_start_ts_ms = int(time.time() * 1000)
@@ -171,7 +171,7 @@ def test_invalid_totals_do_not_apply_ledger_and_trigger_fallback() -> None:
         router=DummyRouter(bid=1.0, ask=1.01),
         settings=make_settings(),
         profile=profile,
-        logger=lambda _msg: None,
+        logger=lambda _msg, **_kwargs: None,
     )
     executor._cycle_order_ids = {101}
     executor._cycle_start_ts_ms = int(time.time() * 1000)
@@ -198,7 +198,7 @@ def test_wait_deadline_triggers_recover() -> None:
         router=DummyRouter(bid=1.0, ask=1.01),
         settings=make_settings(),
         profile=profile,
-        logger=lambda _msg: None,
+        logger=lambda _msg, **_kwargs: None,
     )
     executor.state = TradeState.STATE_ENTRY_WORKING
     executor._wait_state_kind = "ENTRY_WAIT"
@@ -222,7 +222,7 @@ def test_recover_places_exit_when_position_open_and_no_exit() -> None:
         router=DummyRouter(bid=1.0, ask=1.01),
         settings=make_settings(),
         profile=profile,
-        logger=lambda _msg: None,
+        logger=lambda _msg, **_kwargs: None,
     )
     executor.position = {"buy_price": 1.0, "qty": 1.0, "opened_ts": 0, "partial": False, "initial_qty": 1.0}
     executor._remaining_qty = 1.0

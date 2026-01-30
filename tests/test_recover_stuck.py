@@ -150,7 +150,7 @@ def test_deadline_triggers_recover() -> None:
         router=router,
         settings=make_settings(),
         profile=profile,
-        logger=lambda _msg: None,
+        logger=lambda _msg, **_kwargs: None,
     )
     executor.state = TradeState.STATE_ENTRY_WORKING
     executor._wait_state_kind = "ENTRY_WAIT"
@@ -175,7 +175,7 @@ def test_recover_places_cross_if_position_open_and_no_exit() -> None:
         router=router,
         settings=make_settings(),
         profile=profile,
-        logger=lambda _msg: None,
+        logger=lambda _msg, **_kwargs: None,
     )
     executor._current_cycle_id = 1
     executor._cycle_start_ts_ms = now_ms - 500

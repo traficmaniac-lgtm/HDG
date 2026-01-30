@@ -86,7 +86,7 @@ def make_executor(logs: list[str], data_blind: bool = False, cycle_count: int = 
         router=DummyRouter(data_blind=data_blind),
         settings=make_settings(cycle_count=cycle_count),
         profile=profile,
-        logger=logs.append,
+        logger=lambda _msg, **_kwargs: logs.append(_msg),
     )
 
 
