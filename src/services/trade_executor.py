@@ -49,6 +49,7 @@ class TradeExecutor:
     EXIT_CROSS_MAX_ATTEMPTS = 3
     EXIT_STATUS_MISSING_MS = 3500
     EXIT_SL_EMERGENCY_TICKS = 1
+    MAX_TP_ORDERS = 5
 
     def __init__(
         self,
@@ -207,6 +208,9 @@ class TradeExecutor:
         self._start_inflight = False
         self._start_inflight_lock = Lock()
         self._trade_hold = False
+        self._entry_target_qty: Optional[float] = None
+        self._continuous_run = True
+        self._adaptive_mode = True
 
     @staticmethod
     def _normalize_direction(direction: Optional[str]) -> str:
@@ -235,6 +239,184 @@ class TradeExecutor:
 
     def get_executed_qty_total(self) -> float:
         return float(self._executed_qty_total or self.position_qty_base or 0.0)
+
+    def _is_continuous_run(self) -> bool:
+        return self._continuous_run
+
+    def _resolve_entry_target_qty(self, entry_price: Optional[float]) -> float:
+        target_usd = float(self._settings.order_quote)
+        if not entry_price or entry_price <= 0:
+            return 0.0
+        target_qty = target_usd / entry_price
+        if self._profile.step_size:
+            target_qty = self._round_down(target_qty, self._profile.step_size)
+        return max(target_qty, 0.0)
+
+    def _remaining_to_target(self, entry_price: Optional[float]) -> float:
+        target_qty = self._resolve_entry_target_qty(entry_price)
+        self._entry_target_qty = target_qty
+        remaining = max(target_qty - float(self._executed_qty_total or 0.0), 0.0)
+        if self._profile.step_size:
+            remaining = self._round_down(remaining, self._profile.step_size)
+        return max(remaining, 0.0)
+
+    def _log_entry_target(
+        self,
+        entry_price: float,
+        remaining: float,
+    ) -> None:
+        target_usd = float(self._settings.order_quote)
+        target_qty = self._entry_target_qty or self._resolve_entry_target_qty(entry_price)
+        executed = float(self._executed_qty_total or 0.0)
+        self._logger(
+            "[ENTRY_TARGET] "
+            f"dir={self._direction} target_usd={target_usd:.8f} "
+            f"target_qty={target_qty:.8f} exec={executed:.8f} rem={remaining:.8f} "
+            f"price={entry_price:.8f}"
+        )
+
+    def _log_entry_fill(self, cycle_id: Optional[int], qty: float, price: float) -> None:
+        deal = self.ledger.deals_by_cycle_id.get(cycle_id or -1)
+        deal_label = deal.deal_id if deal else cycle_id
+        self._logger(
+            f"[ENTRY_FILL] deal={deal_label} qty={qty:.8f} price={price:.8f}"
+        )
+
+    def _log_tp_place(self, cycle_id: Optional[int], qty: float, price: float) -> None:
+        deal = self.ledger.deals_by_cycle_id.get(cycle_id or -1)
+        deal_label = deal.deal_id if deal else cycle_id
+        self._logger(
+            f"[TP_PLACE] deal={deal_label} qty={qty:.8f} tp_price={price:.8f}"
+        )
+
+    def _log_tp_fill(self, cycle_id: Optional[int], qty: float, price: float) -> None:
+        deal = self.ledger.deals_by_cycle_id.get(cycle_id or -1)
+        deal_label = deal.deal_id if deal else cycle_id
+        self._logger(
+            f"[TP_FILL] deal={deal_label} qty={qty:.8f} price={price:.8f}"
+        )
+
+    def _log_sl_trigger(
+        self,
+        cycle_id: Optional[int],
+        remaining_qty: float,
+        sl_price: float,
+        market_price: Optional[float],
+    ) -> None:
+        deal = self.ledger.deals_by_cycle_id.get(cycle_id or -1)
+        deal_label = deal.deal_id if deal else cycle_id
+        market_label = "—" if market_price is None else f"{market_price:.8f}"
+        self._logger(
+            f"[SL_TRIGGER] deal={deal_label} rem={remaining_qty:.8f} "
+            f"sl_price={sl_price:.8f} mkt={market_label}"
+        )
+
+    def _log_deal_close(self, cycle_id: Optional[int], pnl: Optional[float]) -> None:
+        if cycle_id is None:
+            return
+        deal = self.ledger.deals_by_cycle_id.get(cycle_id)
+        if not deal:
+            return
+        realized = pnl if pnl is not None else deal.realized_pnl
+        win = None if realized is None else realized > 0
+        realized_label = "—" if realized is None else f"{realized:.8f}"
+        self._logger(
+            f"[DEAL_CLOSE] deal={deal.deal_id} realized={realized_label} win={win}"
+        )
+
+    def _active_tp_orders(self) -> list[dict]:
+        active: list[dict] = []
+        for order in self.active_test_orders:
+            if str(order.get("role") or "").upper() != "EXIT_TP":
+                continue
+            if self._sell_order_is_final(order):
+                continue
+            active.append(order)
+        return active
+
+    def _count_active_tp_orders(self) -> int:
+        return len(self._active_tp_orders())
+
+    def _cancel_active_tp_orders(self) -> None:
+        is_isolated = "TRUE" if self._settings.margin_isolated else "FALSE"
+        for order in self._active_tp_orders():
+            order_id = order.get("orderId")
+            if not order_id:
+                continue
+            attempt_cancel = True
+            final_status = self._safe_cancel_and_sync(
+                order_id=order_id,
+                is_isolated=is_isolated,
+                tag=order.get("tag", self.TAG),
+                attempt_cancel=attempt_cancel,
+            )
+            if final_status in {"CANCELED", "REJECTED", "EXPIRED"}:
+                order["status"] = final_status
+
+    def _tp_price_from_book(
+        self,
+        best_bid: Optional[float],
+        best_ask: Optional[float],
+    ) -> Optional[float]:
+        tick_size = self._profile.tick_size
+        if tick_size is None or tick_size <= 0:
+            return None
+        ticks = int(self._settings.take_profit_ticks)
+        if ticks <= 0:
+            return None
+        if self._position_side() == "SHORT":
+            if best_bid is None:
+                return None
+            target_price = best_bid - (ticks * tick_size)
+            raw_price = min(best_bid, target_price)
+        else:
+            if best_ask is None:
+                return None
+            target_price = best_ask + (ticks * tick_size)
+            raw_price = max(best_ask, target_price)
+        return self._round_to_step(raw_price, tick_size)
+
+    def _place_tp_for_fill(self, fill_qty: float, price_state: PriceState) -> None:
+        if fill_qty <= 0:
+            return
+        if self._normalize_exit_intent(self.exit_intent or "") == "SL":
+            return
+        if not self._can_trade_now(
+            price_state,
+            action="EXIT",
+            max_age_ms=self._trade_gate_age_ms("EXIT"),
+        ):
+            return
+        best_bid, best_ask = self._book_refs(price_state)
+        tp_price = self._tp_price_from_book(best_bid, best_ask)
+        if tp_price is None:
+            return
+        remaining_qty = self._resolve_remaining_qty_raw()
+        if remaining_qty <= self._get_step_size_tolerance():
+            return
+        if self._profile.step_size:
+            fill_qty = self._round_down(fill_qty, self._profile.step_size)
+        if fill_qty <= 0:
+            return
+        if self._count_active_tp_orders() >= self.MAX_TP_ORDERS:
+            self._cancel_active_tp_orders()
+            remaining_qty = self._resolve_remaining_qty_raw()
+            if self._profile.step_size:
+                fill_qty = self._round_down(remaining_qty, self._profile.step_size)
+        if fill_qty <= 0:
+            return
+        self._set_exit_intent("TP", mid=price_state.mid, ticks=int(self._settings.take_profit_ticks))
+        self._log_tp_place(self._current_cycle_id, fill_qty, tp_price)
+        placed = self._place_sell_order(
+            reason="TP_MAKER",
+            price_override=tp_price,
+            exit_intent="TP",
+            qty_override=fill_qty,
+            ref_bid=best_bid,
+            ref_ask=best_ask,
+        )
+        if placed and self._entry_order_active():
+            self._transition_to_position_state()
 
     def get_exit_trigger_prices(self) -> tuple[Optional[float], Optional[float]]:
         entry_avg = self.get_entry_avg_price()
@@ -1295,6 +1477,7 @@ class TradeExecutor:
     def _log_cycle_start(self, cycle_id: int) -> None:
         self._cycle_started_ts = time.monotonic()
         self._logger(f"[CYCLE_START] id={cycle_id}")
+        self._entry_target_qty = None
         if self.ledger._next_id <= cycle_id:
             self.ledger._next_id = cycle_id
         ledger_cycle_id = self.ledger.start_cycle(
@@ -1876,6 +2059,7 @@ class TradeExecutor:
         self.entry_cancel_pending = False
         self._entry_missing_since_ts = None
         self._current_cycle_id = None
+        self._entry_target_qty = None
         self._cycle_started_ts = None
         self._cycle_start_ts_ms = None
         self._cycle_order_ids = set()
@@ -2019,8 +2203,9 @@ class TradeExecutor:
                 self.last_action = "budget_blocked"
                 self.orders_count = 0
                 return 0
-            base_qty = order_quote / entry_price
-            qty = self._apply_dust_carry_to_entry_qty(base_qty)
+            remaining_qty = self._remaining_to_target(entry_price)
+            self._log_entry_target(entry_price, remaining_qty)
+            qty = self._apply_dust_carry_to_entry_qty(remaining_qty)
 
             if qty <= 0:
                 self._logger(f"[TRADE] place_test_orders | qty <= 0 tag={self.TAG}")
@@ -2290,7 +2475,7 @@ class TradeExecutor:
             return 0
         if not self.run_active:
             return 0
-        if self.cycles_done >= self.cycles_target:
+        if not self._is_continuous_run() and self.cycles_done >= self.cycles_target:
             return 0
         if self._next_cycle_ready_ts is None:
             return 0
@@ -2343,7 +2528,7 @@ class TradeExecutor:
                 f"[CYCLE_STOP] done={self.cycles_done} target={self.cycles_target}"
             )
             return
-        if self.run_active and self.cycles_done < self.cycles_target:
+        if self._is_continuous_run() or self.cycles_done < self.cycles_target:
             self._next_cycle_ready_ts = time.monotonic() + self._cycle_cooldown_s
             self._logger(
                 f"[CYCLE_NEXT] done={self.cycles_done} target={self.cycles_target}"
@@ -2361,7 +2546,7 @@ class TradeExecutor:
             self._next_cycle_ready_ts = None
             self._logger("[CYCLE] done -> auto_next state=IDLE reason=stop_requested")
             return
-        if self.cycles_done >= self.cycles_target:
+        if not self._is_continuous_run() and self.cycles_done >= self.cycles_target:
             self.run_active = False
             self._next_cycle_ready_ts = None
             self._logger("[CYCLE] done -> auto_next state=IDLE reason=target_reached")
@@ -2562,6 +2747,8 @@ class TradeExecutor:
                 f"bid={best_bid_label} ask={best_ask_label} "
                 f"mid={mid if mid is not None else '—'}"
             )
+            market_price = best_bid if position_side == "SHORT" else best_ask
+            self._log_sl_trigger(self._current_cycle_id, remaining_qty, sl_price, market_price)
             self._cancel_active_sell(reason="SL")
             self._set_exit_intent("SL", mid=mid, ticks=int(self._settings.stop_loss_ticks), force=True)
             sl_override = best_bid if exit_side == "SELL" else best_ask
@@ -2572,6 +2759,9 @@ class TradeExecutor:
                 ref_bid=best_bid,
                 ref_ask=best_ask,
             )
+            return
+
+        if self._adaptive_mode:
             return
 
         if tp_price is None:
@@ -3210,6 +3400,9 @@ class TradeExecutor:
             return 0
         reason_upper = reason.upper()
         intent = self._normalize_exit_intent(exit_intent or self.exit_intent or reason)
+        allow_multiple_tp = (
+            self._adaptive_mode and intent == "TP" and reason_upper in {"TP", "TP_MAKER"}
+        )
         exit_order_type = self._resolve_exit_order_type(intent, reason_upper)
         is_cross_intent = (
             exit_order_type == "MARKET"
@@ -3231,7 +3424,11 @@ class TradeExecutor:
         active_tp_meta = self._get_active_meta_for_role(
             active_cycle_id, "EXIT_TP"
         )
-        if (active_tp_meta is not None or self._has_active_role("EXIT_TP")) and not is_cross_intent:
+        if (
+            not allow_multiple_tp
+            and (active_tp_meta is not None or self._has_active_role("EXIT_TP"))
+            and not is_cross_intent
+        ):
             client_id = active_tp_meta.client_id if active_tp_meta else None
             self._log_role_active_skip(
                 active_cycle_id, "EXIT_TP", client_id
@@ -3240,7 +3437,11 @@ class TradeExecutor:
             self.last_action = "exit_tp_active_guard"
             return 0
         active_sell_order = self._get_active_sell_order()
-        if active_sell_order and not self._sell_order_is_final(active_sell_order):
+        if (
+            active_sell_order
+            and not self._sell_order_is_final(active_sell_order)
+            and not allow_multiple_tp
+        ):
             self._logger("[SELL_SKIP_DUPLICATE] reason=active_sell")
             self._logger(f"[TRADE] close_position | {exit_side} already active")
             self.last_action = "sell_active"
@@ -3990,6 +4191,10 @@ class TradeExecutor:
             if not self._should_dedup_log("entry_replace_no_ref", 2.0):
                 self._logger(f"[ENTRY_REPLACE_WAIT] reason=no_{ref_label} {entry_context}")
             return
+        remaining_qty = self._remaining_to_target(ref_price)
+        if remaining_qty <= self._epsilon_qty():
+            self._entry_replace_after_cancel = False
+            return
         self._start_entry_attempt()
         self._start_buy_wait()
         placed = self._place_entry_order(
@@ -4341,9 +4546,9 @@ class TradeExecutor:
         new_price = self._calculate_entry_price(price)
         if new_price is None:
             return False
-        order_quote = float(self._settings.order_quote)
-        base_qty = order_quote / new_price
-        qty = self._apply_dust_carry_to_entry_qty(base_qty)
+        remaining_qty = self._remaining_to_target(new_price)
+        self._log_entry_target(new_price, remaining_qty)
+        qty = self._apply_dust_carry_to_entry_qty(remaining_qty)
         if self._profile.min_qty and qty < self._profile.min_qty:
             return False
         if self._profile.min_notional is not None and qty * new_price < self._profile.min_notional:
@@ -4642,6 +4847,28 @@ class TradeExecutor:
             return
         current_price = float(buy_order.get("price") or 0.0)
         if current_price <= 0:
+            return
+        if self._remaining_to_target(current_price) <= self._epsilon_qty():
+            order_id = buy_order.get("orderId")
+            if order_id:
+                is_isolated = "TRUE" if self._settings.margin_isolated else "FALSE"
+                final_status = self._safe_cancel_and_sync(
+                    order_id=order_id,
+                    is_isolated=is_isolated,
+                    tag=buy_order.get("tag", self.TAG),
+                    attempt_cancel=True,
+                )
+                if final_status in {"CANCELED", "REJECTED", "EXPIRED"}:
+                    buy_order["status"] = final_status
+                    self.active_test_orders = [
+                        entry
+                        for entry in self.active_test_orders
+                        if entry.get("orderId") != order_id
+                    ]
+                    self.orders_count = len(self.active_test_orders)
+                    self.entry_active_order_id = None
+                    self.entry_active_price = None
+                    self.entry_cancel_pending = False
             return
         tick_size = self._profile.tick_size
         now_ms = int(time.time() * 1000)
@@ -5813,10 +6040,15 @@ class TradeExecutor:
                 self.ledger.on_entry_fill(cycle_id, qty, price)
                 self._sync_cycle_qty_from_ledger(cycle_id)
                 self._log_fill_applied(meta, qty, price)
+                self._log_entry_fill(cycle_id, qty, price)
+                price_state, _ = self._router.build_price_state()
+                self._place_tp_for_fill(qty, price_state)
             elif role in {"EXIT_TP", "EXIT_CROSS"}:
                 self.ledger.on_exit_fill(cycle_id, qty, price)
                 self._sync_cycle_qty_from_ledger(cycle_id)
                 self._log_fill_applied(meta, qty, price)
+                if meta.role == OrderRole.EXIT_TP:
+                    self._log_tp_fill(cycle_id, qty, price)
             self._update_registry_status_by_order(order_id, "FILLED")
             return
         trade_id = self._extract_trade_id(order)
@@ -5870,12 +6102,17 @@ class TradeExecutor:
                     self.ledger.on_entry_fill(cycle_id, cum_qty, fill_price)
                     self._sync_cycle_qty_from_ledger(cycle_id)
                     self._log_fill_applied(meta, cum_qty, fill_price)
+                    self._log_entry_fill(cycle_id, cum_qty, fill_price)
+                    price_state, _ = self._router.build_price_state()
+                    self._place_tp_for_fill(cum_qty, price_state)
                 self._update_registry_status_by_order(order_id, "PARTIAL", cum_qty)
             elif meta.role in {OrderRole.EXIT_TP, OrderRole.EXIT_CROSS}:
                 if fill_price > 0:
                     self.ledger.on_exit_fill(cycle_id, cum_qty, fill_price)
                     self._sync_cycle_qty_from_ledger(cycle_id)
                     self._log_fill_applied(meta, cum_qty, fill_price)
+                    if meta.role == OrderRole.EXIT_TP:
+                        self._log_tp_fill(cycle_id, cum_qty, fill_price)
                 self._update_registry_status_by_order(order_id, "PARTIAL", cum_qty)
             return
         trade_id = self._extract_trade_id(order)
@@ -5902,6 +6139,7 @@ class TradeExecutor:
                     self.ledger.on_entry_fill(cycle_id, delta, float(fill_price))
                     self._sync_cycle_qty_from_ledger(cycle_id)
                     self._log_fill_applied(meta, delta, float(fill_price))
+                    self._log_entry_fill(cycle_id, delta, float(fill_price))
                 self._update_registry_status_by_order(order_id, "PARTIAL", delta)
                 if self.position is None:
                     self.position = {
@@ -5985,6 +6223,8 @@ class TradeExecutor:
                     self.ledger.on_exit_fill(cycle_id, delta, float(fill_price))
                     self._sync_cycle_qty_from_ledger(cycle_id)
                     self._log_fill_applied(meta, delta, float(fill_price))
+                    if meta.role == OrderRole.EXIT_TP:
+                        self._log_tp_fill(cycle_id, delta, float(fill_price))
                 self._update_registry_status_by_order(order_id, "PARTIAL", delta)
                 cycle_label = "—" if cycle_id is None else str(cycle_id)
                 self._logger(
@@ -6099,6 +6339,7 @@ class TradeExecutor:
                 self.ledger.on_entry_fill(cycle_id, delta, price)
                 self._sync_cycle_qty_from_ledger(cycle_id)
                 self._log_fill_applied(meta, delta, price)
+                self._log_entry_fill(cycle_id, delta, price)
             self._reset_buy_retry()
             self._clear_entry_attempt()
             if self.entry_active_order_id == order_id:
@@ -6188,6 +6429,20 @@ class TradeExecutor:
                     self.ledger.on_exit_fill(cycle_id, delta, float(fill_price))
                     self._sync_cycle_qty_from_ledger(cycle_id)
                     self._log_fill_applied(meta, delta, float(fill_price))
+                    if meta.role == OrderRole.EXIT_TP:
+                        self._log_tp_fill(cycle_id, delta, float(fill_price))
+            remaining_qty = self._resolve_remaining_qty_raw()
+            if (
+                self._adaptive_mode
+                and exit_reason in {"TP_MAKER", "TP_FORCE", "TP_CROSS"}
+                and remaining_qty > self._get_step_size_tolerance()
+            ):
+                if self.position is not None:
+                    self.position["qty"] = remaining_qty
+                self._transition_to_position_state()
+                self._clear_order_role(order_id)
+                self._update_registry_status_by_order(order_id, "FILLED")
+                return
             pnl = self._finalize_close(order)
             self.last_exit_reason = exit_reason
             if exit_reason in {"TP_MAKER", "TP_FORCE", "TP_CROSS", "SL_HARD"}:
@@ -6205,8 +6460,13 @@ class TradeExecutor:
                 self._logger(f"[PNL] realized={realized}")
             self._transition_state(TradeState.STATE_FLAT)
             self._log_exit_summary(exit_reason, buy_price, fill_price, qty)
+            total_qty = self._executed_qty_total if self._executed_qty_total > 0 else qty
             self._finalize_cycle_close(
-                reason=exit_reason, pnl=pnl, qty=qty, buy_price=buy_price, cycle_id=cycle_id
+                reason=exit_reason,
+                pnl=pnl,
+                qty=total_qty,
+                buy_price=buy_price,
+                cycle_id=cycle_id,
             )
             self._clear_order_role(order_id)
         self._update_registry_status_by_order(order_id, "FILLED")
@@ -6245,7 +6505,10 @@ class TradeExecutor:
             self.ledger.on_entry_fill(cycle_id, qty, float(price))
             self._sync_cycle_qty_from_ledger(cycle_id)
             self._log_fill_applied(meta, qty, float(price))
-            self._update_registry_status_by_order(order_id, "PARTIAL", qty)
+            self._log_entry_fill(cycle_id, qty, float(price))
+            price_state, _ = self._router.build_price_state()
+            self._place_tp_for_fill(qty, price_state)
+        self._update_registry_status_by_order(order_id, "PARTIAL", qty)
         self._reset_buy_retry()
         self._clear_entry_attempt()
         if self.position is None:
@@ -6329,7 +6592,15 @@ class TradeExecutor:
         if buy_price is None:
             buy_price = self._last_buy_price
         pnl = None
-        if buy_price is not None and sell_price is not None and qty is not None:
+        if self._adaptive_mode:
+            cycle = self.ledger.active_cycle
+            if cycle and cycle.status == CycleStatus.OPEN and cycle.exit_qty > 0:
+                if cycle.direction == "SHORT":
+                    pnl = (cycle.entry_avg - cycle.exit_avg) * cycle.exit_qty
+                else:
+                    pnl = (cycle.exit_avg - cycle.entry_avg) * cycle.exit_qty
+                pnl -= cycle.fees_quote
+        if pnl is None and buy_price is not None and sell_price is not None and qty is not None:
             if self._position_side() == "SHORT":
                 pnl = (buy_price - sell_price) * qty
             else:
@@ -6580,6 +6851,10 @@ class TradeExecutor:
         if delta_qty <= 0:
             return "SKIP_EMPTY", 0.0
         self._reconcile_position_from_fills()
+        if self._adaptive_mode:
+            price_state, _ = self._router.build_price_state()
+            self._place_tp_for_fill(delta_qty, price_state)
+            return "TP_PLACED", delta_qty
         remaining_qty_raw = self._remaining_qty
         qty_to_sell = remaining_qty_raw
         if self._profile.step_size:
@@ -6706,6 +6981,7 @@ class TradeExecutor:
         self._transition_state(TradeState.STATE_FLAT)
         self._cleanup_cycle_state(cycle_id)
         self._auto_next_cycle()
+        self._log_deal_close(cycle_id, pnl)
 
     def _finalize_partial_close(self, reason: str) -> None:
         self.last_exit_reason = reason
