@@ -354,16 +354,16 @@ class MainWindow(QMainWindow):
         self.fills_model = QStandardItemModel(0, 10, self)
         self.fills_model.setHorizontalHeaderLabels(
             [
-                "cycle_id",
+                "time_open",
                 "direction",
                 "entry_avg",
                 "exit_avg",
                 "qty",
                 "status",
-                "unreal_pnl",
                 "realized_pnl",
-                "win",
-                "notes",
+                "unreal_pnl",
+                "ticks_profit",
+                "tag",
             ]
         )
         self.fills_table = QTableView()
@@ -376,11 +376,11 @@ class MainWindow(QMainWindow):
         fills_header = self.fills_table.horizontalHeader()
         fills_header.setStretchLastSection(False)
         fills_header.setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
-        fills_widths = [80, 80, 110, 110, 90, 90, 110, 110, 70, 140]
+        fills_widths = [80, 80, 110, 110, 90, 90, 110, 110, 90, 140]
         for idx, width in enumerate(fills_widths):
             self.fills_table.setColumnWidth(idx, width)
         fills_layout.addWidget(self.fills_table, stretch=1)
-        orders_tabs.addTab(fills_tab, "TRADES")
+        orders_tabs.addTab(fills_tab, "DEALS")
 
         splitter.addWidget(hud_widget)
         splitter.addWidget(orders_tabs)
@@ -1793,16 +1793,11 @@ class MainWindow(QMainWindow):
             )
         ledger = self._trade_executor.ledger if self._trade_executor else None
         closed_cycles = (
-            [cycle for cycle in ledger.cycles if cycle.status == CycleStatus.CLOSED]
-            if ledger
-            else []
+            ledger.list_closed_deals(limit=1000) if ledger else []
         )
-        pnl_session = sum(cycle.realized_pnl_quote for cycle in closed_cycles) if closed_cycles else 0.0
-        pnl_unreal = (
-            ledger.active_cycle.unrealized_pnl_quote
-            if ledger and ledger.active_cycle and ledger.active_cycle.status == CycleStatus.OPEN
-            else None
-        )
+        pnl_session = sum(deal.realized_pnl for deal in closed_cycles) if closed_cycles else 0.0
+        open_deal = ledger.get_open_deal() if ledger else None
+        pnl_unreal = open_deal.unrealized_pnl if open_deal else 0.0
         trades_closed = len(closed_cycles)
         last_exit = self._trade_executor.last_exit_reason if self._trade_executor else None
         self.summary_label.setText(
@@ -1818,20 +1813,13 @@ class MainWindow(QMainWindow):
 
     def _update_scoreboard(self) -> None:
         ledger = self._trade_executor.ledger if self._trade_executor else None
-        closed_cycles = (
-            [cycle for cycle in ledger.cycles if cycle.status == CycleStatus.CLOSED]
-            if ledger
-            else []
-        )
-        wins = sum(1 for cycle in closed_cycles if cycle.win)
-        total = len(closed_cycles)
+        closed_deals = ledger.list_closed_deals(limit=1000) if ledger else []
+        wins = sum(1 for deal in closed_deals if deal.realized_pnl > 0)
+        total = len(closed_deals)
         winrate = (wins / total) * 100.0 if total else 0.0
-        pnl_realized = sum(cycle.realized_pnl_quote for cycle in closed_cycles) if closed_cycles else 0.0
-        pnl_unreal = (
-            ledger.active_cycle.unrealized_pnl_quote
-            if ledger and ledger.active_cycle and ledger.active_cycle.status == CycleStatus.OPEN
-            else None
-        )
+        pnl_realized = sum(deal.realized_pnl for deal in closed_deals) if closed_deals else 0.0
+        open_deal = ledger.get_open_deal() if ledger else None
+        pnl_unreal = open_deal.unrealized_pnl if open_deal else 0.0
         self.winrate_value_label.setText(f"{winrate:>5.1f}%")
         self.pnl_realized_value_label.setText(self._fmt_pnl(pnl_realized, width=10))
         self.pnl_unreal_value_label.setText(self._fmt_pnl(pnl_unreal, width=10))
@@ -1884,16 +1872,16 @@ class MainWindow(QMainWindow):
 
     def _fill_row_values(self, entry: dict) -> list[str]:
         return [
-            str(entry.get("cycle_id", "—")),
+            self._format_time_s(entry.get("opened_ts")),
             entry.get("direction", "—"),
             self._fmt_price(entry.get("entry_avg"), width=12),
             self._fmt_price(entry.get("exit_avg"), width=12),
             self._fmt_qty(entry.get("qty"), width=8),
             str(entry.get("status", "—")),
-            self._fmt_pnl(entry.get("unreal_pnl"), width=12),
             self._fmt_pnl(entry.get("realized_pnl"), width=12),
-            str(entry.get("win", "—")),
-            str(entry.get("notes", "—")),
+            self._fmt_pnl(entry.get("unreal_pnl"), width=12),
+            str(entry.get("ticks_profit", "—")),
+            str(entry.get("tag", "—")),
         ]
 
     def _refresh_trade_ledger_table(self) -> None:
@@ -1903,11 +1891,51 @@ class MainWindow(QMainWindow):
         if (now - self._last_ledger_table_ts) < 0.25:
             return
         self._last_ledger_table_ts = now
-        rows = self._trade_executor.ledger.get_cycle_rows(limit=200)
+        ledger = self._trade_executor.ledger
+        rows: list[dict] = []
+        open_deal = ledger.get_open_deal()
+        if open_deal:
+            rows.append(self._deal_row(open_deal))
+        for deal in ledger.list_closed_deals(limit=200):
+            rows.append(self._deal_row(deal))
         self._fills_history = rows
         self.fills_model.removeRows(0, self.fills_model.rowCount())
         for entry in rows:
             self._append_fill_row(entry)
+
+    @staticmethod
+    def _format_time_s(value: Optional[float]) -> str:
+        if not value:
+            return "—"
+        try:
+            return datetime.fromtimestamp(value).strftime("%H:%M:%S")
+        except (OSError, ValueError):
+            return "—"
+
+    @staticmethod
+    def _deal_row(deal: object) -> dict:
+        status_value = getattr(deal, "status", "—")
+        if hasattr(status_value, "value"):
+            status_value = status_value.value
+        status_upper = str(status_value)
+        return {
+            "opened_ts": getattr(deal, "opened_ts", None),
+            "direction": getattr(deal, "direction", "—"),
+            "entry_avg": getattr(deal, "entry_avg", None),
+            "exit_avg": getattr(deal, "exit_avg", None)
+            if status_upper == "CLOSED"
+            else None,
+            "qty": getattr(deal, "qty", None),
+            "status": status_upper,
+            "realized_pnl": getattr(deal, "realized_pnl", None)
+            if status_upper == "CLOSED"
+            else 0.0,
+            "unreal_pnl": getattr(deal, "unrealized_pnl", None)
+            if status_upper == "OPEN"
+            else None,
+            "ticks_profit": None,
+            "tag": "—",
+        }
 
     @staticmethod
     def _format_time(value: Optional[int]) -> str:
