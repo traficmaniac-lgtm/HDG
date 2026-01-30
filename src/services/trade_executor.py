@@ -33,10 +33,12 @@ class TradeExecutor:
     TAG = "PRE_V0_8_0"
     PRICE_MOVE_TICK_THRESHOLD = 1
     MAX_FILL_KEYS = 50_000
-    ENTRY_WAIT_DEADLINE_MS = 4500
+    ENTRY_WAIT_DEADLINE_MS = 12000
+    ENTRY_CANCEL_TIMEOUT_MS = 5000
     EXIT_MAKER_WAIT_DEADLINE_MS = 3500
     EXIT_CROSS_WAIT_DEADLINE_MS = 2500
     CANCEL_WAIT_DEADLINE_MS = 2000
+    HARD_STALL_MS = 20000
 
     def __init__(
         self,
@@ -135,6 +137,7 @@ class TradeExecutor:
         now = time.monotonic()
         self._state_entered_ts = now
         self._last_progress_ts = now
+        self._last_progress_reason = "init"
         self._reconcile_inflight = False
         self._reconcile_attempts = 0
         self._reconcile_recovery_attempts = 0
@@ -154,6 +157,8 @@ class TradeExecutor:
         self._wait_state_kind: Optional[str] = None
         self._wait_state_enter_ts_ms: Optional[int] = None
         self._wait_state_deadline_ms: Optional[int] = None
+        self._entry_replace_after_cancel = False
+        self._entry_cancel_requested_ts: Optional[float] = None
         self._last_effective_source: Optional[str] = None
         self._last_open_orders_signature: Optional[tuple] = None
         self._recover_cancel_attempts = {"entry": 0, "exit": 0}
@@ -168,6 +173,7 @@ class TradeExecutor:
 
     def _mark_progress(self, reason: str, reset_reconcile: bool = True) -> None:
         self._last_progress_ts = time.monotonic()
+        self._last_progress_reason = reason
         if reset_reconcile:
             self._reconcile_attempts = 0
 
@@ -183,13 +189,18 @@ class TradeExecutor:
         if kind == "ENTRY_WAIT":
             default = self.ENTRY_WAIT_DEADLINE_MS
             return int(getattr(self._settings, "entry_wait_deadline_ms", default) or default)
+        if kind == "ENTRY_CANCEL_WAIT":
+            default = self.ENTRY_CANCEL_TIMEOUT_MS
+            return int(
+                getattr(self._settings, "entry_cancel_timeout_ms", default) or default
+            )
         if kind == "EXIT_MAKER_WAIT":
             default = self.EXIT_MAKER_WAIT_DEADLINE_MS
             return int(getattr(self._settings, "exit_maker_wait_deadline_ms", default) or default)
         if kind == "EXIT_CROSS_WAIT":
             default = self.EXIT_CROSS_WAIT_DEADLINE_MS
             return int(getattr(self._settings, "exit_cross_wait_deadline_ms", default) or default)
-        if kind == "CANCEL_WAIT":
+        if kind == "EXIT_CANCEL_WAIT":
             default = self.CANCEL_WAIT_DEADLINE_MS
             return int(getattr(self._settings, "cancel_wait_deadline_ms", default) or default)
         return 0
@@ -220,8 +231,10 @@ class TradeExecutor:
             self._mark_progress(reason="source_change", reset_reconcile=True)
 
     def _current_wait_kind(self) -> Optional[str]:
-        if self.entry_cancel_pending or self.sell_cancel_pending:
-            return "CANCEL_WAIT"
+        if self.entry_cancel_pending:
+            return "ENTRY_CANCEL_WAIT"
+        if self.sell_cancel_pending:
+            return "EXIT_CANCEL_WAIT"
         if self.state == TradeState.STATE_ENTRY_WORKING:
             return "ENTRY_WAIT"
         if self._in_exit_workflow():
@@ -241,6 +254,21 @@ class TradeExecutor:
         age_ms = now_ms - self._wait_state_enter_ts_ms
         if age_ms <= self._wait_state_deadline_ms:
             return False
+        if kind == "ENTRY_WAIT":
+            no_progress_ms = self._no_progress_ms(now)
+            if no_progress_ms <= self._wait_state_deadline_ms:
+                return False
+            self._logger(
+                f"[ENTRY_WAIT_DEADLINE] age_ms={age_ms} no_progress_ms={no_progress_ms}"
+            )
+            return self._start_entry_cancel(reason="deadline", age_ms=age_ms)
+        if kind == "ENTRY_CANCEL_WAIT":
+            self._logger(
+                f"[ENTRY_CANCEL_TIMEOUT] age_ms={age_ms} -> RECOVER_STUCK"
+            )
+            return self._recover_stuck(
+                reason="entry_cancel_timeout", wait_kind=kind, age_ms=age_ms
+            )
         return self._recover_stuck(reason="deadline", wait_kind=kind, age_ms=age_ms)
 
     def _open_orders_signature(self, open_orders: list[dict]) -> tuple:
@@ -870,10 +898,6 @@ class TradeExecutor:
                 health_state.ws_age_ms,
                 health_state.http_age_ms,
             )
-            if price_state.data_blind:
-                self._logger("[TRADE] blocked: data_blind")
-                self.last_action = "DATA_BLIND"
-                return 0
             if mid is None or bid is None:
                 now = time.monotonic()
                 if now - self._last_no_price_log_ts >= 2.0:
@@ -1038,6 +1062,7 @@ class TradeExecutor:
                 f"[ORDER] BUY placed cycle_id={cycle_label} qty={qty:.8f} "
                 f"price={buy_price:.8f} id={buy_order.get('orderId')}"
             )
+            self._mark_progress(reason="entry_place", reset_reconcile=True)
             buy_order_id = buy_order.get("orderId")
             if isinstance(buy_order_id, int):
                 self._cycle_order_ids.add(buy_order_id)
@@ -1245,8 +1270,7 @@ class TradeExecutor:
             self._reconcile_position_from_fills()
         self._update_data_blind_state(price_state)
         self._note_effective_source(price_state.source)
-        if not price_state.data_blind:
-            self._note_price_progress(price_state.bid, price_state.ask)
+        self._note_price_progress(price_state.bid, price_state.ask)
         remaining_qty = self._remaining_qty
         if remaining_qty <= self._epsilon_qty():
             return
@@ -1319,6 +1343,31 @@ class TradeExecutor:
             elif ws_bad and http_fresh:
                 cross_reason = "ws_unstable_http"
         desired_phase = "CROSS" if cross_reason and self._tp_armed else "MAKER"
+        if price_state.data_blind and desired_phase == "CROSS":
+            if not self._should_dedup_log("exit_cross_blocked_data_blind", 2.0):
+                self._logger("[EXIT_CROSS_BLOCKED] reason=data_blind")
+            desired_phase = "MAKER"
+        if price_state.data_blind and self._data_blind_since_ts is not None:
+            blind_ms = int((time.monotonic() - self._data_blind_since_ts) * 1000.0)
+            blind_exit_hard_ms = int(
+                getattr(self._settings, "blind_exit_hard_ms", 15000)
+            )
+            if blind_ms >= blind_exit_hard_ms:
+                if not self._should_dedup_log("exit_data_blind_hard", 2.0):
+                    self._logger(
+                        "[EXIT_DATA_BLIND_HARD] "
+                        f"age_ms={blind_ms} action=safe_stop"
+                    )
+                if not self._has_active_order("SELL"):
+                    self._place_sell_order(
+                        reason="TP_MAKER",
+                        price_override=tp_price,
+                        exit_intent="TP",
+                        ref_bid=bid,
+                        ref_ask=ask,
+                    )
+                self._enter_safe_stop(reason="DATA_BLIND_EXIT_HARD", allow_rest=False)
+                return
         if desired_phase == "MAKER" and self._tp_exit_phase != "MAKER":
             self._logger("[TP_MAKER_ARMED]")
             self._logger("[EXIT] maker_armed")
@@ -1722,6 +1771,15 @@ class TradeExecutor:
             tick_size = tick_size or self._profile.tick_size
             reason_upper = reason.upper()
             exit_order_type = self._resolve_exit_order_type(intent, reason_upper)
+            if price_state.data_blind:
+                if exit_order_type == "MARKET" or reason_upper in {"TP_CROSS", "RECOVERY"}:
+                    if not self._should_dedup_log("exit_blocked_data_blind", 2.0):
+                        self._logger(
+                            "[EXIT_BLOCKED] action=aggressive_exit reason=data_blind "
+                            f"intent={intent} exit_order_type={exit_order_type}"
+                        )
+                    self.last_action = "data_blind_exit_blocked"
+                    return 0
             if exit_order_type == "MARKET" and reason_upper not in {
                 "EMERGENCY",
                 "SL_HARD",
@@ -2031,6 +2089,7 @@ class TradeExecutor:
                 }
             )
             self.orders_count = len(self.active_test_orders)
+            self._mark_progress(reason="exit_place", reset_reconcile=True)
             return 1
         finally:
             self._inflight_trade_action = False
@@ -2048,6 +2107,13 @@ class TradeExecutor:
         if self.position is None:
             self.last_action = "no_position"
             return 0
+        if not force:
+            price_state, _ = self._router.build_price_state()
+            if price_state.data_blind:
+                if not self._should_dedup_log("market_exit_blocked_data_blind", 2.0):
+                    self._logger("[EXIT_BLOCKED] action=market_exit reason=data_blind")
+                self.last_action = "data_blind_exit_blocked"
+                return 0
         self.sell_place_inflight = True
         self.sell_last_attempt_ts = time.monotonic()
         inflight_ms = int(getattr(self._settings, "inflight_deadline_ms", 2500))
@@ -2142,6 +2208,7 @@ class TradeExecutor:
                 }
             )
             self.orders_count = len(self.active_test_orders)
+            self._mark_progress(reason="exit_place", reset_reconcile=True)
             return 1
         finally:
             self.sell_place_inflight = False
@@ -2172,6 +2239,60 @@ class TradeExecutor:
     def _start_buy_wait(self) -> None:
         self._buy_wait_started_ts = time.monotonic()
         self._set_wait_state("ENTRY_WAIT")
+
+    def _start_entry_cancel(self, reason: str, age_ms: Optional[int] = None) -> bool:
+        buy_order = self._get_active_entry_order()
+        if not buy_order or self._entry_order_is_final(buy_order):
+            return self._recover_stuck(
+                reason="entry_cancel_missing",
+                wait_kind="ENTRY_WAIT",
+                age_ms=age_ms,
+            )
+        order_id = buy_order.get("orderId")
+        age_label = age_ms if age_ms is not None else "?"
+        self._logger(
+            f"[ENTRY_CANCEL] reason={reason} order_id={order_id} age_ms={age_label}"
+        )
+        is_isolated = "TRUE" if self._settings.margin_isolated else "FALSE"
+        if order_id:
+            self._cancel_margin_order(
+                symbol=self._settings.symbol,
+                order_id=order_id,
+                is_isolated=is_isolated,
+                tag=buy_order.get("tag", self.TAG),
+            )
+        self.entry_cancel_pending = True
+        self._entry_replace_after_cancel = True
+        self._entry_cancel_requested_ts = time.monotonic()
+        self._set_wait_state("ENTRY_CANCEL_WAIT")
+        return True
+
+    def _attempt_entry_replace_from_cancel(self) -> None:
+        price_state, health_state = self._router.build_price_state()
+        self._note_effective_source(price_state.source)
+        bid = price_state.bid
+        ask = price_state.ask
+        entry_context = self._entry_log_context(
+            price_state.source,
+            price_state.source == "WS" and self._entry_ws_bad(health_state.ws_connected),
+            health_state.ws_age_ms,
+            health_state.http_age_ms,
+        )
+        if bid is None:
+            if not self._should_dedup_log("entry_replace_no_bid", 2.0):
+                self._logger(f"[ENTRY_REPLACE_WAIT] reason=no_bid {entry_context}")
+            return
+        self._start_entry_attempt()
+        self._start_buy_wait()
+        placed = self._place_entry_order(
+            price=bid,
+            bid=bid,
+            ask=ask,
+            entry_context=entry_context,
+            reason="deadline_replace",
+        )
+        if placed:
+            self._entry_replace_after_cancel = False
 
     def _start_entry_attempt(self) -> None:
         if self._entry_attempt_started_ts is None:
@@ -2347,19 +2468,6 @@ class TradeExecutor:
         source = price_state.source
         if source == "HTTP" and health_state.http_age_ms is not None:
             age_ms = health_state.http_age_ms
-        if price_state.data_blind:
-            return (
-                False,
-                bid,
-                ask,
-                mid_val,
-                age_ms,
-                source,
-                "data_blind",
-                ws_bad,
-                health_state.ws_age_ms,
-                health_state.http_age_ms,
-            )
         if mid_val is None:
             return (
                 False,
@@ -2387,13 +2495,19 @@ class TradeExecutor:
                 health_state.http_age_ms,
             )
         entry_max_age_ms = int(getattr(self._settings, "entry_max_age_ms", 800))
-        if age_ms > entry_max_age_ms:
+        entry_http_max_age_ms = int(
+            getattr(self._settings, "entry_http_max_age_ms", entry_max_age_ms)
+        )
+        if (
+            health_state.http_age_ms is not None
+            and health_state.http_age_ms > entry_http_max_age_ms
+        ):
             return (
                 False,
                 bid,
                 ask,
                 mid_val,
-                age_ms,
+                health_state.http_age_ms,
                 source,
                 "stale",
                 ws_bad,
@@ -2428,7 +2542,6 @@ class TradeExecutor:
 
     def _note_price_progress(self, bid: Optional[float], ask: Optional[float]) -> None:
         if bid is None or ask is None:
-            self._mark_progress(reason="price_fresh", reset_reconcile=True)
             return
         tick_size = self._profile.tick_size
         moved = False
@@ -2474,11 +2587,101 @@ class TradeExecutor:
             f"bid={bid_label} ask={ask_label} {entry_context}"
         )
 
+    def _place_entry_order(
+        self,
+        price: float,
+        bid: Optional[float],
+        ask: Optional[float],
+        entry_context: str,
+        reason: str,
+    ) -> bool:
+        if not self._profile.tick_size or not self._profile.step_size:
+            return False
+        new_price = self._calculate_entry_price(price)
+        if new_price is None:
+            return False
+        order_quote = float(self._settings.order_quote)
+        qty = self._round_down(order_quote / new_price, self._profile.step_size)
+        if self._profile.min_qty and qty < self._profile.min_qty:
+            return False
+        if self._profile.min_notional is not None and qty * new_price < self._profile.min_notional:
+            return False
+        is_isolated = "TRUE" if self._settings.margin_isolated else "FALSE"
+        timestamp = int(time.time() * 1000)
+        self._mark_cycle_entry_start()
+        buy_client_id = self._build_client_order_id("BUY", timestamp)
+        side_effect_type = self._normalize_side_effect_type(
+            self._settings.side_effect_type
+        )
+        self._log_entry_place(new_price, bid, ask, entry_context)
+        buy_order = self._place_margin_order(
+            symbol=self._settings.symbol,
+            side="BUY",
+            quantity=qty,
+            price=new_price,
+            is_isolated=is_isolated,
+            client_order_id=buy_client_id,
+            side_effect=side_effect_type,
+            order_type="LIMIT",
+        )
+        if not buy_order:
+            return False
+        buy_order_id = buy_order.get("orderId")
+        if isinstance(buy_order_id, int):
+            self._cycle_order_ids.add(buy_order_id)
+        cycle_label = self._cycle_id_label()
+        self._logger(
+            f"[ORDER] BUY placed cycle_id={cycle_label} qty={qty:.8f} "
+            f"price={new_price:.8f} id={buy_order.get('orderId')}"
+        )
+        if reason == "deadline_replace":
+            self._logger(
+                f"[ENTRY] replaced cycle_id={cycle_label} price={new_price:.8f}"
+            )
+        self._entry_reprice_last_ts = time.monotonic()
+        self._entry_consecutive_fresh_reads = 0
+        self._entry_order_price = new_price
+        now_ms = int(time.time() * 1000)
+        self.active_test_orders = [
+            {
+                "orderId": buy_order_id,
+                "side": "BUY",
+                "price": new_price,
+                "bid_at_place": bid,
+                "qty": qty,
+                "cum_qty": 0.0,
+                "avg_fill_price": 0.0,
+                "last_fill_price": None,
+                "created_ts": now_ms,
+                "updated_ts": now_ms,
+                "status": "NEW",
+                "tag": self.TAG,
+                "clientOrderId": buy_order.get("clientOrderId", buy_client_id),
+                "cycle_id": self._current_cycle_id,
+            }
+        ]
+        self.entry_active_order_id = buy_order.get("orderId")
+        self.entry_active_price = new_price
+        self.entry_cancel_pending = False
+        if bid is not None:
+            self._entry_last_ref_bid = bid
+            self._entry_last_ref_ts_ms = now_ms
+        self.orders_count = len(self.active_test_orders)
+        progress_reason = "entry_place"
+        if reason in {"reprice", "deadline_replace"}:
+            progress_reason = "entry_reprice"
+        self._mark_progress(reason=progress_reason, reset_reconcile=True)
+        return True
+
     def _handle_entry_follow_top(self, open_orders: dict[int, dict]) -> None:
         if self.state != TradeState.STATE_ENTRY_WORKING:
             return
         buy_order = self._get_active_entry_order()
-        if not buy_order or buy_order.get("status") == "FILLED":
+        if not buy_order:
+            if self._entry_replace_after_cancel:
+                self._attempt_entry_replace_from_cancel()
+            return
+        if buy_order.get("status") == "FILLED":
             return
         if self.entry_cancel_pending:
             self._maybe_confirm_entry_cancel(buy_order, open_orders)
@@ -2695,72 +2898,16 @@ class TradeExecutor:
             entry for entry in self.active_test_orders if entry.get("orderId") != order_id
         ]
         self.orders_count = len(self.active_test_orders)
-        order_quote = float(self._settings.order_quote)
-        qty = self._round_down(order_quote / new_price, self._profile.step_size)
-        if self._profile.min_qty and qty < self._profile.min_qty:
-            return
-        if self._profile.min_notional is not None and qty * new_price < self._profile.min_notional:
-            return
-        is_isolated = "TRUE" if self._settings.margin_isolated else "FALSE"
-        timestamp = int(time.time() * 1000)
-        self._mark_cycle_entry_start()
-        buy_client_id = self._build_client_order_id("BUY", timestamp)
-        side_effect_type = self._normalize_side_effect_type(
-            self._settings.side_effect_type
+        self._logger(
+            f"[ENTRY] repriced cycle_id={self._cycle_id_label()} price={new_price:.8f}"
         )
-        self._log_entry_place(new_price, bid, ask, entry_context)
-        buy_order = self._place_margin_order(
-            symbol=self._settings.symbol,
-            side="BUY",
-            quantity=qty,
+        self._place_entry_order(
             price=new_price,
-            is_isolated=is_isolated,
-            client_order_id=buy_client_id,
-            side_effect=side_effect_type,
-            order_type="LIMIT",
+            bid=bid,
+            ask=ask,
+            entry_context=entry_context,
+            reason="reprice",
         )
-        if not buy_order:
-            return
-        buy_order_id = buy_order.get("orderId")
-        if isinstance(buy_order_id, int):
-            self._cycle_order_ids.add(buy_order_id)
-        cycle_label = self._cycle_id_label()
-        self._logger(
-            f"[ORDER] BUY placed cycle_id={cycle_label} qty={qty:.8f} "
-            f"price={new_price:.8f} id={buy_order.get('orderId')}"
-        )
-        self._logger(
-            f"[ENTRY] repriced cycle_id={cycle_label} price={new_price:.8f}"
-        )
-        self._entry_reprice_last_ts = now
-        self._entry_consecutive_fresh_reads = 0
-        self._entry_order_price = new_price
-        now_ms = int(time.time() * 1000)
-        self.active_test_orders = [
-            {
-                "orderId": buy_order_id,
-                "side": "BUY",
-                "price": new_price,
-                "bid_at_place": bid,
-                "qty": qty,
-                "cum_qty": 0.0,
-                "avg_fill_price": 0.0,
-                "last_fill_price": None,
-                "created_ts": now_ms,
-                "updated_ts": now_ms,
-                "status": "NEW",
-                "tag": self.TAG,
-                "clientOrderId": buy_order.get("clientOrderId", buy_client_id),
-                "cycle_id": self._current_cycle_id,
-            }
-        ]
-        self.entry_active_order_id = buy_order.get("orderId")
-        self.entry_active_price = new_price
-        self.entry_cancel_pending = False
-        if bid is not None:
-            self._entry_last_ref_bid = bid
-            self._entry_last_ref_ts_ms = now_ms
-        self.orders_count = len(self.active_test_orders)
 
     def _maybe_handle_sell_reprice(self, open_orders: dict[int, dict]) -> None:
         if not self._in_exit_workflow():
@@ -2865,14 +3012,8 @@ class TradeExecutor:
             return True
         state_age_ms = self._state_age_ms(now)
         no_progress_ms = self._no_progress_ms(now)
-        max_state_ms = int(getattr(self._settings, "max_state_stuck_ms", 8000))
-        max_progress_ms = int(getattr(self._settings, "max_no_progress_ms", 5000))
+        hard_stall_ms = int(getattr(self._settings, "hard_stall_ms", self.HARD_STALL_MS))
         if self.state == TradeState.STATE_ENTRY_WORKING:
-            entry_stuck_ms = max(
-                max_state_ms,
-                max_progress_ms,
-                int(getattr(self._settings, "entry_stuck_ms", 15000)),
-            )
             entry_order = self._get_active_entry_order()
             entry_order_active = entry_order is not None and not self._entry_order_is_final(
                 entry_order
@@ -2889,9 +3030,6 @@ class TradeExecutor:
                 moved_ticks = self._ticks_between(
                     self.entry_active_price, price_state.bid, self._profile.tick_size
                 )
-            if entry_order_active and not price_state.data_blind and moved_ticks == 0:
-                if no_progress_ms < entry_stuck_ms:
-                    return False
             if self._entry_missing_since_ts is not None:
                 missing_ms = int((now - self._entry_missing_since_ts) * 1000.0)
                 if missing_ms >= 1000:
@@ -2900,18 +3038,9 @@ class TradeExecutor:
                         f"entry_missing_ms={missing_ms} state={self.state.value} -> RECONCILE"
                     )
                     return self._start_reconcile_from_watchdog(state_age_ms, no_progress_ms)
-            if self._data_blind_since_ts is not None:
-                blind_ms = int((now - self._data_blind_since_ts) * 1000.0)
-                data_blind_ms = int(getattr(self._settings, "data_blind_ms", 8000))
-                if blind_ms >= data_blind_ms and self.position is not None:
-                    self._logger(
-                        "[WD] "
-                        f"data_blind_ms={blind_ms} state={self.state.value} -> RECONCILE"
-                    )
-                    return self._start_reconcile_from_watchdog(state_age_ms, no_progress_ms)
-            if entry_order_active and no_progress_ms < entry_stuck_ms:
+            if entry_order_active and moved_ticks == 0 and no_progress_ms < hard_stall_ms:
                 return False
-        if state_age_ms < max_state_ms and no_progress_ms < max_progress_ms:
+        if no_progress_ms < hard_stall_ms:
             return False
         return self._start_reconcile_from_watchdog(state_age_ms, no_progress_ms)
 
@@ -2919,7 +3048,8 @@ class TradeExecutor:
         self._logger(
             "[WD] "
             f"stuck state={self.state.value} age_ms={state_age_ms} "
-            f"no_progress_ms={no_progress_ms} -> RECONCILE"
+            f"no_progress_ms={no_progress_ms} last_progress={self._last_progress_reason} "
+            "-> RECONCILE"
         )
         max_retries = int(getattr(self._settings, "max_reconcile_retries", 3))
         if self._reconcile_attempts >= max_retries:
@@ -4534,6 +4664,12 @@ class TradeExecutor:
             self._reset_buy_retry()
             self._clear_entry_attempt()
         self._logger(f"[ENTRY_CANCEL_CONFIRMED] id={order_id} status={status}")
+        self._mark_progress(reason="entry_cancel_confirmed", reset_reconcile=True)
+        if (
+            self._entry_replace_after_cancel
+            and status in {"CANCELED", "REJECTED", "EXPIRED"}
+        ):
+            self._attempt_entry_replace_from_cancel()
         if self.position is not None:
             self._transition_to_position_state()
 
@@ -4568,6 +4704,7 @@ class TradeExecutor:
                     or 0.0
                 )
             self.entry_cancel_pending = False
+            self._entry_replace_after_cancel = False
             self._logger(
                 "[ENTRY_CANCEL_ABORT] "
                 f"id={order_id} status={status} executed={executed_qty:.8f}"
@@ -4584,7 +4721,7 @@ class TradeExecutor:
             final_status = status if status else "CANCELED"
             self._handle_entry_cancel_confirmed(buy_order, order_id, final_status)
             return
-        self._set_wait_state("CANCEL_WAIT")
+        self._set_wait_state("ENTRY_CANCEL_WAIT")
         if not self._should_dedup_log(f"entry_cancel_wait:{order_id}", 2.0):
             self._logger(f"[ENTRY_CANCEL_WAIT] id={order_id}")
 
@@ -4607,13 +4744,14 @@ class TradeExecutor:
         if order_id not in open_orders:
             self._handle_sell_cancel_confirmed(sell_order, order_id)
             return
-        self._set_wait_state("CANCEL_WAIT")
+        self._set_wait_state("EXIT_CANCEL_WAIT")
         if not self._should_dedup_log(f"sell_cancel_wait:{order_id}", 2.0):
             self._logger(f"[SELL_CANCEL_WAIT] id={order_id}")
 
     def _finalize_sell_cancel(self, order_id: Optional[int]) -> None:
         if order_id is not None:
             self._logger(f"[SELL_CANCEL_CONFIRMED] id={order_id}")
+        self._mark_progress(reason="sell_cancel_confirmed", reset_reconcile=True)
         self.sell_cancel_pending = False
         self.sell_active_order_id = None
         self.sell_retry_pending = False

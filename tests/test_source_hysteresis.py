@@ -97,3 +97,19 @@ def test_source_hold_hysteresis(monkeypatch) -> None:
     _set_time(monkeypatch, 5200.0)
     router.update_ws(1.0, 1.1)
     assert router.get_best_quote()[3] == "WS"
+
+
+def test_data_blind_false_when_http_fresh_even_if_ws_down(monkeypatch) -> None:
+    settings = _make_settings(http_fresh_ms=1000)
+    router = PriceRouter(settings)
+    router.set_tick_size(0.0001)
+    router.set_ws_connected(False)
+
+    _set_time(monkeypatch, 0.0)
+    router.update_http(1.0, 1.1)
+
+    _set_time(monkeypatch, 300.0)
+    price_state, _ = router.build_price_state()
+
+    assert price_state.data_blind is False
+    assert price_state.source == "HTTP"
