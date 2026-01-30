@@ -314,9 +314,10 @@ def test_entry_wait_deadline_triggers_cancel(monkeypatch) -> None:
 
     now_s = 20.0
     monkeypatch.setattr(trade_executor_module.time, "monotonic", lambda: now_s)
-    executor._wait_state_kind = "ENTRY_WAIT"
-    executor._wait_state_enter_ts_ms = int((now_s * 1000) - 13000)
-    executor._wait_state_deadline_ms = executor.ENTRY_WAIT_DEADLINE_MS
+    executor._entry_wait_kind = "ENTRY_WAIT"
+    executor._entry_wait_enter_ts_ms = int((now_s * 1000) - 13000)
+    executor._entry_wait_deadline_ms = executor.ENTRY_WAIT_DEADLINE_MS
+    executor._entry_deadline_ts = now_s - 1.0
     executor._last_progress_ts = now_s - 13.0
 
     cancelled: list[int] = []
@@ -330,3 +331,28 @@ def test_entry_wait_deadline_triggers_cancel(monkeypatch) -> None:
     assert executor._check_wait_deadline(now_s) is True
     assert executor.entry_cancel_pending is True
     assert cancelled == [1]
+
+
+def test_entry_timeout_not_triggered_in_exit(monkeypatch) -> None:
+    price_state = PriceState(
+        bid=1.2000,
+        ask=1.2001,
+        mid=1.20005,
+        source="HTTP",
+        mid_age_ms=10,
+        data_blind=False,
+    )
+    health_state = HealthState(ws_connected=False, ws_age_ms=None, http_age_ms=10)
+    executor = make_executor(DummyRouter(price_state, health_state))
+    executor.state = TradeState.STATE_EXIT_TP_WORKING
+    executor.entry_cancel_pending = True
+
+    now_s = 30.0
+    monkeypatch.setattr(trade_executor_module.time, "monotonic", lambda: now_s)
+    executor._cancel_wait_kind = "ENTRY_CANCEL_WAIT"
+    executor._cancel_wait_enter_ts_ms = int((now_s * 1000) - 5000)
+    executor._cancel_wait_deadline_ms = 1
+    executor._cancel_deadline_ts = now_s - 1.0
+
+    assert executor._check_wait_deadline(now_s) is False
+    assert executor._last_recover_reason is None

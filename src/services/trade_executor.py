@@ -159,6 +159,18 @@ class TradeExecutor:
         self._wait_state_kind: Optional[str] = None
         self._wait_state_enter_ts_ms: Optional[int] = None
         self._wait_state_deadline_ms: Optional[int] = None
+        self._entry_wait_kind: Optional[str] = None
+        self._entry_wait_enter_ts_ms: Optional[int] = None
+        self._entry_wait_deadline_ms: Optional[int] = None
+        self._entry_deadline_ts: Optional[float] = None
+        self._exit_wait_kind: Optional[str] = None
+        self._exit_wait_enter_ts_ms: Optional[int] = None
+        self._exit_wait_deadline_ms: Optional[int] = None
+        self._exit_deadline_ts: Optional[float] = None
+        self._cancel_wait_kind: Optional[str] = None
+        self._cancel_wait_enter_ts_ms: Optional[int] = None
+        self._cancel_wait_deadline_ms: Optional[int] = None
+        self._cancel_deadline_ts: Optional[float] = None
         self._entry_replace_after_cancel = False
         self._entry_cancel_requested_ts: Optional[float] = None
         self._last_effective_source: Optional[str] = None
@@ -249,16 +261,67 @@ class TradeExecutor:
             return int(getattr(self._settings, "cancel_wait_deadline_ms", default) or default)
         return 0
 
-    def _set_wait_state(self, kind: Optional[str]) -> None:
+    def _clear_entry_wait(self) -> None:
+        self._entry_wait_kind = None
+        self._entry_wait_enter_ts_ms = None
+        self._entry_wait_deadline_ms = None
+        self._entry_deadline_ts = None
+
+    def _clear_exit_wait(self) -> None:
+        self._exit_wait_kind = None
+        self._exit_wait_enter_ts_ms = None
+        self._exit_wait_deadline_ms = None
+        self._exit_deadline_ts = None
+
+    def _clear_cancel_wait(self) -> None:
+        self._cancel_wait_kind = None
+        self._cancel_wait_enter_ts_ms = None
+        self._cancel_wait_deadline_ms = None
+        self._cancel_deadline_ts = None
+
+    def _clear_entry_cancel_trackers(self) -> None:
+        self.entry_cancel_pending = False
+        self._entry_cancel_requested_ts = None
+        self._entry_replace_after_cancel = False
+
+    def _set_entry_wait_state(self, kind: Optional[str]) -> None:
         if kind is None:
-            self._wait_state_kind = None
-            self._wait_state_enter_ts_ms = None
-            self._wait_state_deadline_ms = None
+            self._clear_entry_wait()
             return
-        if self._wait_state_kind != kind or self._wait_state_enter_ts_ms is None:
-            self._wait_state_kind = kind
-            self._wait_state_enter_ts_ms = int(time.monotonic() * 1000)
-            self._wait_state_deadline_ms = self._resolve_wait_deadline_ms(kind)
+        if self._entry_wait_kind != kind or self._entry_wait_enter_ts_ms is None:
+            self._entry_wait_kind = kind
+            self._entry_wait_enter_ts_ms = int(time.monotonic() * 1000)
+            self._entry_wait_deadline_ms = self._resolve_wait_deadline_ms(kind)
+            deadline_ms = self._entry_wait_deadline_ms or 0
+            self._entry_deadline_ts = (
+                time.monotonic() + (deadline_ms / 1000.0) if deadline_ms > 0 else None
+            )
+
+    def _set_exit_wait_state(self, kind: Optional[str]) -> None:
+        if kind is None:
+            self._clear_exit_wait()
+            return
+        if self._exit_wait_kind != kind or self._exit_wait_enter_ts_ms is None:
+            self._exit_wait_kind = kind
+            self._exit_wait_enter_ts_ms = int(time.monotonic() * 1000)
+            self._exit_wait_deadline_ms = self._resolve_wait_deadline_ms(kind)
+            deadline_ms = self._exit_wait_deadline_ms or 0
+            self._exit_deadline_ts = (
+                time.monotonic() + (deadline_ms / 1000.0) if deadline_ms > 0 else None
+            )
+
+    def _set_cancel_wait_state(self, kind: Optional[str]) -> None:
+        if kind is None:
+            self._clear_cancel_wait()
+            return
+        if self._cancel_wait_kind != kind or self._cancel_wait_enter_ts_ms is None:
+            self._cancel_wait_kind = kind
+            self._cancel_wait_enter_ts_ms = int(time.monotonic() * 1000)
+            self._cancel_wait_deadline_ms = self._resolve_wait_deadline_ms(kind)
+            deadline_ms = self._cancel_wait_deadline_ms or 0
+            self._cancel_deadline_ts = (
+                time.monotonic() + (deadline_ms / 1000.0) if deadline_ms > 0 else None
+            )
 
     def _note_effective_source(self, source: Optional[str]) -> None:
         if source is None:
@@ -274,46 +337,71 @@ class TradeExecutor:
             self._last_effective_source = source
             self._mark_progress(reason="source_change", reset_reconcile=True)
 
-    def _current_wait_kind(self) -> Optional[str]:
-        if self.entry_cancel_pending:
-            return "ENTRY_CANCEL_WAIT"
-        if self.sell_cancel_pending:
-            return "EXIT_CANCEL_WAIT"
-        if self.state == TradeState.STATE_ENTRY_WORKING:
-            return "ENTRY_WAIT"
-        if self._in_exit_workflow():
-            if self._tp_exit_phase == "MAKER":
-                return "EXIT_MAKER_WAIT"
-            return "EXIT_CROSS_WAIT"
-        return None
-
     def _check_wait_deadline(self, now: float) -> bool:
-        kind = self._current_wait_kind()
-        self._set_wait_state(kind)
-        if self._wait_state_enter_ts_ms is None or self._wait_state_deadline_ms is None:
-            return False
-        if self._wait_state_deadline_ms <= 0:
-            return False
-        now_ms = int(now * 1000)
-        age_ms = now_ms - self._wait_state_enter_ts_ms
-        if age_ms <= self._wait_state_deadline_ms:
-            return False
-        if kind == "ENTRY_WAIT":
-            no_progress_ms = self._no_progress_ms(now)
-            if no_progress_ms <= self._wait_state_deadline_ms:
-                return False
-            self._logger(
-                f"[ENTRY_WAIT_DEADLINE] age_ms={age_ms} no_progress_ms={no_progress_ms}"
-            )
-            return self._start_entry_cancel(reason="deadline", age_ms=age_ms)
-        if kind == "ENTRY_CANCEL_WAIT":
-            self._logger(
-                f"[ENTRY_CANCEL_TIMEOUT] age_ms={age_ms} -> RECOVER_STUCK"
-            )
-            return self._recover_stuck(
-                reason="entry_cancel_timeout", wait_kind=kind, age_ms=age_ms
-            )
-        return self._recover_stuck(reason="deadline", wait_kind=kind, age_ms=age_ms)
+        cancel_kind = None
+        if self.entry_cancel_pending:
+            cancel_kind = "ENTRY_CANCEL_WAIT"
+        elif self.sell_cancel_pending:
+            cancel_kind = "EXIT_CANCEL_WAIT"
+        self._set_cancel_wait_state(cancel_kind)
+        if cancel_kind is None:
+            self._clear_cancel_wait()
+        if cancel_kind and self._cancel_deadline_ts is not None:
+            if self._cancel_wait_deadline_ms and self._cancel_wait_deadline_ms > 0:
+                if now >= self._cancel_deadline_ts:
+                    age_ms = (
+                        int(now * 1000) - (self._cancel_wait_enter_ts_ms or int(now * 1000))
+                    )
+                    if cancel_kind == "ENTRY_CANCEL_WAIT" and (
+                        self.state.value.startswith("EXIT_")
+                        or self.state == TradeState.STATE_POS_OPEN
+                    ):
+                        return False
+                    if cancel_kind == "ENTRY_CANCEL_WAIT":
+                        self._logger(
+                            f"[ENTRY_CANCEL_TIMEOUT] age_ms={age_ms} -> RECOVER_STUCK"
+                        )
+                        return self._recover_stuck(
+                            reason="entry_cancel_timeout",
+                            wait_kind=cancel_kind,
+                            age_ms=age_ms,
+                        )
+                    return self._recover_stuck(
+                        reason="deadline", wait_kind=cancel_kind, age_ms=age_ms
+                    )
+
+        entry_kind = "ENTRY_WAIT" if self.state == TradeState.STATE_ENTRY_WORKING else None
+        self._set_entry_wait_state(entry_kind)
+        if entry_kind is None:
+            self._clear_entry_wait()
+        if entry_kind and self._entry_deadline_ts is not None:
+            if self._entry_wait_deadline_ms and self._entry_wait_deadline_ms > 0:
+                if now >= self._entry_deadline_ts:
+                    age_ms = (
+                        int(now * 1000) - (self._entry_wait_enter_ts_ms or int(now * 1000))
+                    )
+                    no_progress_ms = self._no_progress_ms(now)
+                    if no_progress_ms <= (self._entry_wait_deadline_ms or 0):
+                        return False
+                    self._logger(
+                        f"[ENTRY_WAIT_DEADLINE] age_ms={age_ms} no_progress_ms={no_progress_ms}"
+                    )
+                    return self._start_entry_cancel(reason="deadline", age_ms=age_ms)
+
+        exit_kind = None
+        if self._in_exit_workflow():
+            exit_kind = "EXIT_MAKER_WAIT" if self._tp_exit_phase == "MAKER" else "EXIT_CROSS_WAIT"
+        self._set_exit_wait_state(exit_kind)
+        if exit_kind is None:
+            self._clear_exit_wait()
+        if exit_kind and self._exit_deadline_ts is not None:
+            if self._exit_wait_deadline_ms and self._exit_wait_deadline_ms > 0:
+                if now >= self._exit_deadline_ts:
+                    age_ms = (
+                        int(now * 1000) - (self._exit_wait_enter_ts_ms or int(now * 1000))
+                    )
+                    return self._recover_stuck(reason="deadline", wait_kind=exit_kind, age_ms=age_ms)
+        return False
 
     def _open_orders_signature(self, open_orders: list[dict]) -> tuple:
         signature = []
@@ -344,6 +432,18 @@ class TradeExecutor:
         previous = self.state
         self.state = next_state
         self._state_entered_ts = time.monotonic()
+        if previous == TradeState.STATE_ENTRY_WORKING and next_state in {
+            TradeState.STATE_POS_OPEN,
+            TradeState.STATE_EXIT_TP_WORKING,
+            TradeState.STATE_EXIT_SL_WORKING,
+        }:
+            self._clear_entry_wait()
+            self._clear_entry_cancel_trackers()
+        if previous in {
+            TradeState.STATE_EXIT_TP_WORKING,
+            TradeState.STATE_EXIT_SL_WORKING,
+        } and next_state == TradeState.STATE_FLAT:
+            self._clear_exit_wait()
         reset_reconcile = next_state not in {
             TradeState.STATE_RECONCILE,
             TradeState.STATE_SAFE_STOP,
@@ -1600,6 +1700,30 @@ class TradeExecutor:
         _, ref_side = self._resolve_exit_policy_for_side(intent)
         return ref_side
 
+    @staticmethod
+    def get_cross_price(
+        direction: str, side_needed: str, book: dict[str, Optional[float]]
+    ) -> Optional[float]:
+        side = str(side_needed or "").upper()
+        bid = book.get("bid")
+        ask = book.get("ask")
+        if side == "SELL":
+            return bid if bid is not None else ask
+        if side == "BUY":
+            return ask if ask is not None else bid
+        return None
+
+    @staticmethod
+    def _cap_tp_maker_price(
+        side_needed: str, tp_price: Optional[float], best_ask: Optional[float]
+    ) -> Optional[float]:
+        if tp_price is None or best_ask is None:
+            return tp_price
+        side = str(side_needed or "").upper()
+        if side in {"SELL", "BUY"}:
+            return min(tp_price, best_ask)
+        return tp_price
+
     def _compute_tp_cross_price(
         self,
         bid: Optional[float],
@@ -1608,7 +1732,7 @@ class TradeExecutor:
     ) -> tuple[Optional[float], Optional[float], Optional[float], str]:
         if bid is None or tick_size is None or tick_size <= 0:
             return None, None, None, "ref_missing"
-        raw_price = bid - (cross_ticks * tick_size)
+        raw_price = bid
         rounded = TradeExecutor._round_to_step(raw_price, tick_size)
         if rounded < tick_size:
             rounded = tick_size
@@ -1623,7 +1747,7 @@ class TradeExecutor:
     ) -> tuple[Optional[float], Optional[float], Optional[float], str]:
         if ask is None or tick_size is None or tick_size <= 0:
             return None, None, None, "ref_missing"
-        raw_price = ask + (cross_ticks * tick_size)
+        raw_price = ask
         rounded = TradeExecutor._round_to_step(raw_price, tick_size)
         if rounded < tick_size:
             rounded = tick_size
@@ -1676,7 +1800,7 @@ class TradeExecutor:
     @staticmethod
     def _resolve_exit_policy_buy(intent: str) -> tuple[str, str]:
         if intent == "TP":
-            return "TP_MAKER", "bid"
+            return "TP_MAKER", "ask"
         if intent == "SL":
             return "SL_HARD", "ask"
         return "MANUAL", "bid"
@@ -1917,6 +2041,14 @@ class TradeExecutor:
             tick_size = tick_size or self._profile.tick_size
             reason_upper = reason.upper()
             exit_order_type = self._resolve_exit_order_type(intent, reason_upper)
+            if (
+                exit_order_type == "LIMIT"
+                and intent == "TP"
+                and (self._tp_exit_phase == "CROSS" or reason_upper == "TP_CROSS")
+            ):
+                price_override = TradeExecutor.get_cross_price(
+                    self._direction, exit_side, {"bid": bid, "ask": ask}
+                )
             if price_state.data_blind:
                 if exit_order_type == "MARKET" or reason_upper in {"TP_CROSS", "RECOVERY"}:
                     if not self._should_dedup_log("exit_blocked_data_blind", 2.0):
@@ -2097,6 +2229,10 @@ class TradeExecutor:
                         )
                 else:
                     sell_price = price_override
+                    if intent == "TP" and exit_order_type == "LIMIT":
+                        sell_price = self._cap_tp_maker_price(exit_side, sell_price, ask)
+                        sell_ref_label = "ask"
+                        sell_ref_price = ask
                     sell_ref_price = ask if sell_ref_label == "ask" else bid
                     if (
                         sell_ref_price is not None
@@ -2376,7 +2512,7 @@ class TradeExecutor:
         wait_kind = "EXIT_CROSS_WAIT"
         if self._tp_exit_phase == "MAKER":
             wait_kind = "EXIT_MAKER_WAIT"
-        self._set_wait_state(wait_kind)
+        self._set_exit_wait_state(wait_kind)
 
     def _reset_buy_retry(self) -> None:
         self._buy_wait_started_ts = None
@@ -2388,7 +2524,7 @@ class TradeExecutor:
 
     def _start_buy_wait(self) -> None:
         self._buy_wait_started_ts = time.monotonic()
-        self._set_wait_state("ENTRY_WAIT")
+        self._set_entry_wait_state("ENTRY_WAIT")
 
     def _start_entry_cancel(self, reason: str, age_ms: Optional[int] = None) -> bool:
         buy_order = self._get_active_entry_order()
@@ -2415,7 +2551,7 @@ class TradeExecutor:
         self.entry_cancel_pending = True
         self._entry_replace_after_cancel = True
         self._entry_cancel_requested_ts = time.monotonic()
-        self._set_wait_state("ENTRY_CANCEL_WAIT")
+        self._set_cancel_wait_state("ENTRY_CANCEL_WAIT")
         return True
 
     def _attempt_entry_replace_from_cancel(self) -> None:
@@ -3292,11 +3428,13 @@ class TradeExecutor:
         self._apply_reconcile_snapshot(executed, closed, remaining, entry_avg)
         decided = "snapshot"
 
+        entry_side = self._entry_side()
+        exit_side = self._exit_side()
         have_open_entry = any(
-            str(order.get("side") or "").upper() == "BUY" for order in open_orders
+            str(order.get("side") or "").upper() == entry_side for order in open_orders
         )
         have_open_exit = any(
-            str(order.get("side") or "").upper() == "SELL" for order in open_orders
+            str(order.get("side") or "").upper() == exit_side for order in open_orders
         )
 
         if self.entry_cancel_pending and self._recover_cancel_attempts["entry"] < 2:
@@ -3357,20 +3495,29 @@ class TradeExecutor:
                     )
                 self._apply_reconcile_snapshot(executed, closed, remaining, entry_avg)
                 have_open_entry = any(
-                    str(order.get("side") or "").upper() == "BUY" for order in open_orders
+                    str(order.get("side") or "").upper() == entry_side for order in open_orders
                 )
                 have_open_exit = any(
-                    str(order.get("side") or "").upper() == "SELL" for order in open_orders
+                    str(order.get("side") or "").upper() == exit_side for order in open_orders
                 )
 
         if remaining > self._epsilon_qty():
             self._recover_cancel_attempts["entry"] = 0
-            if not have_open_exit:
+            if have_open_exit:
+                decided = "exit_active"
+                self._transition_state(self._exit_state_for_intent(self.exit_intent))
+                wait_kind = "EXIT_MAKER_WAIT"
+                if self._tp_exit_phase == "CROSS":
+                    wait_kind = "EXIT_CROSS_WAIT"
+                self._set_exit_wait_state(wait_kind)
+            else:
                 price_state, _ = self._router.build_price_state()
                 self._note_effective_source(price_state.source)
                 bid = price_state.bid
                 ask = price_state.ask
-                cross_price = bid if bid is not None else ask
+                cross_price = TradeExecutor.get_cross_price(
+                    self._direction, exit_side, {"bid": bid, "ask": ask}
+                )
                 if self._tp_exit_phase != "CROSS":
                     self._tp_exit_phase = "CROSS"
                 placed = self._place_sell_order(
@@ -3382,7 +3529,7 @@ class TradeExecutor:
                 )
                 if placed:
                     decided = "place_exit_cross"
-                    self._set_wait_state("EXIT_CROSS_WAIT")
+                    self._set_exit_wait_state("EXIT_CROSS_WAIT")
                     self._transition_state(self._exit_state_for_intent(self.exit_intent))
                 else:
                     decided = "exit_place_failed"
@@ -3400,9 +3547,6 @@ class TradeExecutor:
                         in {"sell_balance_unavailable", "sell_blocked_no_balance", "NO_PRICE"}
                     ):
                         self._enter_safe_stop(reason="RECOVER_EXIT_UNAVAILABLE", allow_rest=False)
-            else:
-                decided = "exit_wait"
-                self._transition_state(self._exit_state_for_intent(self.exit_intent))
         else:
             self._recover_cancel_attempts["exit"] = 0
             if executed <= self._epsilon_qty() and not have_open_entry:
@@ -4872,6 +5016,7 @@ class TradeExecutor:
         self, buy_order: dict, order_id: Optional[int], status: str
     ) -> None:
         self.entry_cancel_pending = False
+        self._clear_cancel_wait()
         if order_id is None:
             return
         buy_order["status"] = status
@@ -4943,7 +5088,7 @@ class TradeExecutor:
             final_status = status if status else "CANCELED"
             self._handle_entry_cancel_confirmed(buy_order, order_id, final_status)
             return
-        self._set_wait_state("ENTRY_CANCEL_WAIT")
+        self._set_cancel_wait_state("ENTRY_CANCEL_WAIT")
         if not self._should_dedup_log(f"entry_cancel_wait:{order_id}", 2.0):
             self._logger(f"[ENTRY_CANCEL_WAIT] id={order_id}")
 
@@ -4966,7 +5111,7 @@ class TradeExecutor:
         if order_id not in open_orders:
             self._handle_sell_cancel_confirmed(sell_order, order_id)
             return
-        self._set_wait_state("EXIT_CANCEL_WAIT")
+        self._set_cancel_wait_state("EXIT_CANCEL_WAIT")
         if not self._should_dedup_log(f"sell_cancel_wait:{order_id}", 2.0):
             self._logger(f"[SELL_CANCEL_WAIT] id={order_id}")
 
@@ -4975,6 +5120,7 @@ class TradeExecutor:
             self._logger(f"[SELL_CANCEL_CONFIRMED] id={order_id}")
         self._mark_progress(reason="sell_cancel_confirmed", reset_reconcile=True)
         self.sell_cancel_pending = False
+        self._clear_cancel_wait()
         self.sell_active_order_id = None
         self.sell_retry_pending = False
         if order_id is not None:

@@ -133,3 +133,47 @@ def test_tp_cross_after_timeout() -> None:
 
     assert executor._tp_exit_phase == "CROSS"
     assert placed == ["TP_CROSS"]
+
+
+def test_short_cross_uses_best_ask() -> None:
+    profile = SymbolProfile(tick_size=0.01, step_size=0.01, min_qty=0.01, min_notional=0.0)
+    router = DummyRouter(bid=100.0, ask=101.0)
+    executor = TradeExecutor(
+        rest=DummyRest(),
+        router=router,
+        settings=make_settings(),
+        profile=profile,
+        logger=lambda _msg, **_kwargs: None,
+    )
+    executor._set_direction("SHORT")
+    executor.exit_intent = "TP"
+    executor._tp_exit_phase = "CROSS"
+    executor._executed_qty_total = 1.0
+    executor._remaining_qty = 1.0
+    executor.position = {
+        "buy_price": 101.0,
+        "qty": 1.0,
+        "opened_ts": 0,
+        "partial": False,
+        "initial_qty": 1.0,
+        "side": "SHORT",
+    }
+
+    captured: dict[str, float] = {}
+
+    def fake_place_margin_order(
+        *_args,
+        side: str,
+        quantity: float,
+        price: float | None,
+        **_kwargs,
+    ) -> dict:
+        captured["price"] = float(price or 0.0)
+        return {"orderId": 1, "side": side, "price": price, "status": "NEW"}
+
+    executor._place_margin_order = fake_place_margin_order  # type: ignore[assignment]
+
+    placed = executor._place_sell_order(reason="TP_CROSS", exit_intent="TP")
+
+    assert placed == 1
+    assert captured["price"] == 101.0

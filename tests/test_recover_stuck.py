@@ -153,14 +153,17 @@ def test_deadline_triggers_recover() -> None:
         logger=lambda _msg, **_kwargs: None,
     )
     executor.state = TradeState.STATE_ENTRY_WORKING
-    executor._wait_state_kind = "ENTRY_WAIT"
-    executor._wait_state_enter_ts_ms = int(time.monotonic() * 1000) - 50
-    executor._wait_state_deadline_ms = 1
+    now = time.monotonic()
+    executor._entry_wait_kind = "ENTRY_WAIT"
+    executor._entry_wait_enter_ts_ms = int(now * 1000) - 50
+    executor._entry_wait_deadline_ms = 1
+    executor._entry_deadline_ts = now - 0.01
+    executor._last_progress_ts = now - 1.0
 
     triggered = executor.watchdog_tick()
 
     assert triggered is True
-    assert executor._last_recover_reason == "deadline"
+    assert executor._last_recover_reason == "entry_cancel_missing"
     assert executor._last_recover_from == TradeState.STATE_ENTRY_WORKING
 
 
@@ -188,3 +191,31 @@ def test_recover_places_cross_if_position_open_and_no_exit() -> None:
     assert rest.orders
     assert rest.orders[0]["side"] == "SELL"
     assert executor.sell_active_order_id is not None
+
+
+def test_recover_does_not_safe_stop_when_exit_active() -> None:
+    now_ms = int(time.time() * 1000)
+    trades = [{"price": "1.0", "qty": "1.0", "isBuyer": True, "time": now_ms, "orderId": 801}]
+    open_orders = [{"orderId": 900, "side": "SELL", "price": "1.01", "status": "NEW"}]
+    router = DummyRouter(bid=100.0, ask=101.0)
+    rest = DummyRest(open_orders=open_orders, trades=trades, base_free=1.0, base_locked=0.0)
+    profile = SymbolProfile(tick_size=0.01, step_size=0.01, min_qty=0.01, min_notional=0.0)
+    executor = TradeExecutor(
+        rest=rest,
+        router=router,
+        settings=make_settings(),
+        profile=profile,
+        logger=lambda _msg, **_kwargs: None,
+    )
+    executor._current_cycle_id = 1
+    executor._cycle_start_ts_ms = now_ms - 500
+    executor._cycle_order_ids = {801}
+    executor.exit_intent = "TP"
+    executor._tp_exit_phase = "MAKER"
+
+    recovered = executor._recover_stuck(reason="deadline")
+
+    assert recovered is True
+    assert rest.orders == []
+    assert executor.state == TradeState.STATE_EXIT_TP_WORKING
+    assert executor._safe_stop_issued is False
