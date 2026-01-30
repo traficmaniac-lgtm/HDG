@@ -40,6 +40,7 @@ class PriceRouter:
         self._last_effective_source = "NONE"
         self._last_summary_log_ts = 0.0
         self._last_summary_payload: Optional[tuple[object, ...]] = None
+        self._cache_ok_active = False
 
     def update_ws(self, bid: float, ask: float) -> None:
         self._ws_bid = bid
@@ -157,8 +158,6 @@ class PriceRouter:
         http_blind = http_age_ms is None or http_age_ms > http_blind_ms
         ws_blind = ws_age_ms is None or ws_age_ms > ws_blind_ms
         data_blind = not ((ws_fresh and ws_has_quote) or (http_fresh and http_has_quote))
-        if data_blind:
-            self._last_switch_reason = "no_fresh_data"
 
         stable_ms = (
             int((now - self._ws_stable_since) * 1000)
@@ -294,10 +293,6 @@ class PriceRouter:
             self._last_good_ts = now
             self._last_good_source = quote_source
 
-        if data_blind:
-            self._last_switch_reason = "no_fresh_data"
-            effective_source = "NONE"
-            quote_source = "NONE"
         from_cache = False
         cache_age_ms = None
         if mid is None:
@@ -306,10 +301,44 @@ class PriceRouter:
                 bid = self._last_good_bid
                 ask = self._last_good_ask
                 mid = self._last_good_mid
-                quote_source = self._last_good_source
+                quote_source = "CACHE" if self._last_good_source != "NONE" else "CACHE"
                 from_cache = True
+        cache_fresh_base_ms = max(self._settings.http_fresh_ms, self._settings.ws_fresh_ms) * 3
+        cache_fresh_ms = int(
+            getattr(
+                self._settings,
+                "cache_fresh_ms",
+                min(max(cache_fresh_base_ms, 1500), 8000),
+            )
+        )
+        cache_fresh_ms = min(max(cache_fresh_ms, 1500), 8000)
+        cache_ok = (
+            from_cache
+            and cache_age_ms is not None
+            and cache_age_ms <= cache_fresh_ms
+        )
+        if cache_ok:
+            data_blind = False
+            if quote_source == "NONE":
+                quote_source = "CACHE"
+            if effective_source == "NONE":
+                effective_source = quote_source
+        if self._cache_ok_active != cache_ok:
+            self._cache_ok_active = cache_ok
+            age_label = cache_age_ms if cache_age_ms is not None else "?"
+            src_label = quote_source if quote_source != "NONE" else self._last_good_source
+            self._log_queue.append(
+                (
+                    "[DATA_CACHE_OK] "
+                    f"age_ms={age_label} cache_fresh_ms={cache_fresh_ms} src={src_label}",
+                    "INFO",
+                )
+            )
         if data_blind:
-            quote_source = "NONE"
+            self._last_switch_reason = "no_fresh_data"
+            if not cache_ok:
+                effective_source = "NONE"
+                quote_source = "NONE"
         if mid is not None:
             min_interval_s = 0.2
             should_update = (

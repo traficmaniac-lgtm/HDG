@@ -104,6 +104,7 @@ class TradeExecutor:
         self.exit_intent: Optional[str] = None
         self.exit_intent_set_ts: Optional[float] = None
         self._last_place_error_code: Optional[int] = None
+        self._last_place_error_msg: Optional[str] = None
         self.state = TradeState.STATE_IDLE
         self._cycle_id_counter = 0
         self._current_cycle_id: Optional[int] = None
@@ -188,6 +189,7 @@ class TradeExecutor:
         self._direction = "LONG"
         self._order_roles: dict[int, dict] = {}
         self._last_entry_wait_payload: Optional[tuple[object, ...]] = None
+        self._dust_accumulate = False
 
     @staticmethod
     def _normalize_direction(direction: Optional[str]) -> str:
@@ -416,10 +418,12 @@ class TradeExecutor:
 
     def _trade_gate_age_ms(self, action: str) -> int:
         if action == "ENTRY":
-            return int(getattr(self._settings, "entry_max_age_ms", 800))
+            entry_age = int(getattr(self._settings, "entry_max_age_ms", 2500))
+            return max(entry_age, 2500)
         if action == "EXIT":
             return int(getattr(self._settings, "exit_max_age_ms", 2500))
-        entry_age = int(getattr(self._settings, "entry_max_age_ms", 800))
+        entry_age = int(getattr(self._settings, "entry_max_age_ms", 2500))
+        entry_age = max(entry_age, 2500)
         exit_age = int(getattr(self._settings, "exit_max_age_ms", 2500))
         return max(entry_age, exit_age)
 
@@ -438,6 +442,7 @@ class TradeExecutor:
             if price_state.cache_age_ms is not None
             else "?"
         )
+        cache_source_label = "Y" if price_state.from_cache else "N"
         max_age_label = max_age_ms if max_age_ms is not None else "?"
         bid_label = "—" if price_state.bid is None else f"{price_state.bid:.8f}"
         ask_label = "—" if price_state.ask is None else f"{price_state.ask:.8f}"
@@ -445,7 +450,8 @@ class TradeExecutor:
             "[TRADE_BLOCKED] "
             f"action={action} reason={reason} source={price_state.source} "
             f"data_blind={price_state.data_blind} bid={bid_label} ask={ask_label} "
-            f"mid_age_ms={age_label} cache_age_ms={cache_label} max_age_ms={max_age_label}"
+            f"mid_age_ms={age_label} cache_age_ms={cache_label} "
+            f"from_cache={cache_source_label} max_age_ms={max_age_label}"
         )
 
     def _can_trade_now(
@@ -531,6 +537,12 @@ class TradeExecutor:
             wait_state = "EXIT_WAIT"
         deadline_ms = self._resolve_wait_state_deadline_ms(wait_state) if wait_state else None
         self._set_wait_state(wait_state, deadline_ms)
+        if (
+            wait_state == "ENTRY_WAIT"
+            and self._dust_accumulate
+            and self._entry_order_active()
+        ):
+            return False
         if wait_state and deadline_ms and self._wait_state_enter_ts_ms is not None:
             age_ms = int(now * 1000) - self._wait_state_enter_ts_ms
             if age_ms >= deadline_ms:
@@ -547,6 +559,8 @@ class TradeExecutor:
     def _check_progress_deadline(self, now: float) -> bool:
         no_progress_ms = self._no_progress_ms(now)
         if self.state == TradeState.STATE_ENTRY_WORKING:
+            if self._dust_accumulate and self._entry_order_active():
+                return False
             deadline_ms = self._resolve_wait_deadline_ms("ENTRY_WAIT")
             if deadline_ms and no_progress_ms >= deadline_ms:
                 self._logger(
@@ -1359,7 +1373,9 @@ class TradeExecutor:
             is_isolated = "TRUE" if self._settings.margin_isolated else "FALSE"
             timestamp = int(time.time() * 1000)
             self._begin_cycle_entry(now_ms=timestamp)
-            entry_client_id = self._build_client_order_id(entry_side, timestamp)
+            entry_client_id = self._build_client_order_id(
+                entry_side, timestamp, role_tag="ENTRY"
+            )
             order_type = self._normalize_order_type(self._settings.order_type)
             if order_type == "MARKET":
                 self._logger(f"[TRADE] {entry_side} rejected: MARKET disabled")
@@ -1793,6 +1809,81 @@ class TradeExecutor:
         if self._profile.step_size:
             qty_to_sell = self._round_down(remaining_qty, self._profile.step_size)
         if qty_to_sell <= 0:
+            return
+        price_ref = self._resolve_dust_reference_price(bid, ask, mid, entry_avg)
+        min_notional = self._profile.min_notional
+        notional = None
+        if price_ref is not None:
+            notional = qty_to_sell * price_ref
+        dust_threshold = None
+        if min_notional is not None and min_notional > 0:
+            dust_threshold = min_notional * 1.05
+        if dust_threshold is not None and notional is not None and notional >= dust_threshold:
+            self._dust_accumulate = False
+        if (
+            min_notional is not None
+            and min_notional > 0
+            and notional is not None
+            and notional < min_notional
+        ):
+            self._dust_accumulate = True
+        if self._dust_accumulate and min_notional is not None and min_notional > 0:
+            if not self._should_dedup_log("dust_pos", 2.0):
+                notional_label = "?" if notional is None else f"{notional:.8f}"
+                self._logger(
+                    "[DUST_POS] "
+                    f"remaining_qty={qty_to_sell:.8f} notional={notional_label} "
+                    f"min_notional={min_notional:.8f} action=accumulate"
+                )
+            if self._entry_order_active():
+                if self.state != TradeState.STATE_ENTRY_WORKING:
+                    self._transition_state(TradeState.STATE_ENTRY_WORKING)
+                return
+            ref_price, ref_label = self._entry_reference(bid, ask)
+            if ref_price is None:
+                return
+            entry_price = self._calculate_entry_price(ref_price)
+            if entry_price is None:
+                return
+            _, quote_asset = self._split_symbol(self._settings.symbol)
+            quote_state = self._get_margin_asset(quote_asset)
+            if quote_state is None:
+                return
+            order_quote = float(self._settings.order_quote)
+            topup_target = min_notional * 1.2
+            current_notional = notional or 0.0
+            topup_quote = max(topup_target - current_notional, order_quote * 0.25)
+            max_budget = float(self._settings.max_budget)
+            budget_reserve = float(self._settings.budget_reserve)
+            allowed_budget = max(0.0, max_budget - budget_reserve)
+            free_quote = float(quote_state.get("free", 0.0))
+            topup_quote = min(topup_quote, allowed_budget, free_quote)
+            if topup_quote <= 0:
+                return
+            qty = self._round_down(topup_quote / entry_price, self._profile.step_size)
+            if qty <= 0:
+                return
+            ws_bad = price_state.source == "WS" and self._entry_ws_bad(health_state.ws_connected)
+            entry_context = self._entry_log_context(
+                price_state.source,
+                ws_bad,
+                health_state.ws_age_ms,
+                health_state.http_age_ms,
+            )
+            self._logger(
+                "[ENTRY_TOPUP] "
+                f"price={ref_label} {ref_label}={ref_price:.8f} "
+                f"quote={topup_quote:.8f} qty={qty:.8f} "
+                f"src={price_state.source}"
+            )
+            if self._place_entry_topup_order(
+                price=ref_price,
+                qty=qty,
+                bid=bid,
+                ask=ask,
+                entry_context=entry_context,
+            ):
+                self._transition_state(TradeState.STATE_ENTRY_WORKING)
             return
 
         if active_sell_order and not self._sell_order_is_final(active_sell_order):
@@ -2369,6 +2460,19 @@ class TradeExecutor:
                     return self._place_emergency_market_sell(qty)
                 self.last_action = "partial_too_small"
                 return 0
+            price_ref = self._resolve_dust_reference_price(bid, ask, mid, self._entry_avg_price)
+            if self._is_dust_notional(qty, price_ref):
+                min_notional = self._profile.min_notional or 0.0
+                notional_label = "?" if price_ref is None else f"{qty * price_ref:.8f}"
+                self._logger(
+                    "[DUST_POS] "
+                    f"remaining_qty={qty:.8f} notional={notional_label} "
+                    f"min_notional={min_notional:.8f} action=accumulate"
+                )
+                self.last_action = "dust_accumulate"
+                self._dust_accumulate = True
+                self._transition_to_position_state()
+                return 0
 
             if exit_side == "SELL":
                 balance = self._get_base_balance_snapshot()
@@ -2515,7 +2619,16 @@ class TradeExecutor:
 
             is_isolated = "TRUE" if self._settings.margin_isolated else "FALSE"
             timestamp = int(time.time() * 1000)
-            exit_client_id = self._build_client_order_id(exit_side, timestamp + 1)
+            role_tag = "EXIT_TP"
+            if (
+                exit_order_type == "MARKET"
+                or reason_upper in {"TP_CROSS", "TP_FORCE", "SL_HARD", "RECOVERY"}
+                or self._tp_exit_phase == "CROSS"
+            ):
+                role_tag = "EXIT_CROSS"
+            exit_client_id = self._build_client_order_id(
+                exit_side, timestamp + 1, role_tag=role_tag
+            )
             side_effect_type = (
                 "AUTO_REPAY"
                 if self._settings.allow_borrow and self._borrow_allowed_by_api is not False
@@ -2578,6 +2691,18 @@ class TradeExecutor:
             if not exit_order:
                 if self._last_place_error_code == -2010:
                     return self._handle_sell_insufficient_balance(reason)
+                if (
+                    self._last_place_error_code == -1013
+                    and self._last_place_error_msg
+                    and "NOTIONAL" in self._last_place_error_msg.upper()
+                ):
+                    self._logger(
+                        "[SELL_REJECT_NOTIONAL] -> treat_as_dust accumulate"
+                    )
+                    self.last_action = "sell_reject_notional"
+                    self._dust_accumulate = True
+                    self._transition_to_position_state()
+                    return 0
                 self._logger(f"[ORDER] {exit_side} rejected -> flatten")
                 self.last_action = "place_failed"
                 self._transition_state(TradeState.STATE_ERROR)
@@ -2705,7 +2830,9 @@ class TradeExecutor:
             )
             is_isolated = "TRUE" if self._settings.margin_isolated else "FALSE"
             timestamp = int(time.time() * 1000)
-            sell_client_id = self._build_client_order_id(exit_side, timestamp + 1)
+            sell_client_id = self._build_client_order_id(
+                exit_side, timestamp + 1, role_tag="EXIT_CROSS"
+            )
             side_effect_type = (
                 "AUTO_REPAY"
                 if self._settings.allow_borrow and self._borrow_allowed_by_api is not False
@@ -3188,7 +3315,9 @@ class TradeExecutor:
         timestamp = int(time.time() * 1000)
         self._mark_cycle_entry_start()
         entry_side = self._entry_side()
-        entry_client_id = self._build_client_order_id(entry_side, timestamp)
+        entry_client_id = self._build_client_order_id(
+            entry_side, timestamp, role_tag="ENTRY"
+        )
         side_effect_type = self._normalize_side_effect_type(
             self._settings.side_effect_type
         )
@@ -3253,6 +3382,92 @@ class TradeExecutor:
         if reason in {"reprice", "deadline_replace"}:
             progress_reason = "entry_reprice"
         self.mark_progress(reason=progress_reason, reset_reconcile=True)
+        return True
+
+    def _place_entry_topup_order(
+        self,
+        price: float,
+        qty: float,
+        bid: Optional[float],
+        ask: Optional[float],
+        entry_context: str,
+    ) -> bool:
+        if not self._profile.tick_size or not self._profile.step_size:
+            return False
+        new_price = self._calculate_entry_price(price)
+        if new_price is None:
+            return False
+        qty = self._round_down(qty, self._profile.step_size)
+        if qty <= 0:
+            return False
+        if self._profile.min_qty and qty < self._profile.min_qty:
+            return False
+        if self._profile.min_notional is not None and qty * new_price < self._profile.min_notional:
+            return False
+        is_isolated = "TRUE" if self._settings.margin_isolated else "FALSE"
+        timestamp = int(time.time() * 1000)
+        self._mark_cycle_entry_start()
+        entry_side = self._entry_side()
+        entry_client_id = self._build_client_order_id(
+            entry_side, timestamp, role_tag="TOPUP"
+        )
+        side_effect_type = self._normalize_side_effect_type(
+            self._settings.side_effect_type
+        )
+        self._log_entry_place(new_price, bid, ask, entry_context)
+        entry_order = self._place_margin_order(
+            symbol=self._settings.symbol,
+            side=entry_side,
+            quantity=qty,
+            price=new_price,
+            is_isolated=is_isolated,
+            client_order_id=entry_client_id,
+            side_effect=side_effect_type,
+            order_type="LIMIT",
+        )
+        if not entry_order:
+            return False
+        entry_order_id = entry_order.get("orderId")
+        if isinstance(entry_order_id, int):
+            self._cycle_order_ids.add(entry_order_id)
+        cycle_label = self._cycle_id_label()
+        self._logger(
+            f"[ORDER] {entry_side} placed cycle_id={cycle_label} qty={qty:.8f} "
+            f"price={new_price:.8f} id={entry_order.get('orderId')} role=ENTRY_TOPUP"
+        )
+        self._entry_reprice_last_ts = time.monotonic()
+        self._entry_consecutive_fresh_reads = 0
+        self._entry_order_price = new_price
+        now_ms = int(time.time() * 1000)
+        self._register_order_role(entry_order_id, "ENTRY_TOPUP")
+        self.active_test_orders = [
+            {
+                "orderId": entry_order_id,
+                "side": entry_side,
+                "price": new_price,
+                "bid_at_place": bid,
+                "qty": qty,
+                "cum_qty": 0.0,
+                "avg_fill_price": 0.0,
+                "last_fill_price": None,
+                "created_ts": now_ms,
+                "updated_ts": now_ms,
+                "status": "NEW",
+                "tag": self.TAG,
+                "clientOrderId": entry_order.get("clientOrderId", entry_client_id),
+                "cycle_id": self._current_cycle_id,
+                "role": "ENTRY_TOPUP",
+            }
+        ]
+        self.entry_active_order_id = entry_order.get("orderId")
+        self.entry_active_price = new_price
+        self.entry_cancel_pending = False
+        ref_price, _ = self._entry_reference(bid, ask)
+        if ref_price is not None:
+            self._entry_last_ref_bid = ref_price
+            self._entry_last_ref_ts_ms = now_ms
+        self.orders_count = len(self.active_test_orders)
+        self.mark_progress(reason="entry_topup", reset_reconcile=True)
         return True
 
     def _handle_entry_follow_top(self, open_orders: dict[int, dict]) -> None:
@@ -3724,6 +3939,12 @@ class TradeExecutor:
         )
         max_retries = int(getattr(self._settings, "max_reconcile_retries", 3))
         if self._reconcile_attempts >= max_retries:
+            if self._dust_accumulate:
+                if not self._should_dedup_log("reconcile_skip_safe_stop_dust", 2.0):
+                    self._logger(
+                        "[RECONCILE] dust_accumulate=True -> skip_safe_stop"
+                    )
+                return False
             self._enter_safe_stop(reason="RECONCILE_RETRY_LIMIT", allow_rest=False)
             return False
         self._reconcile_attempts += 1
@@ -3803,7 +4024,10 @@ class TradeExecutor:
                 moved_ticks = self._ticks_between(
                     entry_price, ref_price, self._profile.tick_size
                 )
-            if moved_ticks >= self.PRICE_MOVE_TICK_THRESHOLD:
+            if (
+                moved_ticks >= self.PRICE_MOVE_TICK_THRESHOLD
+                and not self._dust_accumulate
+            ):
                 if self._start_entry_cancel(reason="progress_deadline", age_ms=age_label):
                     self._transition_state(TradeState.STATE_ENTRY_WORKING)
                     self._set_entry_wait_state("ENTRY_WAIT")
@@ -4225,7 +4449,13 @@ class TradeExecutor:
             self._reconcile_invalid_totals = False
             self._reconcile_refresh_requested = False
             if remaining > self._epsilon_qty():
+                dust_guard = self._dust_accumulate or (
+                    self._last_place_error_msg
+                    and "NOTIONAL" in self._last_place_error_msg.upper()
+                )
                 needs_cancel_entry = have_open_entry and executed > self._epsilon_qty()
+                if dust_guard:
+                    needs_cancel_entry = False
                 needs_exit_place = not have_open_exit
                 if needs_cancel_entry or needs_exit_place:
                     self._reconcile_recovery_attempts += 1
@@ -4234,11 +4464,18 @@ class TradeExecutor:
                         "cancel_entry": needs_cancel_entry,
                         "place_exit": needs_exit_place,
                     }
-                    self._logger(
-                        "[RECONCILE_PLAN] "
-                        f"cancel_entry={plan['cancel_entry']} "
-                        f"place_exit={plan['place_exit']} attempt={attempt_label}"
-                    )
+                    if dust_guard and not self._should_dedup_log("reconcile_plan_dust", 2.0):
+                        self._logger(
+                            "[RECONCILE_PLAN] "
+                            "dust_accumulate=True plan=keep_entry "
+                            f"place_exit={plan['place_exit']} attempt={attempt_label}"
+                        )
+                    else:
+                        self._logger(
+                            "[RECONCILE_PLAN] "
+                            f"cancel_entry={plan['cancel_entry']} "
+                            f"place_exit={plan['place_exit']} attempt={attempt_label}"
+                        )
                     price_state, health_state = self._router.build_price_state()
                     if not self._can_trade_now(
                         price_state,
@@ -4278,6 +4515,7 @@ class TradeExecutor:
                             action="RECONCILE",
                             max_age_ms=self._trade_gate_age_ms("RECONCILE"),
                         )
+                        and not dust_guard
                     ):
                         self._enter_safe_stop(
                             reason="RECONCILE_RETRY_LIMIT",
@@ -4959,6 +5197,29 @@ class TradeExecutor:
         remaining_qty = base_qty - self._aggregate_sold_qty
         return max(remaining_qty, 0.0)
 
+    def _resolve_dust_reference_price(
+        self,
+        bid: Optional[float],
+        ask: Optional[float],
+        mid: Optional[float],
+        entry_avg: Optional[float],
+    ) -> Optional[float]:
+        if self._direction == "SHORT":
+            return bid or mid or entry_avg
+        return ask or mid or entry_avg
+
+    def _is_dust_notional(self, qty: float, price_ref: Optional[float]) -> bool:
+        min_notional = self._profile.min_notional
+        if min_notional is None or min_notional <= 0:
+            return False
+        if price_ref is None or qty <= 0:
+            return False
+        qty_eval = qty
+        if self._profile.step_size:
+            qty_eval = self._round_down(qty, self._profile.step_size)
+        notional = qty_eval * price_ref
+        return notional < min_notional
+
     def _get_step_size_tolerance(self) -> float:
         if not self._profile.step_size:
             return 0.0
@@ -4989,6 +5250,7 @@ class TradeExecutor:
         self._last_pos_snapshot = None
         self._tp_maker_started_ts = None
         self._sell_last_seen_ts = None
+        self._dust_accumulate = False
         self._reset_exit_intent()
         self._clear_recovery(reason="reset")
         self._tp_armed = False
@@ -5725,17 +5987,21 @@ class TradeExecutor:
         if client_order_id:
             params["newClientOrderId"] = client_order_id
         self._last_place_error_code = None
+        self._last_place_error_msg = None
         try:
             order = self._rest.create_margin_order(params)
             return order
         except httpx.HTTPStatusError as exc:
             code = None
+            msg = None
             try:
                 payload = exc.response.json() if exc.response else {}
                 code = payload.get("code")
+                msg = payload.get("msg")
             except Exception:
                 pass
             self._last_place_error_code = code
+            self._last_place_error_msg = msg
             self._log_binance_error("place_order", exc, params)
         except Exception as exc:
             self._logger(f"[TRADE] place_order error: {exc} tag={self.TAG}")
@@ -5859,9 +6125,12 @@ class TradeExecutor:
         self._error_dedup[key] = now
         return False
 
-    def _build_client_order_id(self, side: str, timestamp: int) -> str:
+    def _build_client_order_id(
+        self, side: str, timestamp: int, role_tag: Optional[str] = None
+    ) -> str:
         cycle_id = self._current_cycle_id or 0
-        raw = f"{self._client_tag}_C{cycle_id}_{side}_{timestamp}"
+        suffix = f"-{role_tag}" if role_tag else ""
+        raw = f"{self._client_tag}_C{cycle_id}_{side}_{timestamp}{suffix}"
         sanitized = self._sanitize_client_order_id(raw)
         if len(sanitized) > 36:
             sanitized = sanitized[:36]
