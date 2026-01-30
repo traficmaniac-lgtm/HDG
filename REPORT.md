@@ -9,13 +9,8 @@
 - 0.7.30.1: UI log is event-only, debug spam moved to file, buffered flush.
 - 0.7.30.2: Fix cross-close pricing, isolate timers, recover respects active exit. Reduce emergency market losses.
 - 0.7.30.3: Fix FSM deadlock: real progress only, hard deadlines, stop interrupt.
-- 0.7.30.4: Enforced data-blind trade gating, deterministic reconcile recovery, exit timeout cross-retry with SL-only emergency, entry ownership cleanup, and lighter UI log buffering.
+- 0.7.30.4: Order role registry (ENTRY/EXIT_TP/EXIT_CROSS), corrected data_blind/effective_source selection with fresh HTTP, progress watchdog recovery for entry/exit stalls, per-session log files, and UI log throttling refinements.
   - Tests:
-    - A) Start LONG and SHORT; set effective_source=NONE or data_blind=True → bot must HOLD (no order placement).
-    - B) Fill ENTRY and transition to POS_OPEN/EXIT → confirm no ENTRY_CANCEL_TIMEOUT logs.
-    - C) Simulate sharp price jump → UI stays responsive; reconcile recovers without SAFE_STOP loop.
-    - D) Force exit timeout without SL breach → verify no emergency market; cross attempts occur; market only after SL breach.
-    - E) Check UI log: responsive, last 500 lines retained, INFO_EVENT/major INFO only; debug spam in logs/debug.log.
-- 0.7.30.5: Sessionized log folders with size-rotated, gz-compressed app/debug logs and buffered flushes to reduce UI lag.
-  - Logs live in logs/sessions/{SESSION_ID}/ with app.log, debug.log, and session.json (version/symbol/mode/start_time).
-  - Rotation: app.log 5 MB (keep 3), debug.log 10 MB (keep 5), rotated parts compressed as .gz.
+    - test_short_buy_fill_is_exit_not_entry
+    - test_data_blind_false_when_http_fresh
+    - test_fsm_no_stuck_entry_working

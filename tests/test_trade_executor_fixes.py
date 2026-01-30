@@ -4,6 +4,7 @@ import time
 
 from src.core.models import HealthState, PriceState, Settings, SymbolProfile
 from src.services import trade_executor as trade_executor_module
+from src.services.price_router import PriceRouter
 from src.services.trade_executor import TradeExecutor, TradeState
 
 
@@ -239,6 +240,108 @@ def test_entry_reprice_on_1_tick_when_http_fresh() -> None:
     assert abs(executor.entry_active_price - 1.1983) <= 1e-9
 
 
+def test_short_buy_fill_is_exit_not_entry() -> None:
+    price_state = PriceState(
+        bid=1.0,
+        ask=1.1,
+        mid=1.05,
+        source="HTTP",
+        mid_age_ms=10,
+        data_blind=False,
+    )
+    health_state = HealthState(ws_connected=False, ws_age_ms=99999, http_age_ms=10)
+    executor = make_executor(DummyRouter(price_state, health_state))
+    executor._set_direction("SHORT")
+    executor.state = TradeState.STATE_EXIT_TP_WORKING
+    executor.position = {
+        "buy_price": 1.2,
+        "qty": 1.0,
+        "opened_ts": 0,
+        "partial": False,
+        "initial_qty": 1.0,
+        "side": "SHORT",
+    }
+    executor._entry_avg_price = 1.2
+    executor._executed_qty_total = 1.0
+    executor._remaining_qty = 1.0
+    executor.exit_intent = "TP"
+    executor._tp_exit_phase = "MAKER"
+    executor.active_test_orders = [
+        {
+            "orderId": 10,
+            "side": "BUY",
+            "price": 1.1,
+            "qty": 1.0,
+            "cum_qty": 0.0,
+            "avg_fill_price": 0.0,
+            "status": "NEW",
+            "reason": "TP",
+            "cycle_id": 1,
+        }
+    ]
+    executor.sell_active_order_id = 10
+    executor._register_order_role(10, "EXIT_TP")
+
+    ts_ms = int(time.time() * 1000)
+    executor.handle_order_filled(order_id=10, side="BUY", price=1.1, qty=1.0, ts_ms=ts_ms)
+
+    assert executor.position is None
+    assert executor.state in {TradeState.STATE_FLAT, TradeState.STATE_IDLE}
+
+
+def test_data_blind_false_when_http_fresh() -> None:
+    settings = make_settings()
+    router = PriceRouter(settings)
+    router.update_http(1.2345, 1.2350)
+    price_state, _ = router.build_price_state()
+
+    assert price_state.data_blind is False
+    assert price_state.source == "HTTP"
+
+
+def test_fsm_no_stuck_entry_working() -> None:
+    price_state = PriceState(
+        bid=1.0,
+        ask=1.1,
+        mid=1.05,
+        source="HTTP",
+        mid_age_ms=10,
+        data_blind=False,
+    )
+    health_state = HealthState(ws_connected=False, ws_age_ms=99999, http_age_ms=10)
+    executor = make_executor(DummyRouter(price_state, health_state))
+    executor.state = TradeState.STATE_ENTRY_WORKING
+    executor.run_active = False
+    executor.active_test_orders = [
+        {
+            "orderId": 5,
+            "side": "BUY",
+            "price": 1.05,
+            "qty": 1.0,
+            "cum_qty": 0.0,
+            "avg_fill_price": 0.0,
+            "status": "NEW",
+            "cycle_id": 1,
+        }
+    ]
+    executor.entry_active_order_id = 5
+    executor.entry_active_price = 1.05
+    executor._set_entry_wait_state("ENTRY_WAIT")
+    executor._settings.entry_wait_deadline_ms = 20
+    executor._last_progress_ts = time.monotonic() - 0.05
+
+    executor.collect_reconcile_snapshot = lambda: {  # type: ignore[assignment]
+        "open_orders": [],
+        "trades": [],
+        "balance": {"total": 0.0, "free": 0.0, "locked": 0.0},
+    }
+
+    moved = executor.watchdog_tick()
+
+    assert moved is True
+    assert executor.state != TradeState.STATE_ENTRY_WORKING
+
+
 def test_entry_not_blocked_by_data_blind() -> None:
     price_state = PriceState(
         bid=1.1001,
@@ -246,7 +349,7 @@ def test_entry_not_blocked_by_data_blind() -> None:
         mid=1.10015,
         source="HTTP",
         mid_age_ms=2000,
-        data_blind=True,
+        data_blind=False,
     )
     health_state = HealthState(ws_connected=False, ws_age_ms=None, http_age_ms=200)
     executor = make_executor(DummyRouter(price_state, health_state))
@@ -286,9 +389,9 @@ def test_entry_not_blocked_by_data_blind() -> None:
 
 def test_entry_wait_deadline_triggers_cancel(monkeypatch) -> None:
     price_state = PriceState(
-        bid=1.2000,
-        ask=1.2001,
-        mid=1.20005,
+        bid=1.2001,
+        ask=1.2002,
+        mid=1.20015,
         source="HTTP",
         mid_age_ms=10,
         data_blind=False,
@@ -318,6 +421,8 @@ def test_entry_wait_deadline_triggers_cancel(monkeypatch) -> None:
     executor._entry_wait_enter_ts_ms = int((now_s * 1000) - 13000)
     executor._entry_wait_deadline_ms = executor.ENTRY_WAIT_DEADLINE_MS
     executor._entry_deadline_ts = now_s - 1.0
+    executor._wait_state_kind = "ENTRY_WAIT"
+    executor._wait_state_enter_ts_ms = int((now_s * 1000) - 13000)
     executor._last_progress_ts = now_s - 13.0
 
     cancelled: list[int] = []
@@ -327,6 +432,13 @@ def test_entry_wait_deadline_triggers_cancel(monkeypatch) -> None:
         return True
 
     executor._cancel_margin_order = fake_cancel  # type: ignore[assignment]
+    executor.collect_reconcile_snapshot = lambda: {  # type: ignore[assignment]
+        "open_orders": [
+            {"orderId": 1, "side": "BUY", "status": "NEW", "price": 1.2000},
+        ],
+        "trades": [],
+        "balance": {"total": 0.0, "free": 0.0, "locked": 0.0},
+    }
 
     assert executor._check_wait_deadline(now_s) is True
     assert executor.entry_cancel_pending is True

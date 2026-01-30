@@ -186,6 +186,8 @@ class TradeExecutor:
         self._last_recover_from: Optional[TradeState] = None
         self._exit_cross_attempts = 0
         self._direction = "LONG"
+        self._order_roles: dict[int, dict] = {}
+        self._last_entry_wait_payload: Optional[tuple[object, ...]] = None
 
     @staticmethod
     def _normalize_direction(direction: Optional[str]) -> str:
@@ -360,6 +362,58 @@ class TradeExecutor:
                 )
             self._last_effective_source = source
 
+    def _register_order_role(self, order_id: Optional[int], role: str) -> None:
+        if not isinstance(order_id, int):
+            return
+        self._order_roles[order_id] = {
+            "role": role,
+            "cycle_id": self._current_cycle_id,
+            "dir": self._direction,
+            "created_ts": int(time.time() * 1000),
+        }
+
+    def _clear_order_role(self, order_id: Optional[int]) -> None:
+        if not isinstance(order_id, int):
+            return
+        self._order_roles.pop(order_id, None)
+
+    def _resolve_fill_role(
+        self, order_id: Optional[int], side_upper: str
+    ) -> tuple[str, str]:
+        if isinstance(order_id, int):
+            role_entry = self._order_roles.get(order_id)
+            if role_entry is not None:
+                return str(role_entry.get("role", "ENTRY")), "registry"
+        fallback_role = None
+        fallback_reason = "unknown"
+        if isinstance(order_id, int) and order_id == self.entry_active_order_id:
+            fallback_role = "ENTRY"
+            fallback_reason = "entry_active_id"
+        elif isinstance(order_id, int) and order_id == self.sell_active_order_id:
+            fallback_role = "EXIT_CROSS" if self._tp_exit_phase == "CROSS" else "EXIT_TP"
+            fallback_reason = "exit_active_id"
+        elif self.position is None and self.state == TradeState.STATE_ENTRY_WORKING:
+            fallback_role = "ENTRY"
+            fallback_reason = "state_entry_working"
+        elif self.position is not None or self._in_exit_workflow():
+            fallback_role = "EXIT_CROSS" if self._tp_exit_phase == "CROSS" else "EXIT_TP"
+            fallback_reason = "state_exit_or_position"
+        else:
+            if self._direction == "SHORT" and side_upper == "BUY":
+                fallback_role = "EXIT_TP"
+            elif self._direction == "LONG" and side_upper == "SELL":
+                fallback_role = "EXIT_TP"
+            else:
+                fallback_role = "ENTRY"
+            fallback_reason = "side_dir_fallback"
+        self._logger(
+            "[UNKNOWN_ROLE] "
+            f"order_id={order_id} classify={fallback_role} "
+            f"reason={fallback_reason} state={self.state.value} "
+            f"dir={self._direction} side={side_upper}"
+        )
+        return fallback_role, fallback_reason
+
     def _trade_gate_age_ms(self, action: str) -> int:
         if action == "ENTRY":
             return int(getattr(self._settings, "entry_max_age_ms", 800))
@@ -487,6 +541,33 @@ class TradeExecutor:
                     reason="deadline",
                     wait_kind=wait_state,
                     age_ms=age_ms,
+                )
+        return False
+
+    def _check_progress_deadline(self, now: float) -> bool:
+        no_progress_ms = self._no_progress_ms(now)
+        if self.state == TradeState.STATE_ENTRY_WORKING:
+            deadline_ms = self._resolve_wait_deadline_ms("ENTRY_WAIT")
+            if deadline_ms and no_progress_ms >= deadline_ms:
+                self._logger(
+                    f"[PROGRESS_DEADLINE] state=ENTRY_WORKING no_progress_ms={no_progress_ms}"
+                )
+                return self._recover_stuck(
+                    reason="progress_deadline_entry",
+                    wait_kind="ENTRY_WAIT",
+                    age_ms=no_progress_ms,
+                )
+        if self._in_exit_workflow():
+            exit_kind = "EXIT_CROSS_WAIT" if self._tp_exit_phase == "CROSS" else "EXIT_MAKER_WAIT"
+            deadline_ms = self._resolve_wait_deadline_ms(exit_kind)
+            if deadline_ms and no_progress_ms >= deadline_ms:
+                self._logger(
+                    f"[PROGRESS_DEADLINE] state=EXIT_WORKING no_progress_ms={no_progress_ms}"
+                )
+                return self._recover_stuck(
+                    reason="progress_deadline_exit",
+                    wait_kind="EXIT_WAIT",
+                    age_ms=no_progress_ms,
                 )
         return False
 
@@ -2508,6 +2589,14 @@ class TradeExecutor:
             exit_order_id = exit_order.get("orderId")
             if isinstance(exit_order_id, int):
                 self._cycle_order_ids.add(exit_order_id)
+            exit_role = "EXIT_TP"
+            if (
+                order_type == "MARKET"
+                or reason_upper in {"TP_CROSS", "TP_FORCE", "SL_HARD", "RECOVERY"}
+                or self._tp_exit_phase == "CROSS"
+            ):
+                exit_role = "EXIT_CROSS"
+            self._register_order_role(exit_order_id, exit_role)
             if reason_upper in {"TP", "TP_MAKER", "TP_FORCE", "TP_CROSS", "SL", "SL_HARD"}:
                 self._logger(
                     f"[ORDER] {exit_side} placed "
@@ -2544,6 +2633,7 @@ class TradeExecutor:
                     "clientOrderId": exit_order.get("clientOrderId", exit_client_id),
                     "reason": reason_upper,
                     "cycle_id": self._current_cycle_id,
+                    "role": exit_role,
                 }
             )
             self.orders_count = len(self.active_test_orders)
@@ -2639,6 +2729,7 @@ class TradeExecutor:
             sell_order_id = sell_order.get("orderId")
             if isinstance(sell_order_id, int):
                 self._cycle_order_ids.add(sell_order_id)
+            self._register_order_role(sell_order_id, "EXIT_CROSS")
             self._logger(
                 f"[ORDER] {exit_side} placed "
                 f"cycle_id={cycle_label} reason=EMERGENCY type=MARKET "
@@ -2666,6 +2757,7 @@ class TradeExecutor:
                     "clientOrderId": sell_order.get("clientOrderId", sell_client_id),
                     "reason": "EMERGENCY",
                     "cycle_id": self._current_cycle_id,
+                    "role": "EXIT_CROSS",
                 }
             )
             self.orders_count = len(self.active_test_orders)
@@ -2773,6 +2865,7 @@ class TradeExecutor:
     def _start_entry_attempt(self) -> None:
         if self._entry_attempt_started_ts is None:
             self._entry_attempt_started_ts = time.monotonic()
+        self._last_entry_wait_payload = None
         self._entry_consecutive_fresh_reads = 0
         self._entry_last_seen_bid = None
         self._entry_last_ws_bad_ts = None
@@ -2785,6 +2878,7 @@ class TradeExecutor:
         self._entry_last_ref_bid = None
         self._entry_last_ref_ts_ms = None
         self._entry_order_price = None
+        self._last_entry_wait_payload = None
 
     def _entry_attempt_elapsed_ms(self) -> Optional[int]:
         if self._entry_attempt_started_ts is None:
@@ -2943,6 +3037,8 @@ class TradeExecutor:
         mid_val = price_state.mid
         age_ms = price_state.mid_age_ms
         source = price_state.source
+        if source == "HTTP" and health_state.http_age_ms is not None:
+            price_state.mid_age_ms = health_state.http_age_ms
         if not self._can_trade_now(
             price_state,
             action="ENTRY",
@@ -3125,6 +3221,7 @@ class TradeExecutor:
         self._entry_consecutive_fresh_reads = 0
         self._entry_order_price = new_price
         now_ms = int(time.time() * 1000)
+        self._register_order_role(entry_order_id, "ENTRY")
         self.active_test_orders = [
             {
                 "orderId": entry_order_id,
@@ -3141,6 +3238,7 @@ class TradeExecutor:
                 "tag": self.TAG,
                 "clientOrderId": entry_order.get("clientOrderId", entry_client_id),
                 "cycle_id": self._current_cycle_id,
+                "role": "ENTRY",
             }
         ]
         self.entry_active_order_id = entry_order.get("orderId")
@@ -3250,12 +3348,15 @@ class TradeExecutor:
         self._note_price_progress(bid, ask)
         self._clear_price_wait("ENTRY")
         elapsed_ms = self._entry_attempt_elapsed_ms()
-        if elapsed_ms is not None and not self._should_dedup_log("entry_wait", 1.5):
-            self._logger(
-                f"[ENTRY_WAIT] ms={elapsed_ms} {entry_context}",
-                level="DEBUG",
-                key="ENTRY_WAIT",
-            )
+        if elapsed_ms is not None:
+            payload = (entry_context,)
+            if payload != self._last_entry_wait_payload:
+                self._last_entry_wait_payload = payload
+                self._logger(
+                    f"[ENTRY_WAIT] ms={elapsed_ms} {entry_context}",
+                    level="DEBUG",
+                    key="ENTRY_WAIT",
+                )
         if not self._profile.tick_size or not self._profile.step_size:
             return
         current_price = float(buy_order.get("price") or 0.0)
@@ -3578,6 +3679,8 @@ class TradeExecutor:
         now = time.monotonic()
         if self._check_wait_deadline(now):
             return True
+        if self._check_progress_deadline(now):
+            return True
         state_age_ms = self._state_age_ms(now)
         no_progress_ms = self._no_progress_ms(now)
         hard_stall_ms = int(getattr(self._settings, "hard_stall_ms", self.HARD_STALL_MS))
@@ -3665,10 +3768,59 @@ class TradeExecutor:
         )
         self._apply_reconcile_snapshot(executed, closed, remaining, entry_avg)
 
+        entry_side = self._entry_side()
         exit_side = self._exit_side()
+        have_open_entry = any(
+            str(order.get("side") or "").upper() == entry_side for order in open_orders
+        )
         have_open_exit = any(
             str(order.get("side") or "").upper() == exit_side for order in open_orders
         )
+
+        if from_state == TradeState.STATE_ENTRY_WORKING and have_open_entry and self.position is None:
+            price_state, _ = self._router.build_price_state()
+            self._note_effective_source(price_state.source)
+            ref_price, _ = self._entry_reference(price_state.bid, price_state.ask)
+            entry_order = next(
+                (
+                    order
+                    for order in open_orders
+                    if str(order.get("side") or "").upper() == entry_side
+                ),
+                None,
+            )
+            entry_price = None
+            if entry_order is not None:
+                entry_price = float(entry_order.get("price") or 0.0)
+            if entry_price is None or entry_price <= 0:
+                entry_price = self.entry_active_price
+            moved_ticks = 0
+            if (
+                ref_price is not None
+                and entry_price is not None
+                and self._profile.tick_size
+            ):
+                moved_ticks = self._ticks_between(
+                    entry_price, ref_price, self._profile.tick_size
+                )
+            if moved_ticks >= self.PRICE_MOVE_TICK_THRESHOLD:
+                if self._start_entry_cancel(reason="progress_deadline", age_ms=age_label):
+                    self._transition_state(TradeState.STATE_ENTRY_WORKING)
+                    self._set_entry_wait_state("ENTRY_WAIT")
+                    decided = "entry_cancel_replace"
+                    self._logger(
+                        f"[RECOVER] {self._direction_tag()} "
+                        f"snapshot open_orders={len(open_orders)} fills={len(trades)} decided={decided}"
+                    )
+                    return True
+            self._transition_state(TradeState.STATE_ENTRY_WORKING)
+            self._set_entry_wait_state("ENTRY_WAIT")
+            decided = "entry_wait"
+            self._logger(
+                f"[RECOVER] {self._direction_tag()} "
+                f"snapshot open_orders={len(open_orders)} fills={len(trades)} decided={decided}"
+            )
+            return True
 
         if have_open_exit:
             self._tp_exit_phase = "MAKER"
@@ -3685,17 +3837,33 @@ class TradeExecutor:
                 if placed:
                     decided = "entry_placed"
         else:
-            self._tp_exit_phase = "MAKER"
-            price_state, health_state = self._router.build_price_state()
-            self._ensure_exit_orders(
-                price_state,
-                health_state,
-                allow_replace=True,
-                skip_reconcile=True,
-            )
-            self._transition_state(self._exit_state_for_intent(self.exit_intent))
-            self._set_exit_wait_state("EXIT_MAKER_WAIT")
-            decided = "place_exit_maker"
+            force_cross = reason == "progress_deadline_exit"
+            if force_cross and not have_open_exit:
+                self._tp_exit_phase = "CROSS"
+                if self.exit_intent is None:
+                    self._set_exit_intent("TP", mid=None, force=True)
+                placed = self._place_sell_order(
+                    reason="TP_CROSS",
+                    exit_intent=self.exit_intent or "TP",
+                )
+                if placed:
+                    decided = "force_exit_cross"
+                else:
+                    self._transition_state(self._exit_state_for_intent(self.exit_intent))
+                    self._set_exit_wait_state("EXIT_CROSS_WAIT")
+                    decided = "force_exit_cross_blocked"
+            else:
+                self._tp_exit_phase = "MAKER"
+                price_state, health_state = self._router.build_price_state()
+                self._ensure_exit_orders(
+                    price_state,
+                    health_state,
+                    allow_replace=True,
+                    skip_reconcile=True,
+                )
+                self._transition_state(self._exit_state_for_intent(self.exit_intent))
+                self._set_exit_wait_state("EXIT_MAKER_WAIT")
+                decided = "place_exit_maker"
 
         self._logger(
             f"[RECOVER] {self._direction_tag()} "
@@ -4377,8 +4545,6 @@ class TradeExecutor:
         avg_price: float,
         ts_ms: int,
     ) -> None:
-        entry_side = self._entry_side()
-        exit_side = self._exit_side()
         order = next(
             (entry for entry in self.active_test_orders if entry.get("orderId") == order_id),
             None,
@@ -4392,7 +4558,10 @@ class TradeExecutor:
             order_id, side_upper, cum_qty, avg_price, cycle_id, trade_id
         ):
             return
-        if side_upper == entry_side:
+        role, _ = self._resolve_fill_role(order_id, side_upper)
+        entry_side = self._entry_side()
+        exit_side = self._exit_side()
+        if role == "ENTRY":
             prev_cum = float(order.get("cum_qty") or 0.0)
             order["cum_qty"] = cum_qty
             if avg_price > 0:
@@ -4459,7 +4628,7 @@ class TradeExecutor:
                     f"pos_qty={pos_qty:.8f} avg={avg_value:.8f}"
                 )
             return
-        if side_upper == exit_side:
+        if role in {"EXIT_TP", "EXIT_CROSS"}:
             prev_cum = float(order.get("cum_qty") or 0.0)
             prev_avg = float(order.get("avg_fill_price") or 0.0)
             delta = self._update_sell_execution(order, cum_qty)
@@ -4511,6 +4680,7 @@ class TradeExecutor:
         self._logger(
             f"[ORDER] {side} {status} cycle_id={cycle_label} id={order_id}"
         )
+        self._clear_order_role(order_id)
         self.active_test_orders = [
             entry for entry in self.active_test_orders if entry.get("orderId") != order_id
         ]
@@ -4537,8 +4707,6 @@ class TradeExecutor:
 
     def _apply_order_filled(self, order: dict, dedup_checked: bool = False) -> None:
         side = order.get("side")
-        entry_side = self._entry_side()
-        exit_side = self._exit_side()
         cycle_id = self._get_cycle_id_for_order(order)
         order_id = order.get("orderId")
         qty = float(order.get("qty") or 0.0)
@@ -4550,8 +4718,11 @@ class TradeExecutor:
                 order_id, side_label, qty, price, cycle_id, trade_id
             ):
                 return
+        role, _ = self._resolve_fill_role(order_id, side_label)
+        entry_side = self._entry_side()
+        exit_side = self._exit_side()
         cycle_label = "—" if cycle_id is None else str(cycle_id)
-        if side_label == entry_side:
+        if role == "ENTRY":
             prev_cum = float(order.get("cum_qty") or 0.0)
             order["cum_qty"] = qty
             self._logger(
@@ -4593,7 +4764,8 @@ class TradeExecutor:
                 f"avg_price={price_label} -> action={action} qty={sell_qty:.8f}"
             )
             self._log_trade_snapshot(reason="entry_filled")
-        elif side_label == exit_side:
+            self._clear_order_role(order_id)
+        elif role in {"EXIT_TP", "EXIT_CROSS"}:
             prev_cum = float(order.get("cum_qty") or 0.0)
             if qty > 0:
                 self._update_sell_execution(order, qty)
@@ -4670,6 +4842,7 @@ class TradeExecutor:
             self._finalize_cycle_close(
                 reason=exit_reason, pnl=pnl, qty=qty, buy_price=buy_price, cycle_id=cycle_id
             )
+            self._clear_order_role(order_id)
 
     def _apply_entry_partial_fill(
         self,
@@ -5192,6 +5365,7 @@ class TradeExecutor:
             entry for entry in self.active_test_orders if entry.get("orderId") != order_id
         ]
         self.orders_count = len(self.active_test_orders)
+        self._clear_order_role(order_id)
         if self.entry_active_order_id == order_id:
             self._finalize_entry_ownership(reason=f"cancel:{status}")
         if status in {"CANCELED", "REJECTED", "EXPIRED"}:
@@ -5297,6 +5471,7 @@ class TradeExecutor:
                 if entry.get("orderId") != order_id
             ]
             self.orders_count = len(self.active_test_orders)
+            self._clear_order_role(order_id)
         self._sell_wait_started_ts = None
 
     def _handle_sell_cancel_confirmed(
