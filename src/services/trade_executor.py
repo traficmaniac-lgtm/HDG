@@ -10,7 +10,7 @@ from typing import Callable, Optional
 
 import httpx
 
-from src.core.models import Settings, SymbolProfile
+from src.core.models import HealthState, PriceState, Settings, SymbolProfile
 from src.services.binance_rest import BinanceRestClient
 from src.services.price_router import PriceRouter
 
@@ -40,6 +40,9 @@ class TradeExecutor:
     EXIT_CROSS_WAIT_DEADLINE_MS = 2500
     CANCEL_WAIT_DEADLINE_MS = 2000
     HARD_STALL_MS = 20000
+    EXIT_CROSS_MAX_ATTEMPTS = 3
+    EXIT_STATUS_MISSING_MS = 3500
+    EXIT_SL_EMERGENCY_TICKS = 1
 
     def __init__(
         self,
@@ -157,6 +160,7 @@ class TradeExecutor:
         self._last_progress_bid: Optional[float] = None
         self._last_progress_ask: Optional[float] = None
         self._entry_missing_since_ts: Optional[float] = None
+        self._exit_missing_since_ts: Optional[float] = None
         self._data_blind_since_ts: Optional[float] = None
         self._wait_state_kind: Optional[str] = None
         self._wait_state_enter_ts_ms: Optional[int] = None
@@ -180,6 +184,7 @@ class TradeExecutor:
         self._recover_cancel_attempts = {"entry": 0, "exit": 0}
         self._last_recover_reason: Optional[str] = None
         self._last_recover_from: Optional[TradeState] = None
+        self._exit_cross_attempts = 0
         self._direction = "LONG"
 
     @staticmethod
@@ -294,6 +299,15 @@ class TradeExecutor:
         self._entry_cancel_requested_ts = None
         self._entry_replace_after_cancel = False
 
+    def _finalize_entry_ownership(self, reason: str) -> None:
+        # Invariant: entry ownership must be cleared once entry is filled/canceled or we leave entry flow.
+        self.entry_active_order_id = None
+        self.entry_active_price = None
+        self._clear_entry_cancel_trackers()
+        self._entry_missing_since_ts = None
+        if not self._should_dedup_log(f"entry_finalize:{reason}", 2.0):
+            self._logger(f"[ENTRY_FINALIZE] reason={reason}")
+
     def _set_entry_wait_state(self, kind: Optional[str]) -> None:
         if kind is None:
             self._clear_entry_wait()
@@ -346,6 +360,70 @@ class TradeExecutor:
                 )
             self._last_effective_source = source
 
+    def _trade_gate_age_ms(self, action: str) -> int:
+        if action == "ENTRY":
+            return int(getattr(self._settings, "entry_max_age_ms", 800))
+        if action == "EXIT":
+            return int(getattr(self._settings, "exit_max_age_ms", 2500))
+        entry_age = int(getattr(self._settings, "entry_max_age_ms", 800))
+        exit_age = int(getattr(self._settings, "exit_max_age_ms", 2500))
+        return max(entry_age, exit_age)
+
+    def _log_trade_blocked(
+        self,
+        action: str,
+        reason: str,
+        price_state: PriceState,
+        max_age_ms: Optional[int],
+    ) -> None:
+        if self._should_dedup_log(f"trade_blocked:{action}:{reason}", 0.5):
+            return
+        age_label = price_state.mid_age_ms if price_state.mid_age_ms is not None else "?"
+        cache_label = (
+            price_state.cache_age_ms
+            if price_state.cache_age_ms is not None
+            else "?"
+        )
+        max_age_label = max_age_ms if max_age_ms is not None else "?"
+        bid_label = "—" if price_state.bid is None else f"{price_state.bid:.8f}"
+        ask_label = "—" if price_state.ask is None else f"{price_state.ask:.8f}"
+        self._logger(
+            "[TRADE_BLOCKED] "
+            f"action={action} reason={reason} source={price_state.source} "
+            f"data_blind={price_state.data_blind} bid={bid_label} ask={ask_label} "
+            f"mid_age_ms={age_label} cache_age_ms={cache_label} max_age_ms={max_age_label}"
+        )
+
+    def _can_trade_now(
+        self,
+        price_state: PriceState,
+        action: str,
+        max_age_ms: Optional[int],
+    ) -> bool:
+        # Invariant: never place/replace/cancel entry/exit orders while blind or stale.
+        reason = None
+        if price_state.data_blind:
+            reason = "data_blind"
+        elif price_state.source == "NONE":
+            reason = "source_none"
+        elif price_state.bid is None or price_state.ask is None:
+            reason = "no_quote"
+        elif max_age_ms is not None:
+            if price_state.mid_age_ms is None:
+                reason = "no_age"
+            elif price_state.mid_age_ms > max_age_ms:
+                reason = "stale"
+            elif (
+                price_state.from_cache
+                and price_state.cache_age_ms is not None
+                and price_state.cache_age_ms > max_age_ms
+            ):
+                reason = "cache_stale"
+        if reason:
+            self._log_trade_blocked(action, reason, price_state, max_age_ms)
+            return False
+        return True
+
     def _set_wait_state(self, kind: Optional[str], deadline_ms: Optional[int]) -> None:
         if kind is None:
             self._clear_wait_state()
@@ -370,7 +448,7 @@ class TradeExecutor:
 
     def _check_wait_deadline(self, now: float) -> bool:
         cancel_kind = None
-        if self.entry_cancel_pending:
+        if self.state == TradeState.STATE_ENTRY_WORKING and self.entry_cancel_pending:
             cancel_kind = "ENTRY_CANCEL_WAIT"
         elif self.sell_cancel_pending:
             cancel_kind = "EXIT_CANCEL_WAIT"
@@ -447,7 +525,7 @@ class TradeExecutor:
             TradeState.STATE_EXIT_SL_WORKING,
         }:
             self._clear_entry_wait()
-            self._clear_entry_cancel_trackers()
+            self._finalize_entry_ownership(reason=f"state:{next_state.value}")
         if previous in {
             TradeState.STATE_EXIT_TP_WORKING,
             TradeState.STATE_EXIT_SL_WORKING,
@@ -1065,10 +1143,18 @@ class TradeExecutor:
                 self.last_action = "buy_active"
                 return 0
             price_state, health_state = self._router.build_price_state()
+            self._update_data_blind_state(price_state)
             mid = price_state.mid
             bid = price_state.bid
             ask = price_state.ask
             active_src = price_state.source
+            if not self._can_trade_now(
+                price_state,
+                action="ENTRY",
+                max_age_ms=self._trade_gate_age_ms("ENTRY"),
+            ):
+                self.last_action = "entry_blocked"
+                return 0
             ws_bad = active_src == "WS" and self._entry_ws_bad(health_state.ws_connected)
             entry_context = self._entry_log_context(
                 active_src,
@@ -1490,6 +1576,14 @@ class TradeExecutor:
         self._update_data_blind_state(price_state)
         self._note_effective_source(price_state.source)
         self._note_price_progress(price_state.bid, price_state.ask)
+        if not self._can_trade_now(
+            price_state,
+            action="EXIT",
+            max_age_ms=self._trade_gate_age_ms("EXIT"),
+        ):
+            # Invariant: do not transition into exit workflows while data is blind/stale.
+            self.last_action = "exit_blocked"
+            return
         remaining_qty = self._remaining_qty
         if remaining_qty <= self._epsilon_qty():
             return
@@ -1737,6 +1831,25 @@ class TradeExecutor:
             configured = 8000
         return self._clamp_int(configured, 6000, 9000)
 
+    def _sl_breached(self, price_state: PriceState, sl_price: Optional[float]) -> bool:
+        if sl_price is None:
+            return False
+        tick_size = self._profile.tick_size or 0.0
+        allowed_ticks = int(
+            getattr(self._settings, "exit_sl_emergency_ticks", self.EXIT_SL_EMERGENCY_TICKS)
+        )
+        buffer = allowed_ticks * tick_size if tick_size else 0.0
+        position_side = self._position_side()
+        if position_side == "SHORT":
+            if price_state.ask is None:
+                return False
+            threshold = sl_price + buffer
+            return price_state.ask >= threshold
+        if price_state.bid is None:
+            return False
+        threshold = sl_price - buffer
+        return price_state.bid <= threshold
+
     def _exit_elapsed_ms(self) -> Optional[int]:
         if self._exit_started_ts is None:
             return None
@@ -1916,6 +2029,13 @@ class TradeExecutor:
         status_label = str(buy_order.get("status") or "").upper()
         if self._entry_order_is_final(buy_order):
             return True
+        price_state, _ = self._router.build_price_state()
+        if not self._can_trade_now(
+            price_state,
+            action="ENTRY",
+            max_age_ms=self._trade_gate_age_ms("ENTRY"),
+        ):
+            return False
         order_id = buy_order.get("orderId")
         self._logger(
             "[CANCEL_ENTRY_BEFORE_EXIT] "
@@ -2073,10 +2193,18 @@ class TradeExecutor:
         self._sell_inflight_deadline_ts = now + (inflight_ms / 1000.0)
         try:
             price_state, health_state = self._router.build_price_state()
+            self._update_data_blind_state(price_state)
             self._note_effective_source(price_state.source)
             mid = mid_override if mid_override is not None else price_state.mid
             bid = ref_bid if ref_bid is not None else price_state.bid
             ask = ref_ask if ref_ask is not None else price_state.ask
+            if not self._can_trade_now(
+                price_state,
+                action="EXIT",
+                max_age_ms=self._trade_gate_age_ms("EXIT"),
+            ):
+                self.last_action = "exit_blocked"
+                return 0
             intent = self._normalize_exit_intent(exit_intent or self.exit_intent or reason)
             if intent == "TP" and price_override is None:
                 tp_price, _ = self._compute_tp_sl_prices()
@@ -2438,16 +2566,15 @@ class TradeExecutor:
         if self.position is None:
             self.last_action = "no_position"
             return 0
-        if not force:
-            price_state, _ = self._router.build_price_state()
-            if price_state.data_blind:
-                if not self._should_dedup_log("market_exit_blocked_data_blind", 2.0):
-                    self._logger(
-                        f"[EXIT_BLOCKED] {self._direction_tag()} "
-                        "action=market_exit reason=data_blind"
-                    )
-                self.last_action = "data_blind_exit_blocked"
-                return 0
+        price_state, _ = self._router.build_price_state()
+        if price_state.data_blind:
+            if not self._should_dedup_log("market_exit_blocked_data_blind", 2.0):
+                self._logger(
+                    f"[EXIT_BLOCKED] {self._direction_tag()} "
+                    "action=market_exit reason=data_blind"
+                )
+            self.last_action = "data_blind_exit_blocked"
+            return 0
         self.sell_place_inflight = True
         self.sell_last_attempt_ts = time.monotonic()
         inflight_ms = int(getattr(self._settings, "inflight_deadline_ms", 2500))
@@ -2582,6 +2709,13 @@ class TradeExecutor:
                 wait_kind="ENTRY_WAIT",
                 age_ms=age_ms,
             )
+        price_state, _ = self._router.build_price_state()
+        if not self._can_trade_now(
+            price_state,
+            action="ENTRY",
+            max_age_ms=self._trade_gate_age_ms("ENTRY"),
+        ):
+            return False
         order_id = buy_order.get("orderId")
         age_label = age_ms if age_ms is not None else "?"
         self._logger(
@@ -2604,9 +2738,16 @@ class TradeExecutor:
 
     def _attempt_entry_replace_from_cancel(self) -> None:
         price_state, health_state = self._router.build_price_state()
+        if not self._can_trade_now(
+            price_state,
+            action="ENTRY",
+            max_age_ms=self._trade_gate_age_ms("ENTRY"),
+        ):
+            return
         self._note_effective_source(price_state.source)
         bid = price_state.bid
         ask = price_state.ask
+        ref_price, ref_label = self._entry_reference(bid, ask)
         entry_context = self._entry_log_context(
             price_state.source,
             price_state.source == "WS" and self._entry_ws_bad(health_state.ws_connected),
@@ -2802,6 +2943,23 @@ class TradeExecutor:
         mid_val = price_state.mid
         age_ms = price_state.mid_age_ms
         source = price_state.source
+        if not self._can_trade_now(
+            price_state,
+            action="ENTRY",
+            max_age_ms=self._trade_gate_age_ms("ENTRY"),
+        ):
+            return (
+                False,
+                bid,
+                ask,
+                mid_val,
+                age_ms,
+                source,
+                "blocked",
+                ws_bad,
+                health_state.ws_age_ms,
+                health_state.http_age_ms,
+            )
         if source == "HTTP" and health_state.http_age_ms is not None:
             age_ms = health_state.http_age_ms
         if mid_val is None:
@@ -3304,30 +3462,86 @@ class TradeExecutor:
         elapsed_ms = int((time.monotonic() - self._sell_wait_started_ts) * 1000.0)
         if elapsed_ms <= max_wait_ms:
             return False
+        price_state, _ = self._router.build_price_state()
+        self._update_data_blind_state(price_state)
+        if not self._can_trade_now(
+            price_state,
+            action="EXIT",
+            max_age_ms=self._trade_gate_age_ms("EXIT"),
+        ):
+            return False
+        exit_side = self._exit_side()
         self._logger(
-            f"[SELL_STUCK_TIMEOUT] waited_ms={elapsed_ms} "
-            f"limit_ms={max_wait_ms} action=force_close_market"
+            f"[EXIT_STUCK_TIMEOUT] waited_ms={elapsed_ms} "
+            f"limit_ms={max_wait_ms} side={exit_side}"
         )
-        self._logger("[EXIT_EMERGENCY] reason=timeout")
-        for order in list(self.active_test_orders):
-            if order.get("side") != "SELL":
-                continue
-            self._cancel_margin_order(
-                symbol=self._settings.symbol,
-                order_id=order.get("orderId"),
-                is_isolated="TRUE" if self._settings.margin_isolated else "FALSE",
-                tag=order.get("tag", self.TAG),
+        entry_avg = self._entry_avg_price or self.get_buy_price()
+        _, sl_price = self._compute_tp_sl_prices(entry_avg)
+        sl_breached = self._sl_breached(price_state, sl_price)
+        max_cross_attempts = int(
+            getattr(self._settings, "exit_cross_attempts", self.EXIT_CROSS_MAX_ATTEMPTS)
+        )
+        status_missing_ms = None
+        if self._exit_missing_since_ts is not None:
+            status_missing_ms = int(
+                (time.monotonic() - self._exit_missing_since_ts) * 1000.0
             )
-        remaining_qty_raw = self._resolve_remaining_qty_raw()
-        if self._profile.step_size:
-            qty = self._round_down(remaining_qty_raw, self._profile.step_size)
-        else:
-            qty = remaining_qty_raw
-        if qty > 0:
-            self._place_emergency_market_sell(qty, force=True)
+        if not sl_breached or self._exit_cross_attempts < max_cross_attempts:
+            if self._exit_cross_attempts >= max_cross_attempts:
+                self._logger(
+                    "[EXIT_CROSS_LIMIT] "
+                    f"attempts={self._exit_cross_attempts} max={max_cross_attempts}"
+                )
+                return False
+            self._exit_cross_attempts += 1
+            attempt_label = self._exit_cross_attempts
+            breach_label = "sl_breach" if sl_breached else "timeout"
+            self._logger(
+                "[EXIT_CROSS_RETRY] "
+                f"attempt={attempt_label}/{max_cross_attempts} reason={breach_label}"
+            )
+            self._tp_exit_phase = "CROSS"
+            if self._has_active_order(exit_side) or self.sell_active_order_id:
+                self._cancel_active_sell(reason="TIMEOUT_CROSS")
+            self._schedule_sell_retry("TP_CROSS")
             return True
-        self._finalize_sell_timeout()
-        return True
+
+        status_limit_ms = int(
+            getattr(
+                self._settings,
+                "exit_status_missing_ms",
+                self.EXIT_STATUS_MISSING_MS,
+            )
+        )
+        status_missing = (
+            status_missing_ms is not None and status_missing_ms >= status_limit_ms
+        )
+        if sl_breached and (status_missing or self._exit_cross_attempts >= max_cross_attempts):
+            self._logger(
+                "[EXIT_EMERGENCY] reason=sl_breach "
+                f"missing_ms={status_missing_ms if status_missing_ms is not None else '—'} "
+                f"attempts={self._exit_cross_attempts}/{max_cross_attempts}"
+            )
+            for order in list(self.active_test_orders):
+                if order.get("side") != exit_side:
+                    continue
+                self._cancel_margin_order(
+                    symbol=self._settings.symbol,
+                    order_id=order.get("orderId"),
+                    is_isolated="TRUE" if self._settings.margin_isolated else "FALSE",
+                    tag=order.get("tag", self.TAG),
+                )
+            remaining_qty_raw = self._resolve_remaining_qty_raw()
+            if self._profile.step_size:
+                qty = self._round_down(remaining_qty_raw, self._profile.step_size)
+            else:
+                qty = remaining_qty_raw
+            if qty > 0:
+                self._place_emergency_market_sell(qty, force=True)
+                return True
+            self._finalize_sell_timeout()
+            return True
+        return False
 
     def _watchdog_inflight(self) -> None:
         now = time.monotonic()
@@ -3831,11 +4045,13 @@ class TradeExecutor:
                     reason="totals_exceed_plan",
                 )
                 return
+            entry_side = self._entry_side()
+            exit_side = self._exit_side()
             have_open_entry = any(
-                str(order.get("side") or "").upper() == "BUY" for order in open_orders
+                str(order.get("side") or "").upper() == entry_side for order in open_orders
             )
             have_open_exit = any(
-                str(order.get("side") or "").upper() == "SELL" for order in open_orders
+                str(order.get("side") or "").upper() == exit_side for order in open_orders
             )
             self._apply_reconcile_snapshot(executed, closed, remaining, entry_avg)
             self._reconcile_invalid_totals = False
@@ -3846,14 +4062,26 @@ class TradeExecutor:
                 if needs_cancel_entry or needs_exit_place:
                     self._reconcile_recovery_attempts += 1
                     attempt_label = self._reconcile_recovery_attempts
+                    plan = {
+                        "cancel_entry": needs_cancel_entry,
+                        "place_exit": needs_exit_place,
+                    }
                     self._logger(
-                        "[RECONCILE] "
-                        f"actions_required cancel_entry={needs_cancel_entry} "
-                        f"place_exit={needs_exit_place} attempt={attempt_label}"
+                        "[RECONCILE_PLAN] "
+                        f"cancel_entry={plan['cancel_entry']} "
+                        f"place_exit={plan['place_exit']} attempt={attempt_label}"
                     )
+                    price_state, health_state = self._router.build_price_state()
+                    if not self._can_trade_now(
+                        price_state,
+                        action="RECONCILE",
+                        max_age_ms=self._trade_gate_age_ms("RECONCILE"),
+                    ):
+                        self._transition_to_position_state()
+                        return
                     if needs_cancel_entry:
                         for order in open_orders:
-                            if str(order.get("side") or "").upper() != "BUY":
+                            if str(order.get("side") or "").upper() != entry_side:
                                 continue
                             order_id = order.get("orderId")
                             if not order_id:
@@ -3867,33 +4095,43 @@ class TradeExecutor:
                             )
                         self.entry_cancel_pending = True
                     if needs_exit_place:
-                        price_state, health_state = self._router.build_price_state()
                         self._ensure_exit_orders(
                             price_state,
                             health_state,
                             allow_replace=True,
                             skip_reconcile=True,
                         )
-                    price_state, _ = self._router.build_price_state()
                     if (
-                        self._reconcile_recovery_attempts >= 3
-                        and (price_state.data_blind or balance is None)
+                        self._reconcile_recovery_attempts
+                        >= int(getattr(self._settings, "max_reconcile_retries", 3))
+                        and self._no_progress_ms() >= self.HARD_STALL_MS
+                        and not self._can_trade_now(
+                            price_state,
+                            action="RECONCILE",
+                            max_age_ms=self._trade_gate_age_ms("RECONCILE"),
+                        )
                     ):
                         self._enter_safe_stop(
-                            reason="RECONCILE_ACTIONS_REQUIRED",
+                            reason="RECONCILE_RETRY_LIMIT",
                             allow_rest=False,
                         )
                         return
-                    self._transition_state(self._exit_state_for_intent(self.exit_intent))
+                    self._transition_to_position_state()
                     return
                 self._reconcile_recovery_attempts = 0
                 self._transition_state(self._exit_state_for_intent(self.exit_intent))
                 return
             if have_open_entry or have_open_exit:
-                self._logger(
-                    "[RECONCILE] open_orders_present -> CANCEL"
-                )
-                self._cancel_all_symbol_orders()
+                price_state, _ = self._router.build_price_state()
+                if self._can_trade_now(
+                    price_state,
+                    action="RECONCILE",
+                    max_age_ms=self._trade_gate_age_ms("RECONCILE"),
+                ):
+                    self._logger(
+                        "[RECONCILE] open_orders_present -> CANCEL"
+                    )
+                    self._cancel_all_symbol_orders()
             cycle_id = self._current_cycle_id
             self.position = None
             self._reset_position_tracking()
@@ -3916,6 +4154,7 @@ class TradeExecutor:
         self.sell_cancel_pending = False
         self.sell_retry_pending = False
         self._pending_sell_retry_reason = None
+        self._exit_cross_attempts = 0
         exit_side = self._exit_side()
         self.active_test_orders = [
             entry for entry in self.active_test_orders if entry.get("side") != exit_side
@@ -4082,6 +4321,20 @@ class TradeExecutor:
                 self._entry_missing_since_ts = None
         else:
             self._entry_missing_since_ts = None
+        exit_order = self._get_active_sell_order()
+        if (
+            self._in_exit_workflow()
+            and exit_order is not None
+            and not self._sell_order_is_final(exit_order)
+        ):
+            exit_id = exit_order.get("orderId")
+            if exit_id not in open_map:
+                if self._exit_missing_since_ts is None:
+                    self._exit_missing_since_ts = time.monotonic()
+            else:
+                self._exit_missing_since_ts = None
+        else:
+            self._exit_missing_since_ts = None
         self._enter_tick(open_map)
         if self._maybe_handle_sell_watchdog(open_map):
             return
@@ -4268,9 +4521,7 @@ class TradeExecutor:
             self._reset_buy_retry()
             self._clear_entry_attempt()
             if self.entry_active_order_id == order_id:
-                self.entry_active_order_id = None
-                self.entry_active_price = None
-                self.entry_cancel_pending = False
+                self._finalize_entry_ownership(reason=f"done:{status}")
             if self.position is None:
                 self._transition_state(TradeState.STATE_IDLE)
             else:
@@ -4580,6 +4831,8 @@ class TradeExecutor:
         self._tp_maker_started_ts = None
         self._tp_armed = False
         self._reconcile_recovery_attempts = 0
+        self._exit_cross_attempts = 0
+        self._exit_missing_since_ts = None
 
     def _set_exit_intent(
         self,
@@ -4606,6 +4859,13 @@ class TradeExecutor:
 
     def _cancel_active_sell(self, reason: str) -> None:
         if not self.sell_active_order_id and not self._has_active_order(self._exit_side()):
+            return
+        price_state, _ = self._router.build_price_state()
+        if not self._can_trade_now(
+            price_state,
+            action="EXIT",
+            max_age_ms=self._trade_gate_age_ms("EXIT"),
+        ):
             return
         sell_order = self._get_active_sell_order()
         order_id = sell_order.get("orderId") if sell_order else self.sell_active_order_id
@@ -4933,8 +5193,7 @@ class TradeExecutor:
         ]
         self.orders_count = len(self.active_test_orders)
         if self.entry_active_order_id == order_id:
-            self.entry_active_order_id = None
-            self.entry_active_price = None
+            self._finalize_entry_ownership(reason=f"cancel:{status}")
         if status in {"CANCELED", "REJECTED", "EXPIRED"}:
             self._reset_buy_retry()
             self._clear_entry_attempt()
