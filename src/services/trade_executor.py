@@ -141,6 +141,7 @@ class TradeExecutor:
         self._seen_fill_queue: deque[tuple[tuple[object, ...], float]] = deque()
         self._orphan_fills: deque[dict[str, object]] = deque()
         self._orphan_fill_keys: set[tuple[object, ...]] = set()
+        self._last_applied_cum_qty: dict[int, Decimal] = {}
         self.wins = 0
         self.losses = 0
         self.cycles_target = self._normalize_cycle_target(
@@ -530,7 +531,7 @@ class TradeExecutor:
         if exchange_qty <= self._epsilon_qty() and remaining_qty > self._epsilon_qty():
             self._reconcile_with_exchange()
             return
-        qty = exchange_qty if exchange_qty > self._epsilon_qty() else remaining_qty
+        qty = remaining_qty
         if self._profile.step_size:
             qty = self._round_down(qty, self._profile.step_size)
         if qty <= self._epsilon_qty():
@@ -674,6 +675,8 @@ class TradeExecutor:
         remaining_qty = self._resolve_remaining_qty_raw()
         if remaining_qty <= self._get_step_size_tolerance():
             return
+        if fill_qty > remaining_qty:
+            fill_qty = remaining_qty
         if self._profile.step_size:
             fill_qty = self._round_down(fill_qty, self._profile.step_size)
         if fill_qty <= 0:
@@ -1198,6 +1201,7 @@ class TradeExecutor:
         if not isinstance(order_id, int):
             return
         self._order_roles.pop(order_id, None)
+        self._last_applied_cum_qty.pop(order_id, None)
 
     def _log_guard_active_order(
         self,
@@ -1975,9 +1979,26 @@ class TradeExecutor:
     def _extract_trade_id(order: Optional[dict]) -> Optional[object]:
         if not order:
             return None
-        for key in ("tradeId", "trade_id", "fillId", "fill_id"):
+        for key in (
+            "tradeId",
+            "trade_id",
+            "aggTradeId",
+            "agg_trade_id",
+            "fillId",
+            "fill_id",
+        ):
             if order.get(key) is not None:
                 return order.get(key)
+        return None
+
+    @staticmethod
+    def _extract_is_buyer_maker(order: Optional[dict]) -> Optional[bool]:
+        if not order:
+            return None
+        if "isBuyerMaker" in order:
+            return bool(order.get("isBuyerMaker"))
+        if "is_buyer_maker" in order:
+            return bool(order.get("is_buyer_maker"))
         return None
 
     @staticmethod
@@ -1989,8 +2010,10 @@ class TradeExecutor:
     def _fill_dedupe_key(
         self,
         order_id: Optional[int],
+        side: Optional[str],
         qty: float,
         price: float,
+        is_buyer_maker: Optional[bool],
         ts_ms: Optional[int],
         trade_id: Optional[object],
     ) -> Optional[tuple[object, ...]]:
@@ -1998,6 +2021,7 @@ class TradeExecutor:
             return ("trade", trade_id)
         if order_id is None:
             return None
+        side_label = str(side or "UNKNOWN").upper()
         qty_key = qty
         price_key = price
         if self._profile.step_size and self._profile.step_size > 0:
@@ -2006,8 +2030,10 @@ class TradeExecutor:
             price_key = self._round_to_tick(price, self._profile.tick_size)
         return (
             int(order_id),
+            side_label,
             float(qty_key),
             float(price_key),
+            is_buyer_maker,
             self._fill_dedupe_bucket(ts_ms),
         )
 
@@ -2041,12 +2067,16 @@ class TradeExecutor:
     def _should_apply_fill_dedup(
         self,
         order_id: Optional[int],
+        side: Optional[str],
         qty: float,
         price: float,
+        is_buyer_maker: Optional[bool],
         ts_ms: Optional[int],
         trade_id: Optional[object],
     ) -> bool:
-        key = self._fill_dedupe_key(order_id, qty, price, ts_ms, trade_id)
+        key = self._fill_dedupe_key(
+            order_id, side, qty, price, is_buyer_maker, ts_ms, trade_id
+        )
         self._prune_seen_fills()
         if key is not None and key in self._seen_fill_keys:
             self._log_fill_dedup("SKIP", order_id, qty, price, trade_id, ts_ms)
@@ -2070,6 +2100,28 @@ class TradeExecutor:
         if order_id is None:
             return None
         return (int(order_id), side, float(cum_qty))
+
+    def _resolve_fill_delta(self, order_id: Optional[int], cum_qty: float) -> float:
+        if cum_qty <= 0:
+            return 0.0
+        if not isinstance(order_id, int):
+            return max(cum_qty, 0.0)
+        new_cum = Decimal(str(cum_qty))
+        prev_cum = self._last_applied_cum_qty.get(order_id, Decimal("0"))
+        if new_cum <= prev_cum:
+            self._logger(
+                "[FILL_SKIP_DUP_CUM] "
+                f"order_id={order_id} cum={new_cum:.8f} prev={prev_cum:.8f}"
+            )
+            return 0.0
+        delta = new_cum - prev_cum
+        self._last_applied_cum_qty[order_id] = new_cum
+        self._logger(
+            "[FILL_APPLY_DELTA] "
+            f"order_id={order_id} cum={new_cum:.8f} prev={prev_cum:.8f} "
+            f"delta={delta:.8f}"
+        )
+        return float(delta)
 
     def _should_process_fill(
         self,
@@ -3266,9 +3318,9 @@ class TradeExecutor:
         tp_triggered = False
         if tp_price is not None:
             if position_side == "SHORT":
-                tp_triggered = best_ask is not None and best_ask <= tp_price
+                tp_triggered = best_bid is not None and best_bid <= tp_price
             else:
-                tp_triggered = best_bid is not None and best_bid >= tp_price
+                tp_triggered = best_ask is not None and best_ask >= tp_price
         if not tp_triggered:
             return
         best_bid_label = "—" if best_bid is None else f"{best_bid:.8f}"
@@ -4065,7 +4117,10 @@ class TradeExecutor:
                 )
                 return 0
             remaining_qty_raw = self._resolve_remaining_qty_raw()
-            qty = qty_override if qty_override is not None else remaining_qty_raw
+            if qty_override is None:
+                qty = remaining_qty_raw
+            else:
+                qty = min(qty_override, remaining_qty_raw)
             if self._profile.step_size:
                 qty = self._round_down(qty, self._profile.step_size)
             active_sell_order = self._get_active_sell_order()
@@ -5624,9 +5679,9 @@ class TradeExecutor:
         tp_triggered = False
         if tp_price is not None:
             if position_side == "SHORT":
-                tp_triggered = best_ask is not None and best_ask <= tp_price
+                tp_triggered = best_bid is not None and best_bid <= tp_price
             else:
-                tp_triggered = best_bid is not None and best_bid >= tp_price
+                tp_triggered = best_ask is not None and best_ask >= tp_price
         max_cross_attempts = int(
             getattr(self._settings, "exit_cross_attempts", self.EXIT_CROSS_MAX_ATTEMPTS)
         )
@@ -5923,9 +5978,9 @@ class TradeExecutor:
                 tp_triggered = False
                 if tp_price is not None:
                     if position_side == "SHORT":
-                        tp_triggered = best_ask is not None and best_ask <= tp_price
+                        tp_triggered = best_bid is not None and best_bid <= tp_price
                     else:
-                        tp_triggered = best_bid is not None and best_bid >= tp_price
+                        tp_triggered = best_ask is not None and best_ask >= tp_price
                 if not tp_triggered:
                     if not self._should_dedup_log("exit_cross_blocked_tp_unmet", 2.0):
                         self._logger("[EXIT_CROSS_BLOCKED] reason=tp_unmet_by_book")
@@ -6611,28 +6666,37 @@ class TradeExecutor:
         if meta is None:
             return
         trade_id = self._extract_trade_id(order)
-        if not self._should_apply_fill_dedup(order_id, qty, price, ts_ms, trade_id):
+        is_buyer_maker = self._extract_is_buyer_maker(order)
+        if not self._should_apply_fill_dedup(
+            order_id, side, qty, price, is_buyer_maker, ts_ms, trade_id
+        ):
             return
         side_upper = str(side).upper()
         cycle_id = meta.cycle_id
         role = meta.role.value
         if order is None:
+            delta = self._resolve_fill_delta(order_id, qty)
+            if delta <= 0:
+                self._update_registry_status_by_order(order_id, "FILLED")
+                return
             if role == "ENTRY":
-                self.ledger.on_entry_fill(cycle_id, qty, price)
+                self.ledger.on_entry_fill(cycle_id, delta, price)
                 self._sync_cycle_qty_from_ledger(cycle_id)
-                self._log_fill_applied(meta, qty, price)
-                self._log_entry_fill(cycle_id, qty, price)
+                self._log_fill_applied(meta, delta, price)
+                self._log_entry_fill(cycle_id, delta, price)
                 price_state, _ = self._router.build_price_state()
-                self._place_tp_for_fill(qty, price_state)
+                self._place_tp_for_fill(delta, price_state)
             elif role in {"EXIT_TP", "EXIT_CROSS"}:
-                self.ledger.on_exit_fill(cycle_id, qty, price)
+                self.ledger.on_exit_fill(cycle_id, delta, price)
                 self._sync_cycle_qty_from_ledger(cycle_id)
-                self._log_fill_applied(meta, qty, price)
+                self._log_fill_applied(meta, delta, price)
                 if meta.role == OrderRole.EXIT_TP:
-                    self._log_tp_fill(cycle_id, qty, price)
+                    self._log_tp_fill(cycle_id, delta, price)
             self._update_registry_status_by_order(order_id, "FILLED")
             return
-        if not self._should_process_fill(order_id, side_upper, qty, price, cycle_id, trade_id):
+        if not self._should_process_fill(
+            order_id, side_upper, qty, price, cycle_id, trade_id
+        ):
             return
         if order.get("status") == "FILLED":
             return
@@ -6674,30 +6738,34 @@ class TradeExecutor:
         if meta is None:
             return
         trade_id = self._extract_trade_id(order)
+        is_buyer_maker = self._extract_is_buyer_maker(order)
         if not self._should_apply_fill_dedup(
-            order_id, cum_qty, avg_price, ts_ms, trade_id
+            order_id, side, cum_qty, avg_price, is_buyer_maker, ts_ms, trade_id
         ):
             return
         side_upper = str(side).upper()
         cycle_id = meta.cycle_id
         if order is None:
             fill_price = avg_price if avg_price > 0 else 0.0
+            delta = self._resolve_fill_delta(order_id, cum_qty)
+            if delta <= 0:
+                return
             if meta.role == OrderRole.ENTRY:
                 if fill_price > 0:
-                    self.ledger.on_entry_fill(cycle_id, cum_qty, fill_price)
+                    self.ledger.on_entry_fill(cycle_id, delta, fill_price)
                     self._sync_cycle_qty_from_ledger(cycle_id)
-                    self._log_fill_applied(meta, cum_qty, fill_price)
-                    self._log_entry_fill(cycle_id, cum_qty, fill_price)
+                    self._log_fill_applied(meta, delta, fill_price)
+                    self._log_entry_fill(cycle_id, delta, fill_price)
                     price_state, _ = self._router.build_price_state()
-                    self._place_tp_for_fill(cum_qty, price_state)
+                    self._place_tp_for_fill(delta, price_state)
                 self._update_registry_status_by_order(order_id, "PARTIAL", cum_qty)
             elif meta.role in {OrderRole.EXIT_TP, OrderRole.EXIT_CROSS}:
                 if fill_price > 0:
-                    self.ledger.on_exit_fill(cycle_id, cum_qty, fill_price)
+                    self.ledger.on_exit_fill(cycle_id, delta, fill_price)
                     self._sync_cycle_qty_from_ledger(cycle_id)
-                    self._log_fill_applied(meta, cum_qty, fill_price)
+                    self._log_fill_applied(meta, delta, fill_price)
                     if meta.role == OrderRole.EXIT_TP:
-                        self._log_tp_fill(cycle_id, cum_qty, fill_price)
+                        self._log_tp_fill(cycle_id, delta, fill_price)
                 self._update_registry_status_by_order(order_id, "PARTIAL", cum_qty)
             return
         if not self._should_process_fill(
@@ -6708,13 +6776,14 @@ class TradeExecutor:
         entry_side = self._entry_side()
         exit_side = self._exit_side()
         if role == "ENTRY":
-            prev_cum = float(order.get("cum_qty") or 0.0)
             order["cum_qty"] = cum_qty
             if avg_price > 0:
                 order["avg_fill_price"] = avg_price
                 order["last_fill_price"] = avg_price
             order["updated_ts"] = ts_ms
-            delta = max(cum_qty - prev_cum, 0.0)
+            delta = self._resolve_fill_delta(order_id, cum_qty)
+            if delta <= 0:
+                return
             if delta > 0:
                 self.mark_progress(reason="partial_fill", reset_reconcile=True)
                 self._log_cycle_fill(cycle_id, entry_side, delta, cum_qty)
@@ -6904,9 +6973,10 @@ class TradeExecutor:
         cycle_id = meta.cycle_id
         if not dedup_checked:
             trade_id = self._extract_trade_id(order)
+            is_buyer_maker = self._extract_is_buyer_maker(order)
             ts_ms = int(order.get("updated_ts") or time.time() * 1000)
             if not self._should_apply_fill_dedup(
-                order_id, qty, price, ts_ms, trade_id
+                order_id, side_label, qty, price, is_buyer_maker, ts_ms, trade_id
             ):
                 return
             if not self._should_process_fill(
@@ -6918,7 +6988,6 @@ class TradeExecutor:
         exit_side = self._exit_side()
         cycle_label = "—" if cycle_id is None else str(cycle_id)
         if role == "ENTRY":
-            prev_cum = float(order.get("cum_qty") or 0.0)
             order["cum_qty"] = qty
             self._logger(
                 f"[ORDER] {entry_side} filled "
@@ -6929,13 +6998,16 @@ class TradeExecutor:
                 f"[FILL] {self._direction_tag()} entry cycle_id={cycle_label} "
                 f"qty={qty:.8f} price={price:.8f}"
             )
-            delta = max(qty - prev_cum, 0.0)
-            if delta > 0:
-                self._log_cycle_fill(cycle_id, entry_side, delta, qty)
-                self.ledger.on_entry_fill(cycle_id, delta, price)
-                self._sync_cycle_qty_from_ledger(cycle_id)
-                self._log_fill_applied(meta, delta, price)
-                self._log_entry_fill(cycle_id, delta, price)
+            delta = self._resolve_fill_delta(order_id, qty)
+            if delta <= 0:
+                self._update_registry_status_by_order(order_id, "FILLED")
+                self._clear_order_role(order_id)
+                return
+            self._log_cycle_fill(cycle_id, entry_side, delta, qty)
+            self.ledger.on_entry_fill(cycle_id, delta, price)
+            self._sync_cycle_qty_from_ledger(cycle_id)
+            self._log_fill_applied(meta, delta, price)
+            self._log_entry_fill(cycle_id, delta, price)
             self._reset_buy_retry()
             self._clear_entry_attempt()
             if self.entry_active_order_id == order_id:
@@ -6965,9 +7037,14 @@ class TradeExecutor:
             self._log_trade_snapshot(reason="entry_filled")
             self._clear_order_role(order_id)
         elif role in {"EXIT_TP", "EXIT_CROSS"}:
-            prev_cum = float(order.get("cum_qty") or 0.0)
+            delta = 0.0
             if qty > 0:
-                self._update_sell_execution(order, qty)
+                prev_cum = float(order.get("cum_qty") or 0.0)
+                delta = self._update_sell_execution(order, qty)
+                if delta <= 0:
+                    self._update_registry_status_by_order(order_id, "FILLED")
+                    self._clear_order_role(order_id)
+                    return
                 if price > 0:
                     prev_avg = float(order.get("avg_fill_price") or 0.0)
                     prev_notional = prev_avg * prev_cum
@@ -7018,7 +7095,6 @@ class TradeExecutor:
                 f"[FILL] {self._direction_tag()} exit reason={exit_reason} "
                 f"qty={qty:.8f} price={fill_price_label}"
             )
-            delta = max(qty - prev_cum, 0.0)
             if delta > 0:
                 self._log_cycle_fill(cycle_id, exit_side, delta, qty)
                 if fill_price is not None:
@@ -7094,9 +7170,14 @@ class TradeExecutor:
             return
         cycle_id = meta.cycle_id
         avg_price = price if price is not None else 0.0
-        if not self._should_apply_fill_dedup(order_id, qty, avg_price, ts_ms, None):
+        if not self._should_apply_fill_dedup(
+            order_id, entry_side, qty, avg_price, None, ts_ms, None
+        ):
             return
         if not self._should_process_fill(order_id, entry_side, qty, avg_price, cycle_id):
+            return
+        delta = self._resolve_fill_delta(order_id, qty)
+        if delta <= 0:
             return
         price_label = "?" if price is None else f"{price:.8f}"
         cycle_label = "—" if cycle_id is None else str(cycle_id)
@@ -7104,17 +7185,17 @@ class TradeExecutor:
             f"[ORDER] {entry_side} partial timeout "
             f"cycle_id={cycle_label} qty={qty:.8f} price={price_label}"
         )
-        self._log_cycle_fill(cycle_id, entry_side, qty, qty)
+        self._log_cycle_fill(cycle_id, entry_side, delta, qty)
         if price is not None:
-            self.ledger.on_entry_fill(cycle_id, qty, float(price))
+            self.ledger.on_entry_fill(cycle_id, delta, float(price))
             self._sync_cycle_qty_from_ledger(cycle_id)
-            self._log_fill_applied(meta, qty, float(price))
-            self._log_entry_fill(cycle_id, qty, float(price))
+            self._log_fill_applied(meta, delta, float(price))
+            self._log_entry_fill(cycle_id, delta, float(price))
             self._transition_pipeline_state(
                 PipelineState.ARM_EXIT, reason="entry_partial_fill"
             )
             price_state, _ = self._router.build_price_state()
-            self._place_tp_for_fill(qty, price_state)
+            self._place_tp_for_fill(delta, price_state)
         self._update_registry_status_by_order(order_id, "PARTIAL", qty)
         self._reset_buy_retry()
         self._clear_entry_attempt()
@@ -7444,8 +7525,12 @@ class TradeExecutor:
                 self._place_emergency_market_sell(qty, force=True)
 
     def _update_sell_execution(self, order: dict, cum_qty: float) -> float:
-        prev_cum = float(order.get("cum_qty") or 0.0)
-        delta = max(cum_qty - prev_cum, 0.0)
+        order_id = order.get("orderId")
+        if isinstance(order_id, int):
+            delta = self._resolve_fill_delta(order_id, cum_qty)
+        else:
+            prev_cum = float(order.get("cum_qty") or 0.0)
+            delta = max(cum_qty - prev_cum, 0.0)
         if delta > 0:
             self._aggregate_sold_qty += delta
         order["cum_qty"] = cum_qty

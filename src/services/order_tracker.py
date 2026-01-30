@@ -89,6 +89,10 @@ class OrderTracker(QObject):
                     self._logger(f"[ORDER_TRACKER] poll error: {exc}")
                 continue
             status = str(payload.get("status", entry.get("status", "NEW"))).upper()
+            last_status = str(entry.get("last_status", entry.get("status", "NEW"))).upper()
+            if last_status == "FILLED" and status == "FILLED":
+                self._logger(f"[STATUS_DUP_IGNORED] id={order_id} status=FILLED")
+                continue
             prev_cum_qty = float(entry.get("cum_qty", 0.0) or 0.0)
             executed_qty = float(payload.get("executedQty", prev_cum_qty) or prev_cum_qty)
             cumulative_quote = payload.get("cumulativeQuoteQty", payload.get("cummulativeQuoteQty"))

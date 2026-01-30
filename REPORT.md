@@ -24,3 +24,11 @@
 - 0.7.30.13: OrderRegistry + cycle_id/role mapping; fills routed deterministically to ledger cycles.
 - 0.7.30.14: Track executed/closed/remaining per cycle, block re-entry until remaining==0, and size exits to remaining.
 - 0.7.30.15: SHORT зеркально LONG; TP/SL по книге; STOP/reconcile deterministic; no wrong-side.
+- 0.7.30.24: Hardened fill dedup (tradeId/aggTradeId + cum-delta guard), block duplicate FILLED status, exit sizing clamps to remaining_qty, TP triggers by book-side (ask for LONG, bid for SHORT), cycles table shows executed/closed/remaining with unreal PnL from remaining.
+  - How to check:
+    1) `pytest tests/test_fill_dedup.py`
+    2) Run bot in LONG with partial fills and confirm each delta fill spawns TP and remaining_qty updates.
+    3) Simulate duplicate FILLED/partial events (WS reconnect) and confirm [FILL_SKIP_DUP_CUM] and no double ledger apply.
+    4) Verify DEALS table shows cycle_id, executed/closed/remaining and winrate is computed from CLOSED cycles only.
+    5) Trigger SL and confirm exit order qty equals remaining_qty and cycle closes only when remaining_qty==0.
+  - Expected logs: [FILL_APPLY_DELTA], [FILL_SKIP_DUP_CUM], [STATUS_DUP_IGNORED]

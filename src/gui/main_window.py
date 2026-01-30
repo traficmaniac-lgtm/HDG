@@ -348,19 +348,20 @@ class MainWindow(QMainWindow):
 
         fills_tab = QWidget()
         fills_layout = QVBoxLayout(fills_tab)
-        self.fills_model = QStandardItemModel(0, 10, self)
+        self.fills_model = QStandardItemModel(0, 11, self)
         self.fills_model.setHorizontalHeaderLabels(
             [
                 "time_open",
+                "cycle_id",
                 "direction",
                 "entry_avg",
                 "exit_avg",
-                "qty",
+                "executed_qty",
+                "closed_qty",
+                "remaining_qty",
                 "status",
                 "realized_pnl",
                 "unreal_pnl",
-                "ticks_profit",
-                "tag",
             ]
         )
         self.fills_table = QTableView()
@@ -373,7 +374,7 @@ class MainWindow(QMainWindow):
         fills_header = self.fills_table.horizontalHeader()
         fills_header.setStretchLastSection(False)
         fills_header.setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
-        fills_widths = [80, 80, 110, 110, 90, 90, 110, 110, 90, 140]
+        fills_widths = [80, 70, 80, 110, 110, 110, 110, 120, 90, 110, 110]
         for idx, width in enumerate(fills_widths):
             self.fills_table.setColumnWidth(idx, width)
         fills_layout.addWidget(self.fills_table, stretch=1)
@@ -1751,12 +1752,21 @@ class MainWindow(QMainWindow):
                 f"{self._fmt_price(buy_price, width=10)}"
             )
         ledger = self._trade_executor.ledger if self._trade_executor else None
-        closed_cycles = (
-            ledger.list_closed_deals(limit=1000) if ledger else []
+        cycles = ledger.cycles if ledger else []
+        closed_cycles = [
+            cycle for cycle in cycles if cycle.status.value == "CLOSED"
+        ]
+        pnl_session = (
+            sum(cycle.realized_pnl_quote for cycle in closed_cycles)
+            if closed_cycles
+            else 0.0
         )
-        pnl_session = sum(deal.realized_pnl for deal in closed_cycles) if closed_cycles else 0.0
-        open_deal = ledger.get_open_deal() if ledger else None
-        pnl_unreal = open_deal.unrealized_pnl if open_deal else 0.0
+        open_cycle = ledger.active_cycle if ledger else None
+        pnl_unreal = (
+            open_cycle.unrealized_pnl_quote
+            if open_cycle and open_cycle.status.value == "OPEN"
+            else 0.0
+        )
         trades_closed = len(closed_cycles)
         last_exit = self._trade_executor.last_exit_reason if self._trade_executor else None
         self.summary_label.setText(
@@ -1772,13 +1782,22 @@ class MainWindow(QMainWindow):
 
     def _update_scoreboard(self) -> None:
         ledger = self._trade_executor.ledger if self._trade_executor else None
-        closed_deals = ledger.list_closed_deals(limit=1000) if ledger else []
-        wins = sum(1 for deal in closed_deals if deal.realized_pnl > 0)
-        total = len(closed_deals)
+        cycles = ledger.cycles if ledger else []
+        closed_cycles = [cycle for cycle in cycles if cycle.status.value == "CLOSED"]
+        wins = sum(1 for cycle in closed_cycles if (cycle.realized_pnl_quote or 0.0) > 0)
+        total = len(closed_cycles)
         winrate = (wins / total) * 100.0 if total else 0.0
-        pnl_realized = sum(deal.realized_pnl for deal in closed_deals) if closed_deals else 0.0
-        open_deal = ledger.get_open_deal() if ledger else None
-        pnl_unreal = open_deal.unrealized_pnl if open_deal else 0.0
+        pnl_realized = (
+            sum(cycle.realized_pnl_quote for cycle in closed_cycles)
+            if closed_cycles
+            else 0.0
+        )
+        open_cycle = ledger.active_cycle if ledger else None
+        pnl_unreal = (
+            open_cycle.unrealized_pnl_quote
+            if open_cycle and open_cycle.status.value == "OPEN"
+            else 0.0
+        )
         self.winrate_value_label.setText(f"{winrate:>5.1f}%")
         self.pnl_realized_value_label.setText(self._fmt_pnl(pnl_realized, width=10))
         self.pnl_unreal_value_label.setText(self._fmt_pnl(pnl_unreal, width=10))
@@ -1821,29 +1840,23 @@ class MainWindow(QMainWindow):
     def _append_fill_row(self, entry: dict) -> None:
         row = self._fill_row_values(entry)
         items = [QStandardItem(value) for value in row]
-        for idx, item in enumerate(items):
-            if idx == 9:
-                item.setTextAlignment(
-                    Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
-                )
-                item.setText(self._elide_text(item.text(), self.fills_table, idx))
-                item.setToolTip(row[idx])
-            else:
-                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        for item in items:
+            item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
         self.fills_model.appendRow(items)
 
     def _fill_row_values(self, entry: dict) -> list[str]:
         return [
-            self._format_time_s(entry.get("opened_ts")),
+            self._format_time_s(entry.get("time_open")),
+            str(entry.get("cycle_id", "—")),
             entry.get("direction", "—"),
             self._fmt_price(entry.get("entry_avg"), width=12),
             self._fmt_price(entry.get("exit_avg"), width=12),
-            self._fmt_qty(entry.get("qty"), width=8),
+            self._fmt_qty(entry.get("executed_qty"), width=10),
+            self._fmt_qty(entry.get("closed_qty"), width=10),
+            self._fmt_qty(entry.get("remaining_qty"), width=10),
             str(entry.get("status", "—")),
             self._fmt_pnl(entry.get("realized_pnl"), width=12),
             self._fmt_pnl(entry.get("unreal_pnl"), width=12),
-            str(entry.get("ticks_profit", "—")),
-            str(entry.get("tag", "—")),
         ]
 
     def _refresh_trade_ledger_table(self) -> None:
@@ -1854,17 +1867,7 @@ class MainWindow(QMainWindow):
             return
         self._last_ledger_table_ts = now
         ledger = self._trade_executor.ledger
-        rows: list[dict] = []
-        open_deal = ledger.get_open_deal()
-        if open_deal:
-            rows.append(self._deal_row(open_deal))
-        closed_deals = sorted(
-            ledger.list_closed_deals(limit=200),
-            key=lambda deal: deal.closed_ts or deal.opened_ts or 0,
-            reverse=True,
-        )
-        for deal in closed_deals:
-            rows.append(self._deal_row(deal))
+        rows = ledger.get_cycle_rows(limit=200)
         self._fills_history = rows
         self.fills_model.removeRows(0, self.fills_model.rowCount())
         for entry in rows:
