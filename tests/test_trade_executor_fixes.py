@@ -468,3 +468,78 @@ def test_entry_timeout_not_triggered_in_exit(monkeypatch) -> None:
 
     assert executor._check_wait_deadline(now_s) is False
     assert executor._last_recover_reason is None
+
+
+def test_ensure_exit_orders_skips_sell_when_dust() -> None:
+    price_state = PriceState(
+        bid=9.9,
+        ask=10.0,
+        mid=9.95,
+        source="HTTP",
+        mid_age_ms=10,
+        data_blind=False,
+    )
+    health_state = HealthState(ws_connected=False, ws_age_ms=99999, http_age_ms=10)
+    executor = make_executor(DummyRouter(price_state, health_state))
+    executor._profile.min_notional = 10.0
+    executor._remaining_qty = 0.5
+    executor._entry_avg_price = 10.0
+    executor.position = {"buy_price": 10.0, "qty": 0.5, "opened_ts": 0, "partial": True}
+    executor.active_test_orders = [
+        {
+            "orderId": 10,
+            "side": "BUY",
+            "price": 10.0,
+            "qty": 1.0,
+            "cum_qty": 0.0,
+            "avg_fill_price": 0.0,
+            "status": "NEW",
+            "tag": executor.TAG,
+            "clientOrderId": "test-entry",
+            "cycle_id": 1,
+        }
+    ]
+    executor.entry_active_order_id = 10
+
+    called: list[str] = []
+
+    def fake_place_sell_order(*_args, **_kwargs) -> int:
+        called.append("sell")
+        return 1
+
+    executor._place_sell_order = fake_place_sell_order  # type: ignore[assignment]
+
+    executor._ensure_exit_orders(price_state, health_state)
+
+    assert called == []
+    assert executor._dust_accumulate is True
+
+
+def test_sell_reject_notional_sets_dust_accumulate() -> None:
+    price_state = PriceState(
+        bid=10.0,
+        ask=10.1,
+        mid=10.05,
+        source="HTTP",
+        mid_age_ms=10,
+        data_blind=False,
+    )
+    health_state = HealthState(ws_connected=False, ws_age_ms=99999, http_age_ms=10)
+    executor = make_executor(DummyRouter(price_state, health_state))
+    executor._set_direction("SHORT")
+    executor._executed_qty_total = 1.0
+    executor._entry_avg_price = 10.0
+    executor.position = {"buy_price": 10.0, "qty": 1.0, "opened_ts": 0, "partial": True}
+
+    def fake_place_margin_order(*_args, **_kwargs) -> None:
+        executor._last_place_error_code = -1013
+        executor._last_place_error_msg = "Filter failure: NOTIONAL"
+        return None
+
+    executor._place_margin_order = fake_place_margin_order  # type: ignore[assignment]
+
+    result = executor._place_sell_order(reason="TP", exit_intent="TP")
+
+    assert result == 0
+    assert executor._dust_accumulate is True
+    assert executor.state not in {TradeState.STATE_ERROR, TradeState.STATE_SAFE_STOP}

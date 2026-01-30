@@ -113,3 +113,20 @@ def test_data_blind_false_when_http_fresh_even_if_ws_down(monkeypatch) -> None:
 
     assert price_state.data_blind is False
     assert price_state.source == "HTTP"
+
+
+def test_cache_mid_prevents_data_blind(monkeypatch) -> None:
+    settings = _make_settings(http_fresh_ms=500, ws_fresh_ms=700)
+    router = PriceRouter(settings)
+    router.set_tick_size(0.0001)
+
+    _set_time(monkeypatch, 0.0)
+    router.update_http(1.0, 1.1)
+    router.build_price_state()
+
+    _set_time(monkeypatch, 2000.0)
+    price_state, _ = router.build_price_state()
+
+    assert price_state.from_cache is True
+    assert price_state.data_blind is False
+    assert price_state.source != "NONE"
