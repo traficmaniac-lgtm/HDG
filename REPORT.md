@@ -23,3 +23,4 @@
 - 0.7.30.12: Added trade ledger cycles with realized/unrealized PnL separation, GUI trades table by cycle, and winrate/session stats from closed cycles only.
 - 0.7.30.13: OrderRegistry + cycle_id/role mapping; fills routed deterministically to ledger cycles.
 - 0.7.30.14: Track executed/closed/remaining per cycle, block re-entry until remaining==0, and size exits to remaining.
+- 0.7.30.15: SHORT зеркально LONG; TP/SL по книге; STOP/reconcile deterministic; no wrong-side.
