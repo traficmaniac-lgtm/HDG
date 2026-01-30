@@ -201,9 +201,12 @@ def test_wait_deadline_triggers_recover() -> None:
         logger=lambda _msg, **_kwargs: None,
     )
     executor.state = TradeState.STATE_ENTRY_WORKING
-    executor._wait_state_kind = "ENTRY_WAIT"
-    executor._wait_state_enter_ts_ms = int(time.monotonic() * 1000) - 50
-    executor._wait_state_deadline_ms = 1
+    now = time.monotonic()
+    executor._entry_wait_kind = "ENTRY_WAIT"
+    executor._entry_wait_enter_ts_ms = int(now * 1000) - 50
+    executor._entry_wait_deadline_ms = 1
+    executor._entry_deadline_ts = now - 0.01
+    executor._last_progress_ts = now - 1.0
 
     executor.collect_reconcile_snapshot = lambda: {  # type: ignore[assignment]
         "open_orders": [],
@@ -212,7 +215,7 @@ def test_wait_deadline_triggers_recover() -> None:
     }
 
     assert executor._check_wait_deadline(time.monotonic()) is True
-    assert executor._last_recover_reason == "deadline"
+    assert executor._last_recover_reason == "entry_cancel_missing"
 
 
 def test_recover_places_exit_when_position_open_and_no_exit() -> None:
