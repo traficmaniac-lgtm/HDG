@@ -8,3 +8,4 @@
 - 0.7.30.0: Added dual start buttons (LONG/SHORT). Shared settings. LONG unchanged.
 - 0.7.30.1: UI log is event-only, debug spam moved to file, buffered flush.
 - 0.7.30.2: Fix cross-close pricing, isolate timers, recover respects active exit. Reduce emergency market losses.
+- 0.7.30.3: Fix FSM deadlock: real progress only, hard deadlines, stop interrupt.
