@@ -39,6 +39,7 @@ class TradeExecutor:
     TAG = "PRE_V0_8_0"
     PRICE_MOVE_TICK_THRESHOLD = 1
     MAX_FILL_KEYS = 50_000
+    ORPHAN_FILL_TTL_S = 5.0
     ENTRY_WAIT_DEADLINE_MS = 12000
     ENTRY_CANCEL_TIMEOUT_MS = 5000
     EXIT_MAKER_WAIT_DEADLINE_MS = 3500
@@ -118,6 +119,8 @@ class TradeExecutor:
         self._current_cycle_id: Optional[int] = None
         self._processed_fill_keys: set[tuple[object, ...]] = set()
         self._processed_fill_queue: deque[tuple[object, ...]] = deque()
+        self._orphan_fills: deque[dict[str, object]] = deque()
+        self._orphan_fill_keys: set[tuple[object, ...]] = set()
         self.wins = 0
         self.losses = 0
         self.cycles_target = self._normalize_cycle_target(
@@ -532,9 +535,9 @@ class TradeExecutor:
         self._order_registry.register_new(meta)
         if not self._should_dedup_log(f"order_reg:{client_id}", 0.5):
             self._logger(
-                "[ORDER_REG] "
+                "[REG_ADD] "
                 f"client_id={client_id} role={meta.role.value} cycle={cycle_id} "
-                f"side={side} price={price:.8f} qty={qty:.8f}"
+                f"dir={meta.direction} side={side} price={price:.8f} qty={qty:.8f}"
             )
 
     def _bind_order_meta(self, client_id: str, order_id: Optional[int]) -> None:
@@ -546,6 +549,121 @@ class TradeExecutor:
             self._logger(
                 f"[ORDER_BIND] client_id={client_id} order_id={order_id}"
             )
+        self._rebind_orphan_fills(order_id=order_id, client_order_id=client_id)
+
+    def _log_fill_applied(
+        self,
+        meta: OrderMeta,
+        qty: float,
+        price: float,
+    ) -> None:
+        cycle_id = meta.cycle_id
+        deal = self.ledger.deals_by_cycle_id.get(cycle_id)
+        deal_label = deal.deal_id if deal else cycle_id
+        self._logger(
+            "[FILL_APPLIED] "
+            f"deal={deal_label} role={meta.role.value} dir={meta.direction} "
+            f"qty={qty:.8f} price={price:.8f}"
+        )
+
+    def _stash_orphan_fill(
+        self,
+        order_id: Optional[int],
+        client_order_id: Optional[str],
+        side: str,
+        qty: float,
+        price: float,
+        kind: str,
+        ts_ms: int,
+    ) -> None:
+        if not isinstance(order_id, int):
+            return
+        key = (order_id, kind, round(qty, 12), round(price, 8))
+        if key in self._orphan_fill_keys:
+            return
+        self._orphan_fill_keys.add(key)
+        self._orphan_fills.append(
+            {
+                "order_id": order_id,
+                "client_order_id": client_order_id,
+                "side": side,
+                "qty": qty,
+                "price": price,
+                "kind": kind,
+                "ts_ms": ts_ms,
+                "created_ts": time.monotonic(),
+            }
+        )
+        self._logger(
+            "[FILL_ORPHAN] "
+            f"order_id={order_id} qty={qty:.8f} price={price:.8f}"
+        )
+
+    def _prune_orphan_fills(self) -> None:
+        now = time.monotonic()
+        while self._orphan_fills and now - float(self._orphan_fills[0]["created_ts"]) > self.ORPHAN_FILL_TTL_S:
+            orphan = self._orphan_fills.popleft()
+            key = (
+                orphan.get("order_id"),
+                orphan.get("kind"),
+                round(float(orphan.get("qty") or 0.0), 12),
+                round(float(orphan.get("price") or 0.0), 8),
+            )
+            self._orphan_fill_keys.discard(key)
+
+    def _rebind_orphan_fills(
+        self,
+        order_id: Optional[int] = None,
+        client_order_id: Optional[str] = None,
+    ) -> None:
+        if not self._orphan_fills:
+            return
+        self._prune_orphan_fills()
+        if not self._orphan_fills:
+            return
+        kept: deque[dict[str, object]] = deque()
+        for orphan in self._orphan_fills:
+            orphan_order_id = orphan.get("order_id")
+            orphan_client_id = orphan.get("client_order_id")
+            if order_id is not None and orphan_order_id != order_id and client_order_id is not None:
+                if orphan_client_id != client_order_id:
+                    kept.append(orphan)
+                    continue
+            meta = None
+            if isinstance(orphan_order_id, int):
+                meta = self._order_registry.get_meta_by_order_id(orphan_order_id)
+            if meta is None and isinstance(orphan_client_id, str):
+                meta = self._order_registry.get_meta_by_client_id(orphan_client_id)
+            if meta is None:
+                kept.append(orphan)
+                continue
+            self._logger(
+                "[FILL_REBIND] "
+                f"order_id={orphan_order_id} role={meta.role.value} cycle={meta.cycle_id}"
+            )
+            self._apply_orphan_fill(orphan)
+            key = (
+                orphan.get("order_id"),
+                orphan.get("kind"),
+                round(float(orphan.get("qty") or 0.0), 12),
+                round(float(orphan.get("price") or 0.0), 8),
+            )
+            self._orphan_fill_keys.discard(key)
+        self._orphan_fills = kept
+
+    def _apply_orphan_fill(self, orphan: dict[str, object]) -> None:
+        order_id = orphan.get("order_id")
+        side = str(orphan.get("side") or "UNKNOWN")
+        qty = float(orphan.get("qty") or 0.0)
+        price = float(orphan.get("price") or 0.0)
+        ts_ms = int(orphan.get("ts_ms") or int(time.time() * 1000))
+        kind = str(orphan.get("kind") or "FILLED").upper()
+        if not isinstance(order_id, int):
+            return
+        if kind == "PARTIAL":
+            self.handle_order_partial(order_id, side, qty, price, ts_ms)
+        else:
+            self.handle_order_filled(order_id, side, price, qty, ts_ms)
 
     def _update_registry_status_by_order(
         self,
@@ -842,13 +960,27 @@ class TradeExecutor:
         order_id: Optional[int],
         qty: float,
         price: float,
+        client_order_id: Optional[str] = None,
+        side: Optional[str] = None,
+        kind: str = "FILLED",
+        ts_ms: Optional[int] = None,
     ) -> Optional[OrderMeta]:
         if not isinstance(order_id, int):
             return None
         meta = self._order_registry.get_meta_by_order_id(order_id)
+        if meta is None and client_order_id:
+            meta = self._order_registry.get_meta_by_client_id(client_order_id)
         if meta is None:
-            if not self._should_dedup_log(f"fill_unmapped:{order_id}", 0.5):
-                self._logger(f"[FILL_UNMAPPED] order_id={order_id}")
+            side_label = str(side or "UNKNOWN").upper()
+            self._stash_orphan_fill(
+                order_id=order_id,
+                client_order_id=client_order_id,
+                side=side_label,
+                qty=qty,
+                price=price,
+                kind="PARTIAL" if kind.upper().startswith("PART") else "FILLED",
+                ts_ms=ts_ms or int(time.time() * 1000),
+            )
             return None
         if not self._should_dedup_log(f"fill_map:{order_id}", 0.5):
             self._logger(
@@ -2955,12 +3087,16 @@ class TradeExecutor:
         is_isolated = "TRUE" if self._settings.margin_isolated else "FALSE"
         if order_id:
             self._note_pending_replace(order_id)
-            self._cancel_margin_order(
-                symbol=self._settings.symbol,
+            final_status = self._safe_cancel_and_sync(
                 order_id=order_id,
                 is_isolated=is_isolated,
                 tag=buy_order.get("tag", self.TAG),
             )
+            if final_status in {"FILLED", "PARTIALLY_FILLED"}:
+                return True
+            if final_status in {"CANCELED", "REJECTED", "EXPIRED"}:
+                self._handle_entry_cancel_confirmed(buy_order, order_id, final_status)
+                return True
         start = time.monotonic()
         while time.monotonic() - start < timeout_s:
             time.sleep(0.15)
@@ -4599,55 +4735,27 @@ class TradeExecutor:
             status_label = str(buy_order.get("status") or "").upper()
             if status_label not in {"FILLED", "PARTIALLY_FILLED"}:
                 is_isolated = "TRUE" if self._settings.margin_isolated else "FALSE"
-                cancel_result = False
-                final_status = "UNKNOWN"
-                if order_id in open_orders:
+                attempt_cancel = order_id in open_orders
+                if attempt_cancel:
                     self._note_pending_replace(order_id)
-                    cancel_result = self._cancel_margin_order(
-                        symbol=self._settings.symbol,
-                        order_id=order_id,
-                        is_isolated=is_isolated,
-                        tag=buy_order.get("tag", self.TAG),
-                    )
-                live_order = self._get_margin_order_snapshot(order_id)
-                if live_order:
-                    final_status = str(live_order.get("status") or "").upper()
-                self._logger(
-                    "[ENTRY_REPRICE_CANCEL] "
-                    f"old_id={order_id} new_price={new_price:.8f} "
-                    f"cancel_result={cancel_result} final_status_old={final_status}"
+                final_status = self._safe_cancel_and_sync(
+                    order_id=order_id,
+                    is_isolated=is_isolated,
+                    tag=buy_order.get("tag", self.TAG),
+                    attempt_cancel=attempt_cancel,
                 )
                 if final_status in {"FILLED", "PARTIALLY_FILLED"}:
                     self._logger(
                         "[ENTRY_REPRICE_ABORT] "
                         f"old_id={order_id} status={final_status}"
                     )
-                    if live_order:
-                        executed_qty = float(
-                            live_order.get("executedQty", 0.0)
-                            or live_order.get("executedQuantity", 0.0)
-                            or 0.0
-                        )
-                        cum_quote = float(
-                            live_order.get("cummulativeQuoteQty", 0.0) or 0.0
-                        )
-                        avg_price = 0.0
-                        if executed_qty > 0 and cum_quote > 0:
-                            avg_price = cum_quote / executed_qty
-                        if final_status == "FILLED" and executed_qty > 0:
-                            buy_order["qty"] = executed_qty
-                            buy_order["price"] = avg_price or buy_order.get("price")
-                            buy_order["status"] = "FILLED"
-                            self._apply_order_filled(buy_order)
-                        elif final_status == "PARTIALLY_FILLED" and executed_qty > 0:
-                            self._apply_entry_partial_fill(
-                                order_id, executed_qty, avg_price or None
-                            )
                     self.entry_cancel_pending = False
                     return
                 if final_status in {"CANCELED", "REJECTED", "EXPIRED"}:
                     self.entry_cancel_pending = False
-                elif not cancel_result:
+                elif final_status == "UNKNOWN":
+                    self.entry_cancel_pending = True
+                    self._reset_cancel_wait("ENTRY_CANCEL_WAIT")
                     return
                 else:
                     self.entry_cancel_pending = True
@@ -5342,6 +5450,70 @@ class TradeExecutor:
         self._transition_state(TradeState.STATE_FLAT)
         self._transition_state(TradeState.STATE_IDLE)
 
+    def _resolve_exchange_qty(self, balance: Optional[dict]) -> float:
+        if not balance:
+            return 0.0
+        total = float(balance.get("total", 0.0) or 0.0)
+        borrowed = abs(float(balance.get("borrowed", 0.0) or 0.0))
+        net = abs(float(balance.get("net", 0.0) or 0.0))
+        if self._direction == "SHORT":
+            return max(borrowed, net, total)
+        return total
+
+    def _restore_position_from_exchange(
+        self,
+        exchange_qty: float,
+        entry_avg: Optional[float],
+    ) -> None:
+        if exchange_qty <= self._epsilon_qty():
+            return
+        cycle = self.ledger.active_cycle
+        if not cycle or cycle.status != CycleStatus.OPEN:
+            recovered_avg = (
+                entry_avg
+                or self._entry_avg_price
+                or self._last_buy_price
+                or self.get_buy_price()
+                or 0.0
+            )
+            cycle_id = self.ledger.start_cycle(
+                symbol=self._settings.symbol,
+                direction=self._direction,
+                entry_qty=exchange_qty,
+                entry_avg=recovered_avg,
+                notes="RECOVERED_FROM_EXCHANGE",
+            )
+            self._current_cycle_id = cycle_id
+            self._cycle_id_counter = max(self._cycle_id_counter, cycle_id)
+            self.ledger.on_entry_fill(cycle_id, exchange_qty, recovered_avg or 0.0)
+            cycle = self.ledger.active_cycle
+        if cycle and cycle.status == CycleStatus.OPEN:
+            cycle.notes = "RECOVERED_FROM_EXCHANGE"
+            self._sync_cycle_qty_from_ledger(cycle.cycle_id)
+        self._executed_qty_total = exchange_qty
+        self._closed_qty_total = 0.0
+        self._remaining_qty = exchange_qty
+        recovered_price = entry_avg or self._entry_avg_price or self.get_buy_price()
+        if recovered_price is not None:
+            self._entry_avg_price = recovered_price
+            self._last_buy_price = recovered_price
+        now_ms = int(time.time() * 1000)
+        if self.position is None:
+            self.position = {
+                "buy_price": recovered_price,
+                "qty": exchange_qty,
+                "opened_ts": now_ms,
+                "partial": True,
+                "initial_qty": exchange_qty,
+                "side": self._direction,
+            }
+        else:
+            if recovered_price is not None:
+                self.position["buy_price"] = recovered_price
+            self.position["qty"] = exchange_qty
+            self.position["partial"] = True
+            self.position.setdefault("initial_qty", exchange_qty)
+
     def apply_reconcile_snapshot(self, snapshot: Optional[dict]) -> None:
         try:
             if snapshot is None:
@@ -5356,19 +5528,40 @@ class TradeExecutor:
             if restored:
                 self._logger(f"[RECON_RESTORE] restored_orders={restored}")
             ledger_remaining = 0.0
+            ledger_executed = 0.0
             cycle = self.ledger.active_cycle
             if cycle and cycle.status == CycleStatus.OPEN:
                 ledger_remaining = cycle.remaining_qty
-            exchange_total = float(balance.get("total") or 0.0) if balance else 0.0
+                ledger_executed = cycle.executed_qty
+            exchange_total = self._resolve_exchange_qty(balance)
+            action = "ok"
             if balance and abs(exchange_total - ledger_remaining) > self._epsilon_qty():
-                if not self._should_dedup_log("reconcile_mismatch", 2.0):
-                    self._logger(
-                        "[RECON_MISMATCH] "
-                        f"exchange_qty={exchange_total:.8f} ledger_remaining={ledger_remaining:.8f}"
+                ledger_before = ledger_remaining
+                if exchange_total > self._epsilon_qty() and ledger_remaining <= self._epsilon_qty():
+                    self._restore_position_from_exchange(
+                        exchange_total,
+                        entry_avg=self._entry_avg_price or self.get_buy_price(),
                     )
-                self._trade_hold = True
+                    ledger_remaining = exchange_total
+                    action = "restore"
+                    self._logger(
+                        "[RECON_RESTORE] "
+                        f"exchange_qty={exchange_total:.8f} "
+                        f"ledger_before={ledger_before:.8f} "
+                        f"ledger_after={ledger_remaining:.8f}"
+                    )
+                    self._trade_hold = False
+                else:
+                    action = "hold"
+                    self._trade_hold = True
             else:
                 self._trade_hold = False
+            self._logger(
+                "[RECON] "
+                f"exchange_qty={exchange_total:.8f} "
+                f"ledger_exec={ledger_executed:.8f} ledger_rem={ledger_remaining:.8f} "
+                f"action={action}"
+            )
             if unresolved > 0 and restored == 0:
                 self._reconcile_attempts += 1
                 attempt_label = self._reconcile_attempts
@@ -5551,6 +5744,7 @@ class TradeExecutor:
             if buy_order:
                 self.entry_active_order_id = buy_order.get("orderId")
                 self.entry_active_price = buy_order.get("price")
+        self._rebind_orphan_fills()
         entry_order = self._get_active_entry_order()
         if (
             self.state == TradeState.STATE_ENTRY_WORKING
@@ -5591,13 +5785,26 @@ class TradeExecutor:
         self, order_id: int, side: str, price: float, qty: float, ts_ms: int
     ) -> None:
         self.mark_progress(reason="fill", reset_reconcile=True)
-        meta = self._get_meta_for_fill(order_id, qty, price)
-        if meta is None:
-            return
         order = next(
             (entry for entry in self.active_test_orders if entry.get("orderId") == order_id),
             None,
         )
+        client_order_id = (
+            str(order.get("clientOrderId"))
+            if order and order.get("clientOrderId") is not None
+            else None
+        )
+        meta = self._get_meta_for_fill(
+            order_id,
+            qty,
+            price,
+            client_order_id=client_order_id,
+            side=side,
+            kind="FILLED",
+            ts_ms=ts_ms,
+        )
+        if meta is None:
+            return
         side_upper = str(side).upper()
         cycle_id = meta.cycle_id
         role = meta.role.value
@@ -5605,9 +5812,11 @@ class TradeExecutor:
             if role == "ENTRY":
                 self.ledger.on_entry_fill(cycle_id, qty, price)
                 self._sync_cycle_qty_from_ledger(cycle_id)
+                self._log_fill_applied(meta, qty, price)
             elif role in {"EXIT_TP", "EXIT_CROSS"}:
                 self.ledger.on_exit_fill(cycle_id, qty, price)
                 self._sync_cycle_qty_from_ledger(cycle_id)
+                self._log_fill_applied(meta, qty, price)
             self._update_registry_status_by_order(order_id, "FILLED")
             return
         trade_id = self._extract_trade_id(order)
@@ -5632,17 +5841,43 @@ class TradeExecutor:
         avg_price: float,
         ts_ms: int,
     ) -> None:
-        meta = self._get_meta_for_fill(order_id, cum_qty, avg_price)
-        if meta is None:
-            return
         order = next(
             (entry for entry in self.active_test_orders if entry.get("orderId") == order_id),
             None,
         )
-        if order is None:
+        client_order_id = (
+            str(order.get("clientOrderId"))
+            if order and order.get("clientOrderId") is not None
+            else None
+        )
+        meta = self._get_meta_for_fill(
+            order_id,
+            cum_qty,
+            avg_price,
+            client_order_id=client_order_id,
+            side=side,
+            kind="PARTIAL",
+            ts_ms=ts_ms,
+        )
+        if meta is None:
             return
         side_upper = str(side).upper()
         cycle_id = meta.cycle_id
+        if order is None:
+            fill_price = avg_price if avg_price > 0 else 0.0
+            if meta.role == OrderRole.ENTRY:
+                if fill_price > 0:
+                    self.ledger.on_entry_fill(cycle_id, cum_qty, fill_price)
+                    self._sync_cycle_qty_from_ledger(cycle_id)
+                    self._log_fill_applied(meta, cum_qty, fill_price)
+                self._update_registry_status_by_order(order_id, "PARTIAL", cum_qty)
+            elif meta.role in {OrderRole.EXIT_TP, OrderRole.EXIT_CROSS}:
+                if fill_price > 0:
+                    self.ledger.on_exit_fill(cycle_id, cum_qty, fill_price)
+                    self._sync_cycle_qty_from_ledger(cycle_id)
+                    self._log_fill_applied(meta, cum_qty, fill_price)
+                self._update_registry_status_by_order(order_id, "PARTIAL", cum_qty)
+            return
         trade_id = self._extract_trade_id(order)
         if not self._should_process_fill(
             order_id, side_upper, cum_qty, avg_price, cycle_id, trade_id
@@ -5666,6 +5901,7 @@ class TradeExecutor:
                 if fill_price is not None:
                     self.ledger.on_entry_fill(cycle_id, delta, float(fill_price))
                     self._sync_cycle_qty_from_ledger(cycle_id)
+                    self._log_fill_applied(meta, delta, float(fill_price))
                 self._update_registry_status_by_order(order_id, "PARTIAL", delta)
                 if self.position is None:
                     self.position = {
@@ -5748,6 +5984,7 @@ class TradeExecutor:
                 if fill_price is not None:
                     self.ledger.on_exit_fill(cycle_id, delta, float(fill_price))
                     self._sync_cycle_qty_from_ledger(cycle_id)
+                    self._log_fill_applied(meta, delta, float(fill_price))
                 self._update_registry_status_by_order(order_id, "PARTIAL", delta)
                 cycle_label = "—" if cycle_id is None else str(cycle_id)
                 self._logger(
@@ -5817,7 +6054,20 @@ class TradeExecutor:
         price = float(order.get("price") or 0.0)
         side_label = str(side or "UNKNOWN").upper()
         if meta is None:
-            meta = self._get_meta_for_fill(order_id, qty, price)
+            client_order_id = (
+                str(order.get("clientOrderId"))
+                if order.get("clientOrderId") is not None
+                else None
+            )
+            meta = self._get_meta_for_fill(
+                order_id,
+                qty,
+                price,
+                client_order_id=client_order_id,
+                side=side_label,
+                kind="FILLED",
+                ts_ms=int(order.get("updated_ts") or time.time() * 1000),
+            )
         if meta is None:
             return
         cycle_id = meta.cycle_id
@@ -5848,6 +6098,7 @@ class TradeExecutor:
                 self._log_cycle_fill(cycle_id, entry_side, delta, qty)
                 self.ledger.on_entry_fill(cycle_id, delta, price)
                 self._sync_cycle_qty_from_ledger(cycle_id)
+                self._log_fill_applied(meta, delta, price)
             self._reset_buy_retry()
             self._clear_entry_attempt()
             if self.entry_active_order_id == order_id:
@@ -5936,6 +6187,7 @@ class TradeExecutor:
                 if fill_price is not None:
                     self.ledger.on_exit_fill(cycle_id, delta, float(fill_price))
                     self._sync_cycle_qty_from_ledger(cycle_id)
+                    self._log_fill_applied(meta, delta, float(fill_price))
             pnl = self._finalize_close(order)
             self.last_exit_reason = exit_reason
             if exit_reason in {"TP_MAKER", "TP_FORCE", "TP_CROSS", "SL_HARD"}:
@@ -5968,7 +6220,14 @@ class TradeExecutor:
         if qty <= 0:
             return
         entry_side = self._entry_side()
-        meta = self._get_meta_for_fill(order_id, qty, price or 0.0)
+        meta = self._get_meta_for_fill(
+            order_id,
+            qty,
+            price or 0.0,
+            side=entry_side,
+            kind="PARTIAL",
+            ts_ms=int(time.time() * 1000),
+        )
         if meta is None:
             return
         cycle_id = meta.cycle_id
@@ -5985,6 +6244,7 @@ class TradeExecutor:
         if price is not None:
             self.ledger.on_entry_fill(cycle_id, qty, float(price))
             self._sync_cycle_qty_from_ledger(cycle_id)
+            self._log_fill_applied(meta, qty, float(price))
             self._update_registry_status_by_order(order_id, "PARTIAL", qty)
         self._reset_buy_retry()
         self._clear_entry_attempt()
@@ -6212,13 +6472,15 @@ class TradeExecutor:
         is_isolated = "TRUE" if self._settings.margin_isolated else "FALSE"
         self._logger(f"[SELL_CANCEL] reason={reason} id={order_id}")
         self._note_pending_replace(order_id)
-        self._cancel_margin_order(
-            symbol=self._settings.symbol,
+        final_status = self._safe_cancel_and_sync(
             order_id=order_id,
             is_isolated=is_isolated,
             tag=sell_order.get("tag", self.TAG) if sell_order else self.TAG,
         )
         self.sell_active_order_id = None
+        if final_status in {"FILLED", "PARTIALLY_FILLED"}:
+            self.sell_cancel_pending = False
+            return
         self.sell_cancel_pending = True
         self._reset_cancel_wait("EXIT_CANCEL_WAIT")
 
@@ -6232,12 +6494,15 @@ class TradeExecutor:
                 is_isolated = "TRUE" if self._settings.margin_isolated else "FALSE"
                 if order_id:
                     self._logger(f"[SL_OVERRIDE] cancel_sell id={order_id}")
-                    self._cancel_margin_order(
-                        symbol=self._settings.symbol,
+                    final_status = self._safe_cancel_and_sync(
                         order_id=order_id,
                         is_isolated=is_isolated,
                         tag=sell_order.get("tag", self.TAG),
                     )
+                    if final_status in {"FILLED", "PARTIALLY_FILLED"}:
+                        self.sell_active_order_id = None
+                        self.sell_cancel_pending = False
+                        return
                 self.sell_active_order_id = None
                 self.sell_cancel_pending = False
         self._place_sell_order(
@@ -6259,12 +6524,15 @@ class TradeExecutor:
                 is_isolated = "TRUE" if self._settings.margin_isolated else "FALSE"
                 if order_id:
                     self._logger(f"[TP_FORCE] cancel_sell id={order_id}")
-                    self._cancel_margin_order(
-                        symbol=self._settings.symbol,
+                    final_status = self._safe_cancel_and_sync(
                         order_id=order_id,
                         is_isolated=is_isolated,
                         tag=sell_order.get("tag", self.TAG),
                     )
+                    if final_status in {"FILLED", "PARTIALLY_FILLED"}:
+                        self.sell_active_order_id = None
+                        self.sell_cancel_pending = False
+                        return
                 self.sell_active_order_id = None
                 self.sell_cancel_pending = False
         self._set_exit_intent("TP", mid=None, force=True)
@@ -6928,6 +7196,67 @@ class TradeExecutor:
             self._logger(f"[TRADE] get_order error: {exc} tag={self.TAG}")
         return None
 
+    def _apply_snapshot_fill(self, order_id: int, status: str, snapshot: dict) -> None:
+        status_label = str(status).upper()
+        side = str(snapshot.get("side") or "UNKNOWN")
+        executed_qty = float(
+            snapshot.get("executedQty", 0.0)
+            or snapshot.get("executedQuantity", 0.0)
+            or 0.0
+        )
+        cumulative_quote = snapshot.get("cumulativeQuoteQty", snapshot.get("cummulativeQuoteQty"))
+        cumulative_quote_qty = (
+            float(cumulative_quote)
+            if cumulative_quote is not None
+            else float(snapshot.get("cumulativeQuoteQty", 0.0) or 0.0)
+        )
+        avg_price = float(snapshot.get("avgPrice", 0.0) or 0.0)
+        if executed_qty > 0 and cumulative_quote_qty > 0:
+            avg_price = cumulative_quote_qty / executed_qty
+        ts_ms = int(time.time() * 1000)
+        if status_label == "FILLED":
+            fill_qty = executed_qty
+            if fill_qty <= 0:
+                fill_qty = float(snapshot.get("origQty", 0.0) or snapshot.get("quantity", 0.0))
+            fill_price = avg_price if avg_price > 0 else float(snapshot.get("price", 0.0) or 0.0)
+            if fill_qty > 0:
+                self.handle_order_filled(order_id, side, fill_price, fill_qty, ts_ms)
+        elif status_label == "PARTIALLY_FILLED":
+            if executed_qty > 0:
+                self.handle_order_partial(order_id, side, executed_qty, avg_price, ts_ms)
+
+    def _safe_cancel_and_sync(
+        self,
+        order_id: int,
+        is_isolated: str,
+        tag: str,
+        attempt_cancel: bool = True,
+    ) -> str:
+        cancel_ok = False
+        code = None
+        if attempt_cancel:
+            cancel_ok, code = self._cancel_margin_order_with_code(
+                symbol=self._settings.symbol,
+                order_id=order_id,
+                is_isolated=is_isolated,
+                tag=tag,
+            )
+        final_status = "CANCELED" if cancel_ok else "UNKNOWN"
+        snapshot = None
+        if not cancel_ok or not attempt_cancel or code == -2011:
+            snapshot = self._get_margin_order_snapshot(order_id)
+        if snapshot:
+            final_status = str(snapshot.get("status") or "").upper()
+            if final_status in {"FILLED", "PARTIALLY_FILLED"}:
+                self._apply_snapshot_fill(order_id, final_status, snapshot)
+            elif final_status in {"CANCELED", "REJECTED", "EXPIRED"}:
+                self._update_registry_status_by_order(order_id, final_status)
+        self._logger(
+            "[CANCEL_SYNC] "
+            f"order_id={order_id} cancel_ok={cancel_ok} final_status={final_status}"
+        )
+        return final_status
+
     def _cancel_margin_order(
         self,
         symbol: str,
@@ -7140,6 +7469,8 @@ class TradeExecutor:
             "asset": base_asset,
             "free": free,
             "locked": locked,
+            "borrowed": float(base_state.get("borrowed", 0.0) or 0.0),
+            "net": float(base_state.get("netAsset", 0.0) or 0.0),
             "total": total,
         }
 
