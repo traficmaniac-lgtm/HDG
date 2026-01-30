@@ -1065,6 +1065,34 @@ class TradeExecutor:
             f"[CYCLE_FILL] id={cycle_label} side={side} delta={delta:.8f} cum={cum:.8f}"
         )
 
+    def _sync_cycle_qty_from_ledger(self, cycle_id: Optional[int]) -> Optional[object]:
+        cycle = self.ledger.get_cycle(cycle_id)
+        if cycle is None or cycle.status != CycleStatus.OPEN:
+            return None
+        self._executed_qty_total = cycle.executed_qty
+        self._closed_qty_total = cycle.closed_qty
+        self._remaining_qty = cycle.remaining_qty
+        self._aggregate_sold_qty = cycle.closed_qty
+        if cycle.entry_avg > 0:
+            self._entry_avg_price = cycle.entry_avg
+            self._last_buy_price = cycle.entry_avg
+        return cycle
+
+    def _entry_blocked_by_active_position(self) -> bool:
+        cycle = self.ledger.active_cycle
+        if (
+            cycle
+            and cycle.status == CycleStatus.OPEN
+            and cycle.remaining_qty > self._epsilon_qty()
+        ):
+            if not self._should_dedup_log("entry_blocked_active_pos", 1.0):
+                self._logger(
+                    "[ENTRY_BLOCKED_ACTIVE_POS] "
+                    f"cycle={cycle.cycle_id} rem={cycle.remaining_qty:.8f}"
+                )
+            return True
+        return False
+
     def _log_cycle_close(
         self,
         cycle_id: Optional[int],
@@ -1223,41 +1251,22 @@ class TradeExecutor:
         self._last_pos_snapshot = snapshot
 
     def _reconcile_position_from_fills(self) -> None:
+        cycle = self.ledger.active_cycle
         executed = 0.0
         closed = 0.0
-        entry_notional = 0.0
-        entry_side = self._entry_side()
-        exit_side = self._exit_side()
-        for order in self.active_test_orders:
-            side = str(order.get("side") or "").upper()
-            cum_qty = float(order.get("cum_qty") or 0.0)
-            if cum_qty <= 0:
-                continue
-            if side == entry_side:
-                executed += cum_qty
-                avg_price = float(order.get("avg_fill_price") or 0.0)
-                if avg_price <= 0:
-                    avg_price = float(order.get("price") or 0.0)
-                if avg_price > 0:
-                    entry_notional += avg_price * cum_qty
-            elif side == exit_side:
-                closed += cum_qty
-
+        remaining = 0.0
         entry_avg = None
-        if executed > 0 and entry_notional > 0:
-            entry_avg = entry_notional / executed
-        elif executed > 0:
+        if cycle and cycle.status == CycleStatus.OPEN:
+            executed = cycle.executed_qty
+            closed = cycle.closed_qty
+            remaining = cycle.remaining_qty
+            entry_avg = cycle.entry_avg if cycle.entry_avg > 0 else None
+        else:
+            executed = self._executed_qty_total
+            closed = self._closed_qty_total
+            remaining = self._remaining_qty
             entry_avg = self._entry_avg_price or self.get_buy_price()
-        remaining_override = None
-        if executed == 0 and self.position is not None:
-            executed = float(self.position.get("initial_qty") or self.position.get("qty") or 0.0)
-            entry_avg = self.position.get("buy_price") or self._entry_avg_price or self.get_buy_price()
-            remaining_override = float(self.position.get("qty") or executed)
-            closed = max(executed - remaining_override, 0.0)
 
-        remaining = max(executed - closed, 0.0)
-        if remaining_override is not None:
-            remaining = max(remaining_override, 0.0)
         self._executed_qty_total = executed
         self._closed_qty_total = closed
         self._remaining_qty = remaining
@@ -1265,7 +1274,6 @@ class TradeExecutor:
         if entry_avg is not None:
             self._entry_avg_price = entry_avg
             self._last_buy_price = entry_avg
-
         if executed > self._epsilon_qty():
             now_ms = int(time.time() * 1000)
             if self.position is None:
@@ -1284,13 +1292,10 @@ class TradeExecutor:
                 if not self.position.get("opened_ts"):
                     self.position["opened_ts"] = now_ms
                 self.position["initial_qty"] = executed
-
-        if executed > 0:
             base_qty = executed
             if self._profile.step_size:
                 base_qty = self._round_down(base_qty, self._profile.step_size)
             self.position_qty_base = base_qty
-
         self._log_position_state(executed, closed, remaining, entry_avg)
 
     def _compute_tp_sl_prices(
@@ -1610,6 +1615,9 @@ class TradeExecutor:
         if self._inflight_trade_action:
             self.last_action = "inflight"
             return 0
+        if self._entry_blocked_by_active_position():
+            self.last_action = "entry_blocked_active_pos"
+            return 0
         self._inflight_trade_action = True
         inflight_ms = int(getattr(self._settings, "inflight_deadline_ms", 2500))
         self._entry_inflight_deadline_ts = time.monotonic() + (inflight_ms / 1000.0)
@@ -1891,6 +1899,9 @@ class TradeExecutor:
             self._logger(f"[START_IGNORED] reason=state={self.state.value}")
             self._clear_start_inflight()
             return 0
+        if self._entry_blocked_by_active_position():
+            self._clear_start_inflight()
+            return 0
         self.run_active = True
         self.cycles_done = 0
         self.cycles_target = self._normalize_cycle_target(self._settings.cycle_count)
@@ -1977,6 +1988,8 @@ class TradeExecutor:
 
     def _attempt_cycle_start(self) -> int:
         if self.state != TradeState.STATE_IDLE:
+            return 0
+        if self._entry_blocked_by_active_position():
             return 0
         if not self._purge_open_orders_before_cycle():
             self._logger("[PRECHECK] open_orders_not_cleared -> SAFE_STOP")
@@ -2318,6 +2331,29 @@ class TradeExecutor:
         if price_ref is not None:
             notional = qty_to_sell * price_ref
             carry_notional = remaining_qty * price_ref
+        if (
+            min_notional is not None
+            and min_notional > 0
+            and notional is not None
+            and notional < min_notional
+        ):
+            self._dust_accumulate = False
+            cycle = self.ledger.active_cycle
+            if cycle and cycle.status == CycleStatus.OPEN:
+                if "DUST_REMAINING" not in (cycle.notes or ""):
+                    cycle.notes = f"{cycle.notes},DUST_REMAINING" if cycle.notes else "DUST_REMAINING"
+                close_threshold = self._profile.step_size * 1.01 if self._profile.step_size else 0.0
+                if cycle.remaining_qty <= close_threshold:
+                    self._finalize_partial_close(reason="DUST_REMAINING")
+                    return
+                if not self._should_dedup_log("exit_blocked_min_notional", 1.0):
+                    notional_label = "?" if notional is None else f"{notional:.8f}"
+                    self._logger(
+                        "[EXIT_BLOCKED_MINNOTIONAL] "
+                        f"cycle={cycle.cycle_id} rem={cycle.remaining_qty:.8f} "
+                        f"notional={notional_label} min_notional={min_notional:.8f}"
+                    )
+            return
         if self._should_carry_dust(remaining_qty, carry_notional, min_notional):
             if carry_notional is not None:
                 self._apply_dust_carry(remaining_qty, carry_notional)
@@ -2969,10 +3005,15 @@ class TradeExecutor:
                 active_sell_order is not None
                 and not self._sell_order_is_final(active_sell_order)
             )
-            if qty <= 0 or remaining_qty_raw <= self._get_step_size_tolerance():
-                if remaining_qty_raw <= self._get_step_size_tolerance() and not active_sell_pending:
+            tolerance = self._get_step_size_tolerance()
+            if qty <= 0 or remaining_qty_raw <= tolerance:
+                if (
+                    remaining_qty_raw <= tolerance
+                    and not active_sell_pending
+                    and self._executed_qty_total > self._epsilon_qty()
+                ):
                     self._logger("[SELL_ALREADY_CLOSED_BY_PARTIAL]")
-                    self._finalize_partial_close(reason="PARTIAL")
+                    self._finalize_partial_close(reason="REMAINING_ZERO")
                 return 0
             self._log_trade_snapshot(reason=f"sell_place:{intent}")
             if self._profile.min_qty and qty < self._profile.min_qty:
@@ -2989,6 +3030,34 @@ class TradeExecutor:
                 self.last_action = "partial_too_small"
                 return 0
             price_ref = self._resolve_dust_reference_price(bid, ask, mid, self._entry_avg_price)
+            notional = None if price_ref is None else qty * price_ref
+            min_notional = self._profile.min_notional
+            if (
+                min_notional is not None
+                and min_notional > 0
+                and notional is not None
+                and notional < min_notional
+            ):
+                self._dust_accumulate = False
+                cycle = self.ledger.active_cycle
+                if cycle and cycle.status == CycleStatus.OPEN:
+                    if "DUST_REMAINING" not in (cycle.notes or ""):
+                        cycle.notes = f"{cycle.notes},DUST_REMAINING" if cycle.notes else "DUST_REMAINING"
+                    if self._profile.step_size:
+                        close_threshold = self._profile.step_size * 1.01
+                    else:
+                        close_threshold = 0.0
+                    if cycle.remaining_qty <= close_threshold:
+                        self._finalize_partial_close(reason="DUST_REMAINING")
+                        return 0
+                    if not self._should_dedup_log("exit_blocked_min_notional", 1.0):
+                        notional_label = f"{notional:.8f}" if notional is not None else "?"
+                        self._logger(
+                            "[EXIT_BLOCKED_MINNOTIONAL] "
+                            f"cycle={cycle.cycle_id} rem={cycle.remaining_qty:.8f} "
+                            f"notional={notional_label} min_notional={min_notional:.8f}"
+                        )
+                return 0
             notional = None if price_ref is None else remaining_qty_raw * price_ref
             if self._should_carry_dust(remaining_qty_raw, notional, self._profile.min_notional):
                 if notional is not None:
@@ -4887,12 +4956,26 @@ class TradeExecutor:
         remaining: float,
         entry_avg: Optional[float],
     ) -> None:
-        self._executed_qty_total = executed
-        self._closed_qty_total = closed
-        self._remaining_qty = remaining
-        if entry_avg is not None:
-            self._entry_avg_price = entry_avg
-            self._last_buy_price = entry_avg
+        cycle = self.ledger.active_cycle
+        if cycle and cycle.status == CycleStatus.OPEN:
+            executed = cycle.executed_qty
+            closed = cycle.closed_qty
+            remaining = cycle.remaining_qty
+            if cycle.entry_avg > 0:
+                entry_avg = cycle.entry_avg
+            self._executed_qty_total = executed
+            self._closed_qty_total = closed
+            self._remaining_qty = remaining
+            if entry_avg is not None:
+                self._entry_avg_price = entry_avg
+                self._last_buy_price = entry_avg
+        else:
+            self._executed_qty_total = executed
+            self._closed_qty_total = closed
+            self._remaining_qty = remaining
+            if entry_avg is not None:
+                self._entry_avg_price = entry_avg
+                self._last_buy_price = entry_avg
         if remaining > self._epsilon_qty():
             now_ms = int(time.time() * 1000)
             if self.position is None:
@@ -5468,8 +5551,10 @@ class TradeExecutor:
         if order is None:
             if role == "ENTRY":
                 self.ledger.on_entry_fill(cycle_id, qty, price)
+                self._sync_cycle_qty_from_ledger(cycle_id)
             elif role in {"EXIT_TP", "EXIT_CROSS"}:
                 self.ledger.on_exit_fill(cycle_id, qty, price)
+                self._sync_cycle_qty_from_ledger(cycle_id)
             self._update_registry_status_by_order(order_id, "FILLED")
             return
         trade_id = self._extract_trade_id(order)
@@ -5527,6 +5612,7 @@ class TradeExecutor:
                 fill_price = avg_price if avg_price > 0 else order.get("price")
                 if fill_price is not None:
                     self.ledger.on_entry_fill(cycle_id, delta, float(fill_price))
+                    self._sync_cycle_qty_from_ledger(cycle_id)
                 self._update_registry_status_by_order(order_id, "PARTIAL", delta)
                 if self.position is None:
                     self.position = {
@@ -5608,6 +5694,7 @@ class TradeExecutor:
                 fill_price = avg_price if avg_price > 0 else order.get("price")
                 if fill_price is not None:
                     self.ledger.on_exit_fill(cycle_id, delta, float(fill_price))
+                    self._sync_cycle_qty_from_ledger(cycle_id)
                 self._update_registry_status_by_order(order_id, "PARTIAL", delta)
                 cycle_label = "—" if cycle_id is None else str(cycle_id)
                 self._logger(
@@ -5707,6 +5794,7 @@ class TradeExecutor:
             if delta > 0:
                 self._log_cycle_fill(cycle_id, entry_side, delta, qty)
                 self.ledger.on_entry_fill(cycle_id, delta, price)
+                self._sync_cycle_qty_from_ledger(cycle_id)
             self._reset_buy_retry()
             self._clear_entry_attempt()
             if self.entry_active_order_id == order_id:
@@ -5794,6 +5882,7 @@ class TradeExecutor:
                 self._log_cycle_fill(cycle_id, exit_side, delta, qty)
                 if fill_price is not None:
                     self.ledger.on_exit_fill(cycle_id, delta, float(fill_price))
+                    self._sync_cycle_qty_from_ledger(cycle_id)
             pnl = self._finalize_close(order)
             self.last_exit_reason = exit_reason
             if exit_reason in {"TP_MAKER", "TP_FORCE", "TP_CROSS", "SL_HARD"}:
@@ -5842,6 +5931,7 @@ class TradeExecutor:
         self._log_cycle_fill(cycle_id, entry_side, qty, qty)
         if price is not None:
             self.ledger.on_entry_fill(cycle_id, qty, float(price))
+            self._sync_cycle_qty_from_ledger(cycle_id)
             self._update_registry_status_by_order(order_id, "PARTIAL", qty)
         self._reset_buy_retry()
         self._clear_entry_attempt()
@@ -5941,6 +6031,10 @@ class TradeExecutor:
         return self._resolve_remaining_qty_raw()
 
     def _resolve_remaining_qty_raw(self) -> float:
+        cycle = self.ledger.active_cycle
+        if cycle and cycle.status == CycleStatus.OPEN:
+            self._sync_cycle_qty_from_ledger(cycle.cycle_id)
+            return max(cycle.remaining_qty, 0.0)
         if self._executed_qty_total > 0 or self._closed_qty_total > 0:
             remaining_qty = self._executed_qty_total - self._closed_qty_total
             return max(remaining_qty, 0.0)
@@ -6154,8 +6248,6 @@ class TradeExecutor:
         delta = max(cum_qty - prev_cum, 0.0)
         if delta > 0:
             self._aggregate_sold_qty += delta
-            self._closed_qty_total += delta
-            self._remaining_qty = max(self._executed_qty_total - self._closed_qty_total, 0.0)
         order["cum_qty"] = cum_qty
         order["sell_executed_qty"] = cum_qty
         if self.position is not None:
