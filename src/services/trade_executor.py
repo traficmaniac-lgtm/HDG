@@ -6,6 +6,7 @@ import time
 from collections import deque
 from decimal import Decimal, ROUND_FLOOR
 from enum import Enum
+from threading import Lock
 from typing import Callable, Optional
 
 import httpx
@@ -190,6 +191,9 @@ class TradeExecutor:
         self._order_roles: dict[int, dict] = {}
         self._last_entry_wait_payload: Optional[tuple[object, ...]] = None
         self._dust_accumulate = False
+        self._dust_carry_qty = 0.0
+        self._start_inflight = False
+        self._start_inflight_lock = Lock()
 
     @staticmethod
     def _normalize_direction(direction: Optional[str]) -> str:
@@ -209,6 +213,66 @@ class TradeExecutor:
 
     def _exit_side(self) -> str:
         return "BUY" if self._direction == "SHORT" else "SELL"
+
+    def _entry_role_tag(self) -> str:
+        return f"ENTRY_{self._direction}"
+
+    def _exit_role_tag(self) -> str:
+        return f"EXIT_{self._direction}"
+
+    def _set_start_inflight(self) -> bool:
+        with self._start_inflight_lock:
+            if self._start_inflight:
+                return False
+            self._start_inflight = True
+            return True
+
+    def _clear_start_inflight(self) -> None:
+        with self._start_inflight_lock:
+            self._start_inflight = False
+
+    def _apply_dust_carry_to_entry_qty(self, base_qty: float) -> float:
+        if not self._profile.step_size:
+            return base_qty
+        if self._direction != "LONG":
+            return self._round_down(base_qty, self._profile.step_size)
+        carry_qty = self._dust_carry_qty
+        if carry_qty <= self._epsilon_qty():
+            return self._round_down(base_qty, self._profile.step_size)
+        combined = base_qty + carry_qty
+        rounded = self._round_to_step(combined, self._profile.step_size)
+        self._dust_carry_qty = 0.0
+        self._logger(f"[DUST_CARRY_APPLIED] carry_used={carry_qty:.8f}")
+        return rounded
+
+    def _should_carry_dust(
+        self,
+        remaining_qty: float,
+        notional: Optional[float],
+        min_notional: Optional[float],
+    ) -> bool:
+        if remaining_qty <= self._epsilon_qty():
+            return False
+        if not self._profile.step_size or self._profile.step_size <= 0:
+            return False
+        if remaining_qty > (self._profile.step_size * 1.01):
+            return False
+        if min_notional is None or min_notional <= 0:
+            return False
+        if notional is None or notional >= min_notional:
+            return False
+        return True
+
+    def _apply_dust_carry(self, remaining_qty: float, notional: float) -> None:
+        self._dust_accumulate = False
+        self._dust_carry_qty += remaining_qty
+        self._remaining_qty = 0.0
+        self._logger(
+            "[DUST_CARRY] "
+            f"carry_qty={self._dust_carry_qty:.8f} added={remaining_qty:.8f} "
+            f"notional={notional:.8f}"
+        )
+        self._finalize_partial_close(reason="DUST_CARRY")
 
     def _position_side(self) -> str:
         if self.position is not None:
@@ -991,8 +1055,32 @@ class TradeExecutor:
         if position_side == "SHORT":
             return None
         target_price = entry_price + ticks * tick_size
-        follow_price = best_ask - tick_size
-        raw_price = max(follow_price, target_price)
+        raw_price = max(best_ask, target_price)
+        rounded = TradeExecutor._round_to_step(raw_price, tick_size)
+        if rounded < tick_size:
+            rounded = tick_size
+        return rounded
+
+    def _tp_follow_top_price_buy(
+        self,
+        entry_price: Optional[float],
+        best_bid: Optional[float],
+        tick_size: Optional[float],
+        ticks: int,
+        position_side: str,
+    ) -> Optional[float]:
+        if (
+            entry_price is None
+            or best_bid is None
+            or tick_size is None
+            or tick_size <= 0
+            or ticks <= 0
+        ):
+            return None
+        if position_side != "SHORT":
+            return None
+        target_price = entry_price - ticks * tick_size
+        raw_price = min(best_bid, target_price)
         rounded = TradeExecutor._round_to_step(raw_price, tick_size)
         if rounded < tick_size:
             rounded = tick_size
@@ -1328,7 +1416,8 @@ class TradeExecutor:
                 self.last_action = "budget_blocked"
                 self.orders_count = 0
                 return 0
-            qty = self._round_down(order_quote / entry_price, self._profile.step_size)
+            base_qty = order_quote / entry_price
+            qty = self._apply_dust_carry_to_entry_qty(base_qty)
 
             if qty <= 0:
                 self._logger(f"[TRADE] place_test_orders | qty <= 0 tag={self.TAG}")
@@ -1374,7 +1463,7 @@ class TradeExecutor:
             timestamp = int(time.time() * 1000)
             self._begin_cycle_entry(now_ms=timestamp)
             entry_client_id = self._build_client_order_id(
-                entry_side, timestamp, role_tag="ENTRY"
+                entry_side, timestamp, role_tag=self._entry_role_tag()
             )
             order_type = self._normalize_order_type(self._settings.order_type)
             if order_type == "MARKET":
@@ -1429,6 +1518,7 @@ class TradeExecutor:
             entry_order_id = entry_order.get("orderId")
             if isinstance(entry_order_id, int):
                 self._cycle_order_ids.add(entry_order_id)
+                self._clear_start_inflight()
             self._transition_state(TradeState.STATE_ENTRY_WORKING)
             self._reset_buy_retry()
             self._start_buy_wait()
@@ -1472,13 +1562,22 @@ class TradeExecutor:
             self._entry_inflight_deadline_ts = None
 
     def start_cycle_run(self, direction: str = "LONG") -> int:
+        if not self._set_start_inflight():
+            self._logger("[START_IGNORED] reason=inflight")
+            return 0
         self._set_direction(direction)
         self._logger(f"[START] {self._direction_tag()}")
+        if self.state != TradeState.STATE_IDLE:
+            self._logger(f"[START_IGNORED] reason=state={self.state.value}")
+            self._clear_start_inflight()
+            return 0
         self.run_active = True
         self.cycles_done = 0
         self.cycles_target = self._normalize_cycle_target(self._settings.cycle_count)
         self._next_cycle_ready_ts = None
         placed = self._attempt_cycle_start()
+        if not placed:
+            self._clear_start_inflight()
         if not placed:
             self._next_cycle_ready_ts = time.monotonic() + self._cycle_cooldown_s
             self._logger("[CYCLE_START] delayed: waiting for next cycle window")
@@ -1488,6 +1587,7 @@ class TradeExecutor:
         self.stop_requested = True
         self.run_active = False
         self._next_cycle_ready_ts = None
+        self._clear_start_inflight()
         self._logger(f"[STOP_REQUEST] reason={reason}")
         self._handle_stop_interrupt(reason=reason)
 
@@ -1516,6 +1616,7 @@ class TradeExecutor:
             return False
         self.run_active = False
         self._next_cycle_ready_ts = None
+        self._clear_start_inflight()
         self._logger(f"[STOP_INTERRUPT] reason={reason}")
         self._transition_state(TradeState.STATE_STOPPING)
         self._cancel_open_orders(open_orders)
@@ -1789,9 +1890,9 @@ class TradeExecutor:
         sl_triggered = False
         if sl_price is not None:
             if position_side == "SHORT":
-                sl_triggered = ask is not None and ask >= sl_price
+                sl_triggered = bid is not None and bid >= sl_price
             else:
-                sl_triggered = bid is not None and bid <= sl_price
+                sl_triggered = ask is not None and ask <= sl_price
         if sl_triggered:
             self._logger(
                 "[SELL_PLAN] "
@@ -1819,24 +1920,23 @@ class TradeExecutor:
         elapsed_ms = int((now - self._tp_maker_started_ts) * 1000.0)
         cross_after_ms = int(getattr(self._settings, "tp_cross_after_ms", 900))
         tick_size = self._profile.tick_size
+        tp_triggered = False
+        if tp_price is not None:
+            if position_side == "SHORT":
+                tp_triggered = ask is not None and ask <= tp_price
+            else:
+                tp_triggered = bid is not None and bid >= tp_price
         if tick_size and tp_price is not None and not self._tp_armed:
             arm_level = tp_price - tick_size if position_side != "SHORT" else tp_price + tick_size
-            bid_reached = bid is not None and bid >= arm_level
-            mid_reached = mid is not None and mid >= arm_level
             if position_side == "SHORT":
                 bid_reached = ask is not None and ask <= arm_level
-                mid_reached = mid is not None and mid <= arm_level
-            if bid_reached or mid_reached:
+            else:
+                bid_reached = bid is not None and bid >= arm_level
+            if bid_reached:
                 self._tp_armed = True
         spread_tight = False
         if bid is not None and ask is not None and tick_size:
             spread_tight = (ask - bid) <= tick_size
-        mid_against = False
-        if mid is not None and tick_size and tp_price is not None:
-            if position_side == "SHORT":
-                mid_against = (mid - tp_price) >= tick_size
-            else:
-                mid_against = (tp_price - mid) >= tick_size
         ws_bad = price_state.source == "WS" and self._entry_ws_bad(health_state.ws_connected)
         http_fresh_ms = int(getattr(self._settings, "http_fresh_ms", 1000) or 0)
         http_fresh = (
@@ -1844,11 +1944,9 @@ class TradeExecutor:
             and health_state.http_age_ms <= http_fresh_ms
         )
         cross_reason = None
-        if self._tp_armed:
+        if tp_triggered and self._tp_armed:
             if elapsed_ms >= cross_after_ms:
                 cross_reason = "timeout"
-            elif mid_against:
-                cross_reason = "mid_away"
             elif spread_tight:
                 cross_reason = "tight_spread"
             elif ws_bad and http_fresh:
@@ -1905,8 +2003,14 @@ class TradeExecutor:
         price_ref = self._resolve_dust_reference_price(bid, ask, mid, entry_avg)
         min_notional = self._profile.min_notional
         notional = None
+        carry_notional = None
         if price_ref is not None:
             notional = qty_to_sell * price_ref
+            carry_notional = remaining_qty * price_ref
+        if self._should_carry_dust(remaining_qty, carry_notional, min_notional):
+            if carry_notional is not None:
+                self._apply_dust_carry(remaining_qty, carry_notional)
+            return
         dust_threshold = None
         if min_notional is not None and min_notional > 0:
             dust_threshold = min_notional * 1.05
@@ -2100,13 +2204,18 @@ class TradeExecutor:
 
     @staticmethod
     def _cap_tp_maker_price(
-        side_needed: str, tp_price: Optional[float], best_ask: Optional[float]
+        side_needed: str,
+        tp_price: Optional[float],
+        best_bid: Optional[float],
+        best_ask: Optional[float],
     ) -> Optional[float]:
-        if tp_price is None or best_ask is None:
+        if tp_price is None:
             return tp_price
         side = str(side_needed or "").upper()
-        if side in {"SELL", "BUY"}:
-            return min(tp_price, best_ask)
+        if side == "SELL" and best_ask is not None:
+            return max(tp_price, best_ask)
+        if side == "BUY" and best_bid is not None:
+            return min(tp_price, best_bid)
         return tp_price
 
     def _compute_tp_cross_price(
@@ -2185,7 +2294,7 @@ class TradeExecutor:
     @staticmethod
     def _resolve_exit_policy_buy(intent: str) -> tuple[str, str]:
         if intent == "TP":
-            return "TP_MAKER", "ask"
+            return "TP_MAKER", "bid"
         if intent == "SL":
             return "SL_HARD", "ask"
         return "MANUAL", "bid"
@@ -2513,6 +2622,11 @@ class TradeExecutor:
                 self.last_action = "partial_too_small"
                 return 0
             price_ref = self._resolve_dust_reference_price(bid, ask, mid, self._entry_avg_price)
+            notional = None if price_ref is None else remaining_qty_raw * price_ref
+            if self._should_carry_dust(remaining_qty_raw, notional, self._profile.min_notional):
+                if notional is not None:
+                    self._apply_dust_carry(remaining_qty_raw, notional)
+                return 0
             if self._is_dust_notional(qty, price_ref):
                 min_notional = self._profile.min_notional or 0.0
                 notional_label = "?" if price_ref is None else f"{qty * price_ref:.8f}"
@@ -2609,7 +2723,26 @@ class TradeExecutor:
             if exit_order_type == "LIMIT":
                 if price_override is None:
                     position_side = self._position_side()
-                    if intent == "TP" and position_side != "SHORT":
+                    if intent == "TP" and position_side == "SHORT":
+                        take_profit_ticks = int(self._settings.take_profit_ticks)
+                        sell_price = self._tp_follow_top_price_buy(
+                            entry_price=self.get_buy_price(),
+                            best_bid=bid,
+                            tick_size=tick_size or self._profile.tick_size,
+                            ticks=take_profit_ticks,
+                            position_side=position_side,
+                        )
+                        sell_ref_price = bid
+                        sell_ref_label = "bid"
+                        if (
+                            sell_price is not None
+                            and sell_ref_price is not None
+                            and tick_size
+                            and tick_size > 0
+                        ):
+                            delta_ticks_to_ref = (sell_price - sell_ref_price) / tick_size
+                        exit_policy = "TP_MAKER"
+                    elif intent == "TP" and position_side != "SHORT":
                         take_profit_ticks = int(self._settings.take_profit_ticks)
                         sell_price = self._tp_follow_top_price(
                             entry_price=self.get_buy_price(),
@@ -2643,7 +2776,9 @@ class TradeExecutor:
                 else:
                     sell_price = price_override
                     if intent == "TP" and exit_order_type == "LIMIT":
-                        sell_price = self._cap_tp_maker_price(exit_side, sell_price, ask)
+                        sell_price = self._cap_tp_maker_price(
+                            exit_side, sell_price, bid, ask
+                        )
                         sell_ref_label = "ask"
                         sell_ref_price = ask
                     sell_ref_price = ask if sell_ref_label == "ask" else bid
@@ -2671,13 +2806,7 @@ class TradeExecutor:
 
             is_isolated = "TRUE" if self._settings.margin_isolated else "FALSE"
             timestamp = int(time.time() * 1000)
-            role_tag = "EXIT_TP"
-            if (
-                exit_order_type == "MARKET"
-                or reason_upper in {"TP_CROSS", "TP_FORCE", "SL_HARD", "RECOVERY"}
-                or self._tp_exit_phase == "CROSS"
-            ):
-                role_tag = "EXIT_CROSS"
+            role_tag = self._exit_role_tag()
             exit_client_id = self._build_client_order_id(
                 exit_side, timestamp + 1, role_tag=role_tag
             )
@@ -2728,6 +2857,8 @@ class TradeExecutor:
                 f"delta_ticks_to_ref={delta_label} qty={qty:.8f}"
                 f" elapsed_ms={elapsed_label} phase={phase_label}"
             )
+            if self._direction == "SHORT" and exit_side == "BUY":
+                self._logger(f"[EXIT_SHORT] place BUY price={price_label}")
             if self.position is not None and self.position.get("partial"):
                 self._logger(f"[SELL_FOR_PARTIAL] qty={qty:.8f}")
             exit_order = self._place_margin_order(
@@ -2880,10 +3011,12 @@ class TradeExecutor:
                 "delta_ticks_to_ref=— "
                 f"qty={qty:.8f}"
             )
+            if self._direction == "SHORT" and exit_side == "BUY":
+                self._logger("[EXIT_SHORT] place BUY price=MARKET")
             is_isolated = "TRUE" if self._settings.margin_isolated else "FALSE"
             timestamp = int(time.time() * 1000)
             sell_client_id = self._build_client_order_id(
-                exit_side, timestamp + 1, role_tag="EXIT_CROSS"
+                exit_side, timestamp + 1, role_tag=self._exit_role_tag()
             )
             side_effect_type = (
                 "AUTO_REPAY"
@@ -3336,6 +3469,8 @@ class TradeExecutor:
         ask: Optional[float],
         entry_context: str,
     ) -> None:
+        if self._direction == "SHORT":
+            self._logger(f"[ENTRY_SHORT] place SELL price={price:.8f}")
         bid_label = "?" if bid is None else f"{bid:.8f}"
         ask_label = "?" if ask is None else f"{ask:.8f}"
         cycle_label = self._cycle_id_label()
@@ -3358,7 +3493,8 @@ class TradeExecutor:
         if new_price is None:
             return False
         order_quote = float(self._settings.order_quote)
-        qty = self._round_down(order_quote / new_price, self._profile.step_size)
+        base_qty = order_quote / new_price
+        qty = self._apply_dust_carry_to_entry_qty(base_qty)
         if self._profile.min_qty and qty < self._profile.min_qty:
             return False
         if self._profile.min_notional is not None and qty * new_price < self._profile.min_notional:
@@ -3368,7 +3504,7 @@ class TradeExecutor:
         self._mark_cycle_entry_start()
         entry_side = self._entry_side()
         entry_client_id = self._build_client_order_id(
-            entry_side, timestamp, role_tag="ENTRY"
+            entry_side, timestamp, role_tag=self._entry_role_tag()
         )
         side_effect_type = self._normalize_side_effect_type(
             self._settings.side_effect_type
@@ -3389,6 +3525,7 @@ class TradeExecutor:
         entry_order_id = entry_order.get("orderId")
         if isinstance(entry_order_id, int):
             self._cycle_order_ids.add(entry_order_id)
+            self._clear_start_inflight()
         cycle_label = self._cycle_id_label()
         self._logger(
             f"[ORDER] {entry_side} placed cycle_id={cycle_label} qty={qty:.8f} "
@@ -3461,7 +3598,7 @@ class TradeExecutor:
         self._mark_cycle_entry_start()
         entry_side = self._entry_side()
         entry_client_id = self._build_client_order_id(
-            entry_side, timestamp, role_tag="TOPUP"
+            entry_side, timestamp, role_tag=self._entry_role_tag()
         )
         side_effect_type = self._normalize_side_effect_type(
             self._settings.side_effect_type
@@ -3482,6 +3619,7 @@ class TradeExecutor:
         entry_order_id = entry_order.get("orderId")
         if isinstance(entry_order_id, int):
             self._cycle_order_ids.add(entry_order_id)
+            self._clear_start_inflight()
         cycle_label = self._cycle_id_label()
         self._logger(
             f"[ORDER] {entry_side} placed cycle_id={cycle_label} qty={qty:.8f} "
@@ -5985,6 +6123,7 @@ class TradeExecutor:
 
     def cancel_test_orders_margin(self, reason: str = "cancelled") -> int:
         is_isolated = "TRUE" if self._settings.margin_isolated else "FALSE"
+        self._clear_start_inflight()
         cancelled = 0
         for order in list(self.active_test_orders):
             order_id = order.get("orderId")
