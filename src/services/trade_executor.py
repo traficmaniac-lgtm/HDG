@@ -218,8 +218,8 @@ class TradeExecutor:
     def _entry_role_tag(self) -> str:
         return f"ENTRY_{self._direction}"
 
-    def _exit_role_tag(self) -> str:
-        return f"EXIT_{self._direction}"
+    def _exit_role_tag(self, role: str) -> str:
+        return f"{role}_{self._direction}"
 
     def _set_start_inflight(self) -> bool:
         with self._start_inflight_lock:
@@ -477,7 +477,7 @@ class TradeExecutor:
         if role == "ENTRY":
             tag = self._entry_role_tag()
         elif role in {"EXIT_TP", "EXIT_CROSS"}:
-            tag = self._exit_role_tag()
+            tag = self._exit_role_tag(role)
         if not tag:
             return False
         return f"-{tag}" in client_order_id
@@ -2980,11 +2980,17 @@ class TradeExecutor:
                     self.last_action = "NO_PRICE"
                     return 0
 
+            exit_role = "EXIT_TP"
+            if (
+                exit_order_type == "MARKET"
+                or reason_upper in {"TP_CROSS", "TP_FORCE", "SL_HARD", "RECOVERY"}
+                or self._tp_exit_phase == "CROSS"
+            ):
+                exit_role = "EXIT_CROSS"
             is_isolated = "TRUE" if self._settings.margin_isolated else "FALSE"
             timestamp = int(time.time() * 1000)
-            role_tag = self._exit_role_tag()
             exit_client_id = self._build_client_order_id(
-                exit_side, timestamp + 1, role_tag=role_tag
+                exit_side, timestamp + 1, role_tag=self._exit_role_tag(exit_role)
             )
             side_effect_type = (
                 "AUTO_REPAY"
@@ -3016,6 +3022,10 @@ class TradeExecutor:
                 f"cycle_id={cycle_label} side={exit_side} price={price_label} qty={qty:.8f} "
                 f"policy={exit_policy}"
             )
+            policy_label = "CROSS" if exit_role == "EXIT_CROSS" else exit_policy
+            self._logger(
+                f"[EXIT_{self._direction}] side={exit_side} policy={policy_label}"
+            )
             bid_label = "—" if bid is None else f"{bid:.8f}"
             ask_label = "—" if ask is None else f"{ask:.8f}"
             mid_label = "—" if mid is None else f"{mid:.8f}"
@@ -3033,8 +3043,6 @@ class TradeExecutor:
                 f"delta_ticks_to_ref={delta_label} qty={qty:.8f}"
                 f" elapsed_ms={elapsed_label} phase={phase_label}"
             )
-            if self._direction == "SHORT" and exit_side == "BUY":
-                self._logger(f"[EXIT_SHORT] place BUY price={price_label}")
             if self.position is not None and self.position.get("partial"):
                 self._logger(f"[SELL_FOR_PARTIAL] qty={qty:.8f}")
             exit_order = self._place_margin_order(
@@ -3073,13 +3081,6 @@ class TradeExecutor:
             exit_order_id = exit_order.get("orderId")
             if isinstance(exit_order_id, int):
                 self._cycle_order_ids.add(exit_order_id)
-            exit_role = "EXIT_TP"
-            if (
-                order_type == "MARKET"
-                or reason_upper in {"TP_CROSS", "TP_FORCE", "SL_HARD", "RECOVERY"}
-                or self._tp_exit_phase == "CROSS"
-            ):
-                exit_role = "EXIT_CROSS"
             self._register_order_role(exit_order_id, exit_role)
             if reason_upper in {"TP", "TP_MAKER", "TP_FORCE", "TP_CROSS", "SL", "SL_HARD"}:
                 self._logger(
@@ -3188,6 +3189,9 @@ class TradeExecutor:
                 f"policy={exit_policy}"
             )
             self._logger(
+                f"[EXIT_{self._direction}] side={exit_side} policy=CROSS"
+            )
+            self._logger(
                 "[SELL_PLACE] "
                 f"cycle_id={cycle_label} side={exit_side} exit_intent={intent} exit_policy={exit_policy} "
                 f"sell_ref={sell_ref_label} bid={bid_label} ask={ask_label} "
@@ -3195,12 +3199,10 @@ class TradeExecutor:
                 "delta_ticks_to_ref=— "
                 f"qty={qty:.8f}"
             )
-            if self._direction == "SHORT" and exit_side == "BUY":
-                self._logger("[EXIT_SHORT] place BUY price=MARKET")
             is_isolated = "TRUE" if self._settings.margin_isolated else "FALSE"
             timestamp = int(time.time() * 1000)
             sell_client_id = self._build_client_order_id(
-                exit_side, timestamp + 1, role_tag=self._exit_role_tag()
+                exit_side, timestamp + 1, role_tag=self._exit_role_tag("EXIT_CROSS")
             )
             side_effect_type = (
                 "AUTO_REPAY"
@@ -3653,8 +3655,8 @@ class TradeExecutor:
         ask: Optional[float],
         entry_context: str,
     ) -> None:
-        if self._direction == "SHORT":
-            self._logger(f"[ENTRY_SHORT] place SELL price={price:.8f}")
+        entry_side = self._entry_side()
+        self._logger(f"[ENTRY_{self._direction}] side={entry_side} price={price:.8f}")
         bid_label = "?" if bid is None else f"{bid:.8f}"
         ask_label = "?" if ask is None else f"{ask:.8f}"
         cycle_label = self._cycle_id_label()
