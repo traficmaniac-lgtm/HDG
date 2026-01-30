@@ -48,6 +48,7 @@ from src.services.binance_rest import BinanceRestClient
 from src.services.http_price import HttpPriceService
 from src.services.order_tracker import OrderTracker
 from src.services.price_router import PriceRouter
+from src.core.trade_ledger import CycleStatus
 from src.services.trade_executor import TradeExecutor
 from src.services.ws_price import WsPriceWorker
 
@@ -106,9 +107,7 @@ class MainWindow(QMainWindow):
         self._last_data_blind_log_ts = 0.0
         self._open_order_rows: dict[str, int] = {}
         self._fills_history: list[dict] = []
-        self._fill_rows_by_event_key: dict[str, int] = {}
-        self._cycle_id_counter = 0
-        self._last_buy_fill_price: Optional[float] = None
+        self._last_ledger_table_ts = 0.0
         self._profile_info_text = "—"
         self._log_queue = deque()
         self._log_lock = threading.Lock()
@@ -355,16 +354,16 @@ class MainWindow(QMainWindow):
         self.fills_model = QStandardItemModel(0, 10, self)
         self.fills_model.setHorizontalHeaderLabels(
             [
-                "time",
-                "side",
-                "avg_fill_price",
+                "cycle_id",
+                "direction",
+                "entry_avg",
+                "exit_avg",
                 "qty",
                 "status",
-                "pnl_quote",
-                "pnl_bps",
-                "unreal_est",
-                "exit_reason",
-                "cycle_id",
+                "unreal_pnl",
+                "realized_pnl",
+                "win",
+                "notes",
             ]
         )
         self.fills_table = QTableView()
@@ -377,11 +376,11 @@ class MainWindow(QMainWindow):
         fills_header = self.fills_table.horizontalHeader()
         fills_header.setStretchLastSection(False)
         fills_header.setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
-        fills_widths = [90, 55, 120, 110, 80, 110, 90, 110, 120, 90]
+        fills_widths = [80, 80, 110, 110, 90, 90, 110, 110, 70, 140]
         for idx, width in enumerate(fills_widths):
             self.fills_table.setColumnWidth(idx, width)
         fills_layout.addWidget(self.fills_table, stretch=1)
-        orders_tabs.addTab(fills_tab, "FILLS")
+        orders_tabs.addTab(fills_tab, "TRADES")
 
         splitter.addWidget(hud_widget)
         splitter.addWidget(orders_tabs)
@@ -396,19 +395,19 @@ class MainWindow(QMainWindow):
         scoreboard_layout = QHBoxLayout(scoreboard)
         scoreboard_layout.setContentsMargins(8, 4, 8, 6)
         scoreboard_layout.setSpacing(18)
-        self.wins_value_label = self._make_score_value_label("0")
-        self.losses_value_label = self._make_score_value_label("0")
         self.winrate_value_label = self._make_score_value_label("0.0%")
-        self.pnl_session_value_label = self._make_score_value_label("—", min_chars=10)
-        self.avg_pnl_value_label = self._make_score_value_label("—", min_chars=10)
-        scoreboard_layout.addWidget(self._make_score_item("WINS", self.wins_value_label))
-        scoreboard_layout.addWidget(self._make_score_item("LOSSES", self.losses_value_label))
+        self.pnl_realized_value_label = self._make_score_value_label("—", min_chars=10)
+        self.pnl_unreal_value_label = self._make_score_value_label("—", min_chars=10)
+        self.trades_closed_value_label = self._make_score_value_label("0")
         scoreboard_layout.addWidget(self._make_score_item("WINRATE", self.winrate_value_label))
         scoreboard_layout.addWidget(
-            self._make_score_item("PNL_SESSION", self.pnl_session_value_label)
+            self._make_score_item("PNL_REALIZED", self.pnl_realized_value_label)
         )
         scoreboard_layout.addWidget(
-            self._make_score_item("AVG_PNL_PER_CYCLE", self.avg_pnl_value_label)
+            self._make_score_item("PNL_UNREAL", self.pnl_unreal_value_label)
+        )
+        scoreboard_layout.addWidget(
+            self._make_score_item("TRADES_CLOSED", self.trades_closed_value_label)
         )
         scoreboard_layout.addStretch(1)
         root.addWidget(scoreboard)
@@ -1595,10 +1594,8 @@ class MainWindow(QMainWindow):
 
     def _fills_model_clear(self) -> None:
         self.fills_model.removeRows(0, self.fills_model.rowCount())
-        self._fill_rows_by_event_key.clear()
         self._fills_history.clear()
-        self._cycle_id_counter = 0
-        self._last_buy_fill_price = None
+        self._last_ledger_table_ts = 0.0
 
     def _refresh_orders(self) -> None:
         if not self._connected or not self._rest or not self._settings:
@@ -1790,47 +1787,58 @@ class MainWindow(QMainWindow):
             if self._trade_executor.position is not None:
                 position_qty = self._trade_executor.position.get("qty")
             buy_price = self._trade_executor.get_buy_price()
+            self._trade_executor.update_ledger_unrealized(price_state)
         pos_label = "—"
         if position_qty is not None:
             pos_label = (
                 f"{self._fmt_qty(position_qty, width=7)}@"
                 f"{self._fmt_price(buy_price, width=10)}"
             )
+        ledger = self._trade_executor.ledger if self._trade_executor else None
+        closed_cycles = (
+            [cycle for cycle in ledger.cycles if cycle.status == CycleStatus.CLOSED]
+            if ledger
+            else []
+        )
+        pnl_session = sum(cycle.realized_pnl_quote for cycle in closed_cycles) if closed_cycles else 0.0
         pnl_unreal = (
-            self._trade_executor.get_unrealized_pnl(price_state.mid)
-            if self._trade_executor
+            ledger.active_cycle.unrealized_pnl_quote
+            if ledger and ledger.active_cycle and ledger.active_cycle.status == CycleStatus.OPEN
             else None
         )
-        pnl_cycle = self._trade_executor.pnl_cycle if self._trade_executor else None
-        pnl_session = self._trade_executor.pnl_session if self._trade_executor else None
+        trades_closed = len(closed_cycles)
         last_exit = self._trade_executor.last_exit_reason if self._trade_executor else None
         self.summary_label.setText(
             f"{symbol} | SRC {price_state.source} | ages {ws_age}/{http_age} | "
             f"spread {spread_label} | FSM {state_label}/{last_action} | "
-            f"pos {pos_label} | pnl "
-            f"{self._fmt_pnl(pnl_unreal, width=9)}/"
-            f"{self._fmt_pnl(pnl_cycle, width=9)}/"
-            f"{self._fmt_pnl(pnl_session, width=9)} | "
+            f"pos {pos_label} | pnl R/U "
+            f"{self._fmt_pnl(pnl_session, width=9)}/"
+            f"{self._fmt_pnl(pnl_unreal, width=9)} | "
+            f"closed {self._fmt_int(trades_closed, width=4)} | "
             f"last_exit {last_exit or '—'}"
         )
+        self._refresh_trade_ledger_table()
 
     def _update_scoreboard(self) -> None:
-        realized = [
-            entry["pnl_quote"]
-            for entry in self._fills_history
-            if entry.get("pnl_quote") is not None
-        ]
-        wins = sum(1 for pnl in realized if pnl > 0)
-        losses = sum(1 for pnl in realized if pnl < 0)
-        total = wins + losses
+        ledger = self._trade_executor.ledger if self._trade_executor else None
+        closed_cycles = (
+            [cycle for cycle in ledger.cycles if cycle.status == CycleStatus.CLOSED]
+            if ledger
+            else []
+        )
+        wins = sum(1 for cycle in closed_cycles if cycle.win)
+        total = len(closed_cycles)
         winrate = (wins / total) * 100.0 if total else 0.0
-        avg_pnl = sum(realized) / len(realized) if realized else None
-        pnl_session = self._trade_executor.pnl_session if self._trade_executor else None
-        self.wins_value_label.setText(str(wins))
-        self.losses_value_label.setText(str(losses))
+        pnl_realized = sum(cycle.realized_pnl_quote for cycle in closed_cycles) if closed_cycles else 0.0
+        pnl_unreal = (
+            ledger.active_cycle.unrealized_pnl_quote
+            if ledger and ledger.active_cycle and ledger.active_cycle.status == CycleStatus.OPEN
+            else None
+        )
         self.winrate_value_label.setText(f"{winrate:>5.1f}%")
-        self.pnl_session_value_label.setText(self._fmt_pnl(pnl_session, width=10))
-        self.avg_pnl_value_label.setText(self._fmt_pnl(avg_pnl, width=10))
+        self.pnl_realized_value_label.setText(self._fmt_pnl(pnl_realized, width=10))
+        self.pnl_unreal_value_label.setText(self._fmt_pnl(pnl_unreal, width=10))
+        self.trades_closed_value_label.setText(str(total))
 
     def _set_hud_defaults(self) -> None:
         self.market_primary_label.setText("Bid —  Ask —  Mid —  Spr —t")
@@ -1851,72 +1859,23 @@ class MainWindow(QMainWindow):
         self.cycles_target_label.setText("—")
         self.summary_label.setText(
             "EURIUSDT | SRC NONE | ages —/— | spread — | FSM —/— | pos — | "
-            "pnl —/—/— | last_exit —"
+            "pnl R/U —/— | closed — | last_exit —"
         )
-        self.wins_value_label.setText("0")
-        self.losses_value_label.setText("0")
         self.winrate_value_label.setText("0.0%")
-        self.pnl_session_value_label.setText("—")
-        self.avg_pnl_value_label.setText("—")
+        self.pnl_realized_value_label.setText("—")
+        self.pnl_unreal_value_label.setText("—")
+        self.trades_closed_value_label.setText("0")
 
     def _register_fill(
         self, order_id: int, side: str, price: float, qty: float, ts_ms: int
     ) -> None:
-        side_upper = str(side).upper()
-        status = "FILLED"
-        event_key = self._fill_event_key(order_id, side_upper, status, qty, price, ts_ms)
-        if event_key in self._fill_rows_by_event_key:
-            return
-        pnl_quote = None
-        pnl_bps = None
-        exit_reason = "—"
-        cycle_id = "—"
-        unreal_est = None
-        buy_price = None
-        if side_upper == "BUY":
-            self._last_buy_fill_price = price
-            if self._last_mid is not None and qty:
-                unreal_est = (self._last_mid - price) * qty
-        elif side_upper == "SELL":
-            self._cycle_id_counter += 1
-            cycle_id = str(self._cycle_id_counter)
-            if self._trade_executor:
-                pnl_quote = self._trade_executor.pnl_cycle
-                exit_reason = self._trade_executor.last_exit_reason or "—"
-                buy_price = self._trade_executor.get_buy_price()
-            if pnl_quote is None:
-                if buy_price is None:
-                    buy_price = self._last_buy_fill_price
-                if buy_price is not None and qty:
-                    pnl_quote = (price - buy_price) * qty
-            if pnl_quote is not None and buy_price and qty:
-                notion = buy_price * qty
-                if notion > 0:
-                    pnl_bps = (pnl_quote / notion) * 10000
-        entry = {
-            "time": self._format_time(ts_ms),
-            "side": side_upper,
-            "status": status,
-            "avg_fill_price": price,
-            "qty": qty,
-            "pnl_quote": pnl_quote,
-            "pnl_bps": pnl_bps,
-            "unreal_est": unreal_est,
-            "exit_reason": exit_reason,
-            "cycle_id": cycle_id,
-            "event_key": event_key,
-        }
-        self._fills_history.insert(0, entry)
-        self._append_fill_row(entry)
-        if len(self._fills_history) > 200:
-            removed = self._fills_history.pop()
-            self._remove_fill_row_by_key(removed.get("event_key"))
+        self._refresh_trade_ledger_table()
 
     def _append_fill_row(self, entry: dict) -> None:
         row = self._fill_row_values(entry)
         items = [QStandardItem(value) for value in row]
         for idx, item in enumerate(items):
-            if idx in {8, 9}:
+            if idx == 9:
                 item.setTextAlignment(
                     Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
                 )
@@ -1924,55 +1883,34 @@ class MainWindow(QMainWindow):
                 item.setToolTip(row[idx])
             else:
                 item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._shift_fill_row_indices(1)
-        self.fills_model.insertRow(0, items)
-        event_key = entry.get("event_key")
-        if isinstance(event_key, str):
-            self._fill_rows_by_event_key[event_key] = 0
+        self.fills_model.appendRow(items)
 
     def _fill_row_values(self, entry: dict) -> list[str]:
         return [
-            entry.get("time", "—"),
-            entry.get("side", "—"),
-            self._fmt_price(entry.get("avg_fill_price"), width=12),
+            str(entry.get("cycle_id", "—")),
+            entry.get("direction", "—"),
+            self._fmt_price(entry.get("entry_avg"), width=12),
+            self._fmt_price(entry.get("exit_avg"), width=12),
             self._fmt_qty(entry.get("qty"), width=8),
             str(entry.get("status", "—")),
-            self._fmt_pnl(entry.get("pnl_quote"), width=12),
-            self._fmt_pnl(entry.get("pnl_bps"), width=8),
-            self._fmt_pnl(entry.get("unreal_est"), width=12),
-            str(entry.get("exit_reason", "—")),
-            str(entry.get("cycle_id", "—")),
+            self._fmt_pnl(entry.get("unreal_pnl"), width=12),
+            self._fmt_pnl(entry.get("realized_pnl"), width=12),
+            str(entry.get("win", "—")),
+            str(entry.get("notes", "—")),
         ]
 
-    def _shift_fill_row_indices(self, delta: int) -> None:
-        if not delta:
+    def _refresh_trade_ledger_table(self) -> None:
+        if not self._trade_executor:
             return
-        for key in list(self._fill_rows_by_event_key.keys()):
-            self._fill_rows_by_event_key[key] += delta
-
-    def _remove_fill_row_by_key(self, event_key: Optional[str]) -> None:
-        if not event_key:
+        now = time.monotonic()
+        if (now - self._last_ledger_table_ts) < 0.25:
             return
-        row = self._fill_rows_by_event_key.pop(event_key, None)
-        if row is None:
-            return
-        self.fills_model.removeRow(row)
-        for key, idx in list(self._fill_rows_by_event_key.items()):
-            if idx > row:
-                self._fill_rows_by_event_key[key] = idx - 1
-
-    @staticmethod
-    def _fill_event_key(
-        order_id: Optional[int],
-        side: str,
-        status: str,
-        cum_qty: float,
-        avg_price: float,
-        ts_ms: int,
-    ) -> str:
-        if order_id is not None:
-            return f"{order_id}:{side}:{status}:{cum_qty}:{avg_price}"
-        return f"{ts_ms}:{side}:{status}:{cum_qty}:{avg_price}"
+        self._last_ledger_table_ts = now
+        rows = self._trade_executor.ledger.get_cycle_rows(limit=200)
+        self._fills_history = rows
+        self.fills_model.removeRows(0, self.fills_model.rowCount())
+        for entry in rows:
+            self._append_fill_row(entry)
 
     @staticmethod
     def _format_time(value: Optional[int]) -> str:
