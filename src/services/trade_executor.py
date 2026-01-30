@@ -211,6 +211,7 @@ class TradeExecutor:
         self._entry_target_qty: Optional[float] = None
         self._continuous_run = True
         self._adaptive_mode = True
+        self._sl_close_retries = 0
 
     @staticmethod
     def _normalize_direction(direction: Optional[str]) -> str:
@@ -307,21 +308,175 @@ class TradeExecutor:
         deal_label = deal.deal_id if deal else cycle_id
         market_label = "—" if market_price is None else f"{market_price:.8f}"
         self._logger(
-            f"[SL_TRIGGER] deal={deal_label} rem={remaining_qty:.8f} "
-            f"sl_price={sl_price:.8f} mkt={market_label}"
+            f"[SL_TRIGGER] deal={deal_label} price={sl_price:.8f} "
+            f"mkt={market_label} rem={remaining_qty:.8f}"
         )
 
-    def _log_deal_close(self, cycle_id: Optional[int], pnl: Optional[float]) -> None:
+    def _log_sl_cancel(self, canceled_orders: int) -> None:
+        self._logger(f"[SL_CANCEL] canceled_orders={canceled_orders}")
+
+    def _log_sl_cross(self, side: str, qty: float, attempt: Optional[int] = None) -> None:
+        attempt_label = "" if attempt is None else f" attempt={attempt}"
+        self._logger(f"[SL_CROSS] side={side} qty={qty:.8f}{attempt_label}")
+
+    def _log_sl_sync(self, exchange_qty: float) -> None:
+        self._logger(f"[SL_SYNC] exchange_qty={exchange_qty:.8f}")
+
+    def _sl_exchange_qty(self) -> float:
+        balance = self._get_base_balance_snapshot()
+        return self._resolve_exchange_qty(balance)
+
+    def _cancel_orders_for_sl(self) -> int:
+        is_isolated = "TRUE" if self._settings.margin_isolated else "FALSE"
+        order_ids: dict[int, str] = {}
+        for order in self.active_test_orders:
+            order_id = order.get("orderId")
+            if not order_id:
+                continue
+            order_ids[int(order_id)] = order.get("tag", self.TAG)
+        try:
+            open_orders = self._rest.get_margin_open_orders(self._settings.symbol)
+        except Exception as exc:
+            self._logger(f"[SL_CANCEL] open_orders_error={exc}")
+            open_orders = []
+        for order in open_orders:
+            order_id = order.get("orderId")
+            if not order_id:
+                continue
+            order_ids.setdefault(int(order_id), self.TAG)
+        canceled = 0
+        for order_id, tag in order_ids.items():
+            final_status = self._safe_cancel_and_sync(
+                order_id=order_id,
+                is_isolated=is_isolated,
+                tag=tag,
+                attempt_cancel=True,
+            )
+            if final_status in {"CANCELED", "REJECTED", "EXPIRED"}:
+                canceled += 1
+            for entry in self.active_test_orders:
+                if entry.get("orderId") == order_id:
+                    entry["status"] = final_status
+                    if entry.get("side") == self._exit_side():
+                        entry["sell_status"] = final_status
+        self.active_test_orders = [
+            entry
+            for entry in self.active_test_orders
+            if entry.get("status") not in {"CANCELED", "REJECTED", "EXPIRED"}
+        ]
+        self.orders_count = len(self.active_test_orders)
+        self.entry_active_order_id = None
+        self.entry_active_price = None
+        self.entry_cancel_pending = False
+        self._entry_replace_after_cancel = False
+        self.sell_active_order_id = None
+        self.sell_cancel_pending = False
+        self.sell_place_inflight = False
+        return canceled
+
+    def _handle_sl_trigger(
+        self,
+        remaining_qty: float,
+        sl_price: float,
+        best_bid: Optional[float],
+        best_ask: Optional[float],
+    ) -> None:
+        exit_side = self._exit_side()
+        market_price = best_bid if exit_side == "SELL" else best_ask
+        self._log_sl_trigger(self._current_cycle_id, remaining_qty, sl_price, market_price)
+        self._set_exit_intent(
+            "SL",
+            mid=None,
+            ticks=int(self._settings.stop_loss_ticks),
+            force=True,
+        )
+        self._sl_close_retries = 0
+        canceled = self._cancel_orders_for_sl()
+        self._log_sl_cancel(canceled)
+        try:
+            open_orders = self._rest.get_margin_open_orders(self._settings.symbol)
+        except Exception as exc:
+            self._logger(f"[SL_SYNC] open_orders_error={exc}")
+            open_orders = []
+        self._last_open_orders = open_orders
+        exchange_qty = self._sl_exchange_qty()
+        self._log_sl_sync(exchange_qty)
+        if exchange_qty <= self._epsilon_qty() and remaining_qty > self._epsilon_qty():
+            self._reconcile_with_exchange()
+            return
+        qty = exchange_qty if exchange_qty > self._epsilon_qty() else remaining_qty
+        if self._profile.step_size:
+            qty = self._round_down(qty, self._profile.step_size)
+        if qty <= self._epsilon_qty():
+            return
+        self._log_sl_cross(exit_side, qty)
+        self._place_sell_order(
+            reason="SL_HARD",
+            exit_intent="SL",
+            qty_override=qty,
+            ref_bid=best_bid,
+            ref_ask=best_ask,
+        )
+
+    def _post_sl_reconcile(self, exit_side: str) -> bool:
+        tolerance = self._get_step_size_tolerance()
+        exchange_qty = self._sl_exchange_qty()
+        self._log_sl_sync(exchange_qty)
+        if exchange_qty <= tolerance:
+            self._sl_close_retries = 0
+            return True
+        max_retries = 2
+        while exchange_qty > tolerance and self._sl_close_retries < max_retries:
+            self._sl_close_retries += 1
+            qty = exchange_qty
+            if self._profile.step_size:
+                qty = self._round_down(qty, self._profile.step_size)
+            if qty <= self._epsilon_qty():
+                break
+            self._log_sl_cross(exit_side, qty, attempt=self._sl_close_retries)
+            placed = self._place_sell_order(
+                reason="SL_HARD",
+                exit_intent="SL",
+                qty_override=qty,
+            )
+            if placed:
+                self._transition_state(TradeState.STATE_EXIT_SL_WORKING)
+                return False
+            exchange_qty = self._sl_exchange_qty()
+            self._log_sl_sync(exchange_qty)
+        if exchange_qty > tolerance:
+            self._logger(
+                f"[SL_FAILED] exchange_qty={exchange_qty:.8f}",
+                level="ERROR",
+            )
+            self.stop_run_by_user(reason="SL_FAILED")
+            return False
+        self._sl_close_retries = 0
+        return True
+
+    def _log_deal_close(
+        self,
+        cycle_id: Optional[int],
+        pnl: Optional[float],
+        result: Optional[str] = None,
+    ) -> None:
         if cycle_id is None:
             return
         deal = self.ledger.deals_by_cycle_id.get(cycle_id)
         if not deal:
             return
         realized = pnl if pnl is not None else deal.realized_pnl
-        win = None if realized is None else realized > 0
+        result_label = result
+        if result_label is None:
+            result_label = "FLAT"
+            if realized is not None:
+                if realized > 0:
+                    result_label = "WIN"
+                elif realized < 0:
+                    result_label = "LOSS"
         realized_label = "—" if realized is None else f"{realized:.8f}"
         self._logger(
-            f"[DEAL_CLOSE] deal={deal.deal_id} realized={realized_label} win={win}"
+            f"[DEAL_CLOSE] deal={deal.deal_id} result={result_label} realized={realized_label}"
         )
 
     def _active_tp_orders(self) -> list[dict]:
@@ -2727,38 +2882,25 @@ class TradeExecutor:
         sl_triggered = False
         if sl_price is not None:
             if position_side == "SHORT":
-                sl_triggered = best_bid is not None and best_bid >= sl_price
+                sl_triggered = ask is not None and ask >= sl_price
             else:
-                sl_triggered = best_ask is not None and best_ask <= sl_price
+                sl_triggered = bid is not None and bid <= sl_price
         if sl_triggered:
-            best_bid_label = "—" if best_bid is None else f"{best_bid:.8f}"
-            best_ask_label = "—" if best_ask is None else f"{best_ask:.8f}"
+            best_bid_label = "—" if bid is None else f"{bid:.8f}"
+            best_ask_label = "—" if ask is None else f"{ask:.8f}"
             entry_label = "—" if entry_avg is None else f"{entry_avg:.8f}"
             self._logger(
                 "[SL_TRIGGER] "
                 f"dir={self._direction} bid={best_bid_label} ask={best_ask_label} "
                 f"entry_avg={entry_label} target={sl_price:.8f}"
             )
-            best_bid_label = "—" if best_bid is None else f"{best_bid:.8f}"
-            best_ask_label = "—" if best_ask is None else f"{best_ask:.8f}"
             self._logger(
                 "[SELL_PLAN] "
                 f"phase=SL reason=SL qty={remaining_qty:.8f} price={sl_price:.8f} "
                 f"bid={best_bid_label} ask={best_ask_label} "
                 f"mid={mid if mid is not None else '—'}"
             )
-            market_price = best_bid if position_side == "SHORT" else best_ask
-            self._log_sl_trigger(self._current_cycle_id, remaining_qty, sl_price, market_price)
-            self._cancel_active_sell(reason="SL")
-            self._set_exit_intent("SL", mid=mid, ticks=int(self._settings.stop_loss_ticks), force=True)
-            sl_override = best_bid if exit_side == "SELL" else best_ask
-            self._place_sell_order(
-                reason="SL_HARD",
-                price_override=sl_override if sl_override is not None else best_bid if best_bid is not None else best_ask,
-                exit_intent="SL",
-                ref_bid=best_bid,
-                ref_ask=best_ask,
-            )
+            self._handle_sl_trigger(remaining_qty, sl_price, bid, ask)
             return
 
         if self._adaptive_mode:
@@ -3054,7 +3196,8 @@ class TradeExecutor:
     def _sl_breached(self, price_state: PriceState, sl_price: Optional[float]) -> bool:
         if sl_price is None:
             return False
-        best_bid, best_ask = self._book_refs(price_state)
+        best_bid = price_state.bid
+        best_ask = price_state.ask
         tick_size = self._profile.tick_size or 0.0
         allowed_ticks = int(
             getattr(self._settings, "exit_sl_emergency_ticks", self.EXIT_SL_EMERGENCY_TICKS)
@@ -6234,7 +6377,14 @@ class TradeExecutor:
                 )
                 self._sync_sell_for_partial(delta, allow_replace=False)
             if remaining_qty <= self._get_step_size_tolerance():
-                self._finalize_partial_close(reason="PARTIAL")
+                sell_reason = str(order.get("reason") or "").upper()
+                exit_intent = self._normalize_exit_intent(self.exit_intent or sell_reason)
+                exit_reason = "PARTIAL"
+                if sell_reason in {"SL", "SL_HARD"} or exit_intent == "SL":
+                    exit_reason = "SL_HARD"
+                    if not self._post_sl_reconcile(exit_side):
+                        return
+                self._finalize_partial_close(reason=exit_reason)
                 return
 
     def handle_order_done(self, order_id: int, status: str, ts_ms: int) -> None:
@@ -6443,6 +6593,11 @@ class TradeExecutor:
                 self._clear_order_role(order_id)
                 self._update_registry_status_by_order(order_id, "FILLED")
                 return
+            if exit_reason == "SL_HARD":
+                if not self._post_sl_reconcile(exit_side):
+                    self._clear_order_role(order_id)
+                    self._update_registry_status_by_order(order_id, "FILLED")
+                    return
             pnl = self._finalize_close(order)
             self.last_exit_reason = exit_reason
             if exit_reason in {"TP_MAKER", "TP_FORCE", "TP_CROSS", "SL_HARD"}:
@@ -6702,6 +6857,7 @@ class TradeExecutor:
         self._reconcile_recovery_attempts = 0
         self._exit_cross_attempts = 0
         self._exit_missing_since_ts = None
+        self._sl_close_retries = 0
 
     def _set_exit_intent(
         self,
@@ -6954,7 +7110,9 @@ class TradeExecutor:
         buy_price: Optional[float],
         cycle_id: Optional[int],
     ) -> None:
-        if pnl is not None:
+        if reason == "SL_HARD":
+            self.losses += 1
+        elif pnl is not None:
             if pnl > 0:
                 self.wins += 1
             elif pnl < 0:
@@ -6981,7 +7139,8 @@ class TradeExecutor:
         self._transition_state(TradeState.STATE_FLAT)
         self._cleanup_cycle_state(cycle_id)
         self._auto_next_cycle()
-        self._log_deal_close(cycle_id, pnl)
+        result_label = "LOSS" if reason == "SL_HARD" else None
+        self._log_deal_close(cycle_id, pnl, result=result_label)
 
     def _finalize_partial_close(self, reason: str) -> None:
         self.last_exit_reason = reason
