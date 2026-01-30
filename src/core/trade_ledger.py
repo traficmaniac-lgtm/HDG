@@ -35,6 +35,7 @@ class TradeLedger:
     def __init__(self, logger: Optional[Callable[[str], None]] = None) -> None:
         self._next_id = 1
         self.cycles: list[TradeCycle] = []
+        self.cycles_by_id: dict[int, TradeCycle] = {}
         self.active_cycle: Optional[TradeCycle] = None
         self._logger = logger
         self._last_unreal_log_ts = 0.0
@@ -68,13 +69,19 @@ class TradeLedger:
             notes=notes,
         )
         self.cycles.append(cycle)
+        self.cycles_by_id[cycle_id] = cycle
         self.active_cycle = cycle
         if self._logger:
             self._logger(f"[LEDGER_OPEN] id={cycle_id} dir={direction}")
         return cycle_id
 
-    def on_entry_fill(self, qty: float, price: float) -> None:
-        cycle = self.active_cycle
+    def _resolve_cycle(self, cycle_id: Optional[int]) -> Optional[TradeCycle]:
+        if cycle_id is not None:
+            return self.cycles_by_id.get(cycle_id)
+        return self.active_cycle
+
+    def on_entry_fill(self, cycle_id: Optional[int], qty: float, price: float) -> None:
+        cycle = self._resolve_cycle(cycle_id)
         if not cycle or cycle.status != CycleStatus.OPEN or qty <= 0:
             return
         new_qty = cycle.entry_qty + qty
@@ -83,8 +90,8 @@ class TradeLedger:
         cycle.entry_avg = ((cycle.entry_avg * cycle.entry_qty) + (price * qty)) / new_qty
         cycle.entry_qty = new_qty
 
-    def on_exit_fill(self, qty: float, price: float) -> None:
-        cycle = self.active_cycle
+    def on_exit_fill(self, cycle_id: Optional[int], qty: float, price: float) -> None:
+        cycle = self._resolve_cycle(cycle_id)
         if not cycle or cycle.status != CycleStatus.OPEN or qty <= 0:
             return
         new_qty = cycle.exit_qty + qty
@@ -93,8 +100,8 @@ class TradeLedger:
         cycle.exit_avg = ((cycle.exit_avg * cycle.exit_qty) + (price * qty)) / new_qty
         cycle.exit_qty = new_qty
 
-    def close_cycle(self, notes: str = "") -> None:
-        cycle = self.active_cycle
+    def close_cycle(self, cycle_id: Optional[int], notes: str = "") -> None:
+        cycle = self._resolve_cycle(cycle_id)
         if not cycle or cycle.status != CycleStatus.OPEN:
             return
         realized = 0.0
@@ -119,7 +126,8 @@ class TradeLedger:
                 f"[LEDGER_CLOSE] id={cycle.cycle_id} pnl={realized:.8f} "
                 f"win={cycle.win} notes={cycle.notes or '—'}"
             )
-        self.active_cycle = None
+        if self.active_cycle == cycle:
+            self.active_cycle = None
 
     def mark_error(self, notes: str = "") -> None:
         cycle = self.active_cycle

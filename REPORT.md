@@ -21,3 +21,4 @@
 - 0.7.30.10: Fix SHORT semantics (SELL entry / BUY cover exit) + direction-aware tags.
 - 0.7.30.11: TP/SL by bid/ask + maker pricing by book; prevent premature CROSS.
 - 0.7.30.12: Added trade ledger cycles with realized/unrealized PnL separation, GUI trades table by cycle, and winrate/session stats from closed cycles only.
+- 0.7.30.13: OrderRegistry + cycle_id/role mapping; fills routed deterministically to ledger cycles.
