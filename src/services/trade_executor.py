@@ -84,6 +84,7 @@ class TradeExecutor:
         self.last_exit_reason: Optional[str] = None
         self.ledger = TradeLedger(logger=self._logger)
         self._order_registry = OrderRegistry()
+        self._active_tp_keys: set[tuple[object, ...]] = set()
         self._last_ledger_unreal_ts = 0.0
         self._last_buy_price: Optional[float] = None
         self._buy_wait_started_ts: Optional[float] = None
@@ -287,11 +288,18 @@ class TradeExecutor:
             f"[ENTRY_FILL] deal={deal_label} qty={qty:.8f} price={price:.8f}"
         )
 
-    def _log_tp_place(self, cycle_id: Optional[int], qty: float, price: float) -> None:
-        deal = self.ledger.deals_by_cycle_id.get(cycle_id or -1)
-        deal_label = deal.deal_id if deal else cycle_id
+    def _log_tp_place(
+        self,
+        cycle_id: Optional[int],
+        side: str,
+        qty: float,
+        price: float,
+        tp_key: tuple[object, ...],
+    ) -> None:
+        deal_label = self._resolve_deal_id(cycle_id)
         self._logger(
-            f"[TP_PLACE] deal={deal_label} qty={qty:.8f} tp_price={price:.8f}"
+            "[TP_PLACE] "
+            f"deal={deal_label} side={side} qty={qty:.8f} price={price:.8f} tp_key={tp_key}"
         )
 
     def _log_tp_fill(self, cycle_id: Optional[int], qty: float, price: float) -> None:
@@ -300,6 +308,105 @@ class TradeExecutor:
         self._logger(
             f"[TP_FILL] deal={deal_label} qty={qty:.8f} price={price:.8f}"
         )
+
+    def _log_tp_skip_dup(self, cycle_id: Optional[int], tp_key: tuple[object, ...]) -> None:
+        deal_label = self._resolve_deal_id(cycle_id)
+        self._logger(f"[TP_SKIP_DUP] deal={deal_label} tp_key={tp_key}")
+
+    def _log_tp_key_free(
+        self,
+        cycle_id: Optional[int],
+        tp_key: tuple[object, ...],
+        status: str,
+    ) -> None:
+        deal_label = self._resolve_deal_id(cycle_id)
+        self._logger(
+            f"[TP_KEY_FREE] deal={deal_label} tp_key={tp_key} status={status}"
+        )
+
+    def _resolve_deal_id(self, cycle_id: Optional[int]) -> int:
+        deal = self.ledger.deals_by_cycle_id.get(cycle_id or -1)
+        if deal:
+            return deal.deal_id
+        return cycle_id or 0
+
+    def _round_tp_qty(self, qty: float) -> float:
+        step = self._profile.step_size
+        if step and step > 0:
+            return self._round_to_step(qty, step)
+        return qty
+
+    def _round_tp_price(self, price: float) -> float:
+        tick = self._profile.tick_size
+        if tick and tick > 0:
+            return self._round_to_step(price, tick)
+        return price
+
+    def _build_tp_key(
+        self,
+        deal_id: int,
+        direction: str,
+        side: str,
+        qty: float,
+        price: float,
+    ) -> tuple[object, ...]:
+        return (
+            deal_id,
+            direction,
+            side,
+            self._round_tp_qty(qty),
+            self._round_tp_price(price),
+        )
+
+    def _tp_key_from_open_order(
+        self,
+        order: dict,
+        meta: Optional[OrderMeta],
+    ) -> Optional[tuple[object, ...]]:
+        if meta and meta.tp_key:
+            return meta.tp_key
+        side = str(order.get("side") or "").upper()
+        if not side:
+            return None
+        raw_qty = float(order.get("origQty") or order.get("quantity") or 0.0)
+        raw_price = float(order.get("price") or 0.0)
+        if raw_qty <= 0 or raw_price <= 0:
+            return None
+        direction = meta.direction if meta else None
+        cycle_id = meta.cycle_id if meta else None
+        if direction is None or cycle_id is None:
+            client_order_id = str(order.get("clientOrderId") or "")
+            parsed = self._parse_client_order_id(client_order_id)
+            if parsed:
+                direction = str(parsed["direction"])
+                cycle_id = int(parsed["cycle_id"])
+        if direction is None:
+            direction = self._direction
+        deal_id = self._resolve_deal_id(cycle_id)
+        return self._build_tp_key(deal_id, direction, side, raw_qty, raw_price)
+
+    def _maybe_release_tp_key(self, meta: OrderMeta, status: str) -> None:
+        status_label = str(status).upper()
+        if status_label not in {"FILLED", "CANCELED", "EXPIRED", "REJECTED"}:
+            return
+        if not meta.tp_key:
+            return
+        if meta.tp_key in self._active_tp_keys:
+            self._active_tp_keys.remove(meta.tp_key)
+            self._log_tp_key_free(meta.cycle_id, meta.tp_key, status_label)
+
+    def _update_order_status(
+        self,
+        client_id: str,
+        status: str,
+        filled_qty_delta: float = 0.0,
+    ) -> None:
+        meta = self._order_registry.get_meta_by_client_id(client_id)
+        self._order_registry.update_status(
+            client_id, status, filled_qty_delta=filled_qty_delta
+        )
+        if meta:
+            self._maybe_release_tp_key(meta, status)
 
     def _log_sl_trigger(
         self,
@@ -565,7 +672,6 @@ class TradeExecutor:
         if fill_qty <= 0:
             return
         self._set_exit_intent("TP", mid=price_state.mid, ticks=int(self._settings.take_profit_ticks))
-        self._log_tp_place(self._current_cycle_id, fill_qty, tp_price)
         placed = self._place_sell_order(
             reason="TP_MAKER",
             price_override=tp_price,
@@ -856,6 +962,7 @@ class TradeExecutor:
         side: str,
         price: float,
         qty: float,
+        tp_key: Optional[tuple[object, ...]] = None,
     ) -> None:
         cycle_id = self._current_cycle_id or 0
         now = time.time()
@@ -869,6 +976,7 @@ class TradeExecutor:
             side=side,
             price=price,
             orig_qty=qty,
+            tp_key=tp_key,
             created_ts=now,
             last_update_ts=now,
             status="NEW",
@@ -885,7 +993,7 @@ class TradeExecutor:
         if not isinstance(order_id, int):
             return
         self._order_registry.bind_order_id(client_id, order_id)
-        self._order_registry.update_status(client_id, "WORKING")
+        self._update_order_status(client_id, "WORKING")
         if not self._should_dedup_log(f"order_bind:{client_id}:{order_id}", 0.5):
             self._logger(
                 f"[ORDER_BIND] client_id={client_id} order_id={order_id}"
@@ -1017,7 +1125,7 @@ class TradeExecutor:
         meta = self._order_registry.get_meta_by_order_id(order_id)
         if meta is None:
             return
-        self._order_registry.update_status(
+        self._update_order_status(
             meta.client_id, status, filled_qty_delta=filled_qty_delta
         )
 
@@ -1061,9 +1169,12 @@ class TradeExecutor:
         old_client_id = self._pending_replace_clients.pop(role_enum, None)
         if not old_client_id:
             return
+        old_meta = self._order_registry.get_meta_by_client_id(old_client_id)
         self._order_registry.mark_replaced(
             old_client_id, new_client_id, new_order_id
         )
+        if old_meta:
+            self._maybe_release_tp_key(old_meta, "CANCELED")
 
     def _clear_order_role(self, order_id: Optional[int]) -> None:
         if not isinstance(order_id, int):
@@ -1130,7 +1241,7 @@ class TradeExecutor:
             if not isinstance(meta.order_id, int):
                 continue
             if meta.order_id not in open_order_ids:
-                self._order_registry.update_status(meta.client_id, "CANCELED")
+                self._update_order_status(meta.client_id, "CANCELED")
                 stale_local += 1
         restored = 0
         unresolved = 0
@@ -1154,6 +1265,12 @@ class TradeExecutor:
             price = float(order.get("price") or 0.0)
             orig_qty = float(order.get("origQty") or order.get("quantity") or 0.0)
             side = str(order.get("side") or "")
+            tp_key = None
+            if parsed["role"] == OrderRole.EXIT_TP:
+                tp_key = self._tp_key_from_open_order(
+                    order,
+                    None,
+                )
             now = time.time()
             meta = OrderMeta(
                 client_id=client_order_id,
@@ -1165,6 +1282,7 @@ class TradeExecutor:
                 side=side,
                 price=price,
                 orig_qty=orig_qty,
+                tp_key=tp_key,
                 created_ts=now,
                 last_update_ts=now,
                 status=str(order.get("status") or "NEW").upper(),
@@ -1213,6 +1331,97 @@ class TradeExecutor:
                 if self._client_order_has_role(client_order_id, role_upper):
                     return True
         return False
+
+    def _is_exit_tp_open_order(self, order: dict, meta: Optional[OrderMeta]) -> bool:
+        if meta and meta.role == OrderRole.EXIT_TP:
+            return True
+        order_id = order.get("orderId")
+        if isinstance(order_id, int):
+            role_entry = self._order_roles.get(order_id, {})
+            if str(role_entry.get("role") or "").upper() == "EXIT_TP":
+                return True
+        client_order_id = str(order.get("clientOrderId") or "")
+        return self._client_order_has_role(client_order_id, "EXIT_TP")
+
+    def _dedup_open_tp_orders(self, open_orders: list[dict]) -> set[int]:
+        canceled_order_ids: set[int] = set()
+        if not open_orders:
+            return canceled_order_ids
+        if not self._profile.step_size or not self._profile.tick_size:
+            return canceled_order_ids
+        grouped: dict[tuple[object, ...], list[dict]] = {}
+        for order in open_orders:
+            order_id = order.get("orderId")
+            meta = (
+                self._order_registry.get_meta_by_order_id(order_id)
+                if isinstance(order_id, int)
+                else None
+            )
+            if not self._is_exit_tp_open_order(order, meta):
+                continue
+            tp_key = self._tp_key_from_open_order(order, meta)
+            if not tp_key:
+                continue
+            group_key = (tp_key[0], tp_key[2], tp_key[3], tp_key[4])
+            grouped.setdefault(group_key, []).append(order)
+        is_isolated = "TRUE" if self._settings.margin_isolated else "FALSE"
+        for group_key, orders in grouped.items():
+            if len(orders) <= 1:
+                continue
+            keep_order = min(
+                orders,
+                key=lambda entry: (
+                    entry.get("orderId") is None,
+                    entry.get("orderId") or 0,
+                ),
+            )
+            keep_id = keep_order.get("orderId")
+            canceled = []
+            for order in orders:
+                order_id = order.get("orderId")
+                if order_id == keep_id:
+                    continue
+                if not isinstance(order_id, int):
+                    continue
+                self._safe_cancel_and_sync(
+                    order_id=order_id,
+                    is_isolated=is_isolated,
+                    tag="tp_dedup",
+                    attempt_cancel=True,
+                )
+                canceled.append(order_id)
+                canceled_order_ids.add(order_id)
+            if canceled:
+                deal_id = group_key[0]
+                self._logger(
+                    "[TP_DEDUP_CANCEL] "
+                    f"deal={deal_id} keep_order={keep_id} "
+                    f"canceled_n={len(canceled)} canceled={canceled}"
+                )
+        return canceled_order_ids
+
+    def _sync_tp_keys_from_open_orders(
+        self,
+        open_orders: list[dict],
+        skip_order_ids: Optional[set[int]] = None,
+    ) -> None:
+        if not open_orders:
+            return
+        skip_order_ids = skip_order_ids or set()
+        for order in open_orders:
+            order_id = order.get("orderId")
+            if isinstance(order_id, int) and order_id in skip_order_ids:
+                continue
+            meta = (
+                self._order_registry.get_meta_by_order_id(order_id)
+                if isinstance(order_id, int)
+                else None
+            )
+            if not self._is_exit_tp_open_order(order, meta):
+                continue
+            tp_key = self._tp_key_from_open_order(order, meta)
+            if tp_key and tp_key not in self._active_tp_keys:
+                self._active_tp_keys.add(tp_key)
 
     def _should_skip_recover_for_active_order(
         self,
@@ -4077,12 +4286,34 @@ class TradeExecutor:
             )
             if self.position is not None and self.position.get("partial"):
                 self._logger(f"[SELL_FOR_PARTIAL] qty={qty:.8f}")
+            tp_key = None
+            if exit_role == "EXIT_TP" and sell_price is not None:
+                deal_id = self._resolve_deal_id(self._current_cycle_id)
+                tp_key = self._build_tp_key(
+                    deal_id,
+                    self._direction,
+                    exit_side,
+                    qty,
+                    sell_price,
+                )
+                if tp_key in self._active_tp_keys:
+                    self._log_tp_skip_dup(self._current_cycle_id, tp_key)
+                    self.last_action = "tp_skip_dup"
+                    return 0
+                self._log_tp_place(
+                    self._current_cycle_id,
+                    exit_side,
+                    qty,
+                    sell_price,
+                    tp_key,
+                )
             self._register_order_meta(
                 client_id=exit_client_id,
                 role=exit_role,
                 side=exit_side,
                 price=sell_price if sell_price is not None else mid or 0.0,
                 qty=qty,
+                tp_key=tp_key,
             )
             exit_order = self._place_margin_order(
                 symbol=self._settings.symbol,
@@ -4095,7 +4326,7 @@ class TradeExecutor:
                 order_type=order_type,
             )
             if not exit_order:
-                self._order_registry.update_status(exit_client_id, "REJECTED")
+                self._update_order_status(exit_client_id, "REJECTED")
                 if self._last_place_error_code == -2010:
                     return self._handle_sell_insufficient_balance(reason)
                 if (
@@ -4124,6 +4355,8 @@ class TradeExecutor:
             self._register_order_role(exit_order_id, exit_role)
             self._bind_order_meta(exit_client_id, exit_order_id)
             self._apply_pending_replace(exit_role, exit_client_id, exit_order_id)
+            if tp_key is not None:
+                self._active_tp_keys.add(tp_key)
             if reason_upper in {"TP", "TP_MAKER", "TP_FORCE", "TP_CROSS", "SL", "SL_HARD"}:
                 self._logger(
                     f"[ORDER] {exit_side} placed "
@@ -4281,7 +4514,7 @@ class TradeExecutor:
                 order_type="MARKET",
             )
             if not sell_order:
-                self._order_registry.update_status(sell_client_id, "REJECTED")
+                self._update_order_status(sell_client_id, "REJECTED")
                 self._logger(f"[ORDER] {exit_side} rejected")
                 self.last_action = "place_failed"
                 self._transition_to_position_state()
@@ -4805,7 +5038,7 @@ class TradeExecutor:
             order_type="LIMIT",
         )
         if not entry_order:
-            self._order_registry.update_status(entry_client_id, "REJECTED")
+            self._update_order_status(entry_client_id, "REJECTED")
             return False
         entry_order_id = entry_order.get("orderId")
         if isinstance(entry_order_id, int):
@@ -4914,7 +5147,7 @@ class TradeExecutor:
             order_type="LIMIT",
         )
         if not entry_order:
-            self._order_registry.update_status(entry_client_id, "REJECTED")
+            self._update_order_status(entry_client_id, "REJECTED")
             return False
         entry_order_id = entry_order.get("orderId")
         if isinstance(entry_order_id, int):
@@ -6169,6 +6402,8 @@ class TradeExecutor:
             return
         self._last_open_orders = open_orders
         self._update_open_orders_signature(open_orders)
+        canceled_tp_orders = self._dedup_open_tp_orders(open_orders)
+        self._sync_tp_keys_from_open_orders(open_orders, canceled_tp_orders)
         if not self.active_test_orders:
             self.orders_count = 0
             return
