@@ -9,7 +9,8 @@ from src.services.trade_executor import TradeExecutor, TradeState
 
 
 class DummyRest:
-    pass
+    def get_margin_open_orders(self, _symbol: str) -> list[dict]:
+        return []
 
 
 class DummyRouter:
@@ -89,13 +90,15 @@ def make_executor(router: DummyRouter) -> TradeExecutor:
         min_qty=0.0001,
         min_notional=0.0,
     )
-    return TradeExecutor(
+    executor = TradeExecutor(
         rest=DummyRest(),
         router=router,
         settings=make_settings(),
         profile=profile,
         logger=lambda _msg, **_kwargs: None,
     )
+    executor._adaptive_mode = False
+    return executor
 
 
 def test_tp_cross_not_before_armed() -> None:
@@ -238,6 +241,96 @@ def test_entry_reprice_on_1_tick_when_http_fresh() -> None:
 
     assert executor.entry_active_order_id == 2
     assert abs(executor.entry_active_price - 1.1983) <= 1e-9
+
+
+def test_reconcile_baseline_delta_no_hold() -> None:
+    price_state = PriceState(
+        bid=1.0,
+        ask=1.0,
+        mid=1.0,
+        source="HTTP",
+        mid_age_ms=10,
+        data_blind=False,
+    )
+    health_state = HealthState(ws_connected=False, ws_age_ms=99999, http_age_ms=10)
+    executor = make_executor(DummyRouter(price_state, health_state))
+    executor._base_total_baseline = 100.0
+    executor._baseline_ts_ms = int(time.time() * 1000)
+
+    snapshot = {
+        "open_orders": [],
+        "trades": [],
+        "balance": {"total": 100.099, "free": 100.099, "locked": 0.0},
+    }
+
+    executor.apply_reconcile_snapshot(snapshot)
+
+    assert executor._trade_hold is False
+    assert executor.ledger.active_cycle is not None
+    assert executor._remaining_qty > 0.0
+
+
+def test_stop_with_remaining_goes_safe_stop() -> None:
+    price_state = PriceState(
+        bid=1.0,
+        ask=1.0,
+        mid=1.0,
+        source="HTTP",
+        mid_age_ms=10,
+        data_blind=False,
+    )
+    health_state = HealthState(ws_connected=False, ws_age_ms=99999, http_age_ms=10)
+    executor = make_executor(DummyRouter(price_state, health_state))
+    cycle_id = executor.ledger.start_cycle(
+        symbol="TESTUSDT", direction="LONG", entry_qty=1.0, entry_avg=1.0
+    )
+    executor.ledger.on_entry_fill(cycle_id, 1.0, 1.0)
+    executor.stop_requested = True
+    executor._get_base_balance_snapshot = lambda: {  # type: ignore[assignment]
+        "total": 1.0,
+        "free": 1.0,
+        "locked": 0.0,
+        "borrowed": 0.0,
+        "net": 0.0,
+    }
+    executor._force_close_position = lambda **_kwargs: None  # type: ignore[assignment]
+
+    executor._handle_stop_interrupt(open_orders=[], reason="user")
+
+    assert executor.state == TradeState.STATE_SAFE_STOP
+    assert executor.stop_requested is True
+
+
+def test_stopped_but_pos_open_enters_safe_stop() -> None:
+    price_state = PriceState(
+        bid=1.0,
+        ask=1.0,
+        mid=1.0,
+        source="HTTP",
+        mid_age_ms=10,
+        data_blind=False,
+    )
+    health_state = HealthState(ws_connected=False, ws_age_ms=99999, http_age_ms=10)
+    executor = make_executor(DummyRouter(price_state, health_state))
+    executor.state = TradeState.STATE_STOPPED
+    executor._base_total_baseline = 100.0
+    executor._baseline_ts_ms = int(time.time() * 1000)
+    triggered: list[str] = []
+
+    def fake_force_close(reason: str) -> None:
+        triggered.append(reason)
+
+    executor._force_close_position = fake_force_close  # type: ignore[assignment]
+    snapshot = {
+        "open_orders": [],
+        "trades": [],
+        "balance": {"total": 100.5, "free": 100.5, "locked": 0.0},
+    }
+
+    executor.apply_reconcile_snapshot(snapshot)
+
+    assert executor.state == TradeState.STATE_SAFE_STOP
+    assert triggered == ["STOPPED_BUT_POS_OPEN"]
 
 
 def test_short_buy_fill_is_exit_not_entry() -> None:
@@ -472,9 +565,9 @@ def test_entry_timeout_not_triggered_in_exit(monkeypatch) -> None:
 
 def test_ensure_exit_orders_skips_sell_when_dust() -> None:
     price_state = PriceState(
-        bid=9.9,
-        ask=10.0,
-        mid=9.95,
+        bid=10.0,
+        ask=10.1,
+        mid=10.05,
         source="HTTP",
         mid_age_ms=10,
         data_blind=False,
