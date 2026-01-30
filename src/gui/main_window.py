@@ -115,12 +115,13 @@ class MainWindow(QMainWindow):
         self._log_dropped_lines = 0
         self._last_log_message: Optional[str] = None
         self._last_log_ts = 0.0
-        self._log_max_lines = 2000
-        self._log_max_buffer = 3000
-        self._log_flush_limit = 200
+        self._log_max_lines = 500
+        self._log_max_buffer = 700
+        self._log_flush_limit = 120
         self._auth_warning_pending = False
         self._logger = get_logger()
         self._verbose_log_last_ts: dict[str, float] = {}
+        self._ui_log_last_ts: dict[str, float] = {}
 
         self._ui_timer = QTimer(self)
         self._ui_timer.timeout.connect(self._refresh_ui)
@@ -141,7 +142,7 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._load_api_state()
         self._update_status(False)
-        self._log_flush_timer.start(250)
+        self._log_flush_timer.start(200)
 
     def _build_ui(self) -> None:
         central = QWidget()
@@ -1032,6 +1033,7 @@ class MainWindow(QMainWindow):
         self._last_log_message = None
         self._last_log_ts = 0.0
         self._verbose_log_last_ts.clear()
+        self._ui_log_last_ts.clear()
         self.log.clear()
 
     def _append_log(self, message: str, level: str = "INFO", key: Optional[str] = None) -> None:
@@ -1044,11 +1046,14 @@ class MainWindow(QMainWindow):
         self._logger.log(log_level, message)
         if not self._should_emit_ui_log(message, log_level, is_event):
             return
-        if log_level == logging.DEBUG and not self._allow_verbose_log(key, message):
-            return
         now = time.monotonic()
         if self._last_log_message == message and now - self._last_log_ts < 0.5:
             return
+        log_key = key or self._derive_log_key(message)
+        last_ui_ts = self._ui_log_last_ts.get(log_key)
+        if last_ui_ts is not None and now - last_ui_ts < 0.5:
+            return
+        self._ui_log_last_ts[log_key] = now
         self._last_log_message = message
         self._last_log_ts = now
         with self._log_lock:
@@ -1062,9 +1067,24 @@ class MainWindow(QMainWindow):
     def _should_emit_ui_log(self, message: str, level: int, is_event: bool) -> bool:
         if is_event:
             return True
-        if level == logging.DEBUG and self._settings and self._settings.verbose_ui_log:
+        if level >= logging.WARNING:
             return True
+        if level == logging.INFO:
+            return self._is_major_info(message)
         return False
+
+    @staticmethod
+    def _is_major_info(message: str) -> bool:
+        tags = (
+            "[API]",
+            "[CONNECT]",
+            "[DISCONNECT]",
+            "[MARGIN_CHECK]",
+            "[TRADE]",
+            "[WD]",
+            "[LOG]",
+        )
+        return message.startswith(tags)
 
     def _allow_verbose_log(self, key: Optional[str], message: str) -> bool:
         if not self._settings or not self._settings.verbose_ui_log:
