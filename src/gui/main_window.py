@@ -105,7 +105,6 @@ class MainWindow(QMainWindow):
         self._last_ws_status_log_ts = 0.0
         self._data_blind_active = False
         self._last_data_blind_log_ts = 0.0
-        self._open_order_rows: dict[str, int] = {}
         self._fills_history: list[dict] = []
         self._last_ledger_table_ts = 0.0
         self._profile_info_text = "—"
@@ -299,6 +298,34 @@ class MainWindow(QMainWindow):
         self._add_card_row(exit_layout, 3, "exit_policy", self.exit_policy_label)
         self._add_card_row(exit_layout, 4, "exit_age_ms", self.exit_age_label)
 
+        active_orders_group = QGroupBox("Active Orders")
+        active_orders_group.setFixedHeight(88)
+        active_orders_layout = QGridLayout(active_orders_group)
+        active_orders_layout.setContentsMargins(10, 10, 10, 10)
+        active_orders_layout.setHorizontalSpacing(8)
+        active_orders_layout.setVerticalSpacing(6)
+        self.active_entry_label = self._make_value_label(
+            "—",
+            min_chars=24,
+            align=Qt.AlignmentFlag.AlignLeft,
+            fixed_width=300,
+        )
+        self.active_tp_label = self._make_value_label(
+            "—",
+            min_chars=24,
+            align=Qt.AlignmentFlag.AlignLeft,
+            fixed_width=300,
+        )
+        self.active_sl_label = self._make_value_label(
+            "—",
+            min_chars=24,
+            align=Qt.AlignmentFlag.AlignLeft,
+            fixed_width=300,
+        )
+        self._add_card_row(active_orders_layout, 0, "ENTRY", self.active_entry_label)
+        self._add_card_row(active_orders_layout, 1, "TP", self.active_tp_label)
+        self._add_card_row(active_orders_layout, 2, "SL", self.active_sl_label)
+
         timers_group = QGroupBox("Timers")
         timers_group.setFixedHeight(66)
         timers_layout = QGridLayout(timers_group)
@@ -312,42 +339,12 @@ class MainWindow(QMainWindow):
         hud_layout.addWidget(health_group)
         hud_layout.addWidget(entry_group)
         hud_layout.addWidget(exit_group)
+        hud_layout.addWidget(active_orders_group)
         hud_layout.addWidget(timers_group)
         hud_layout.addStretch(1)
 
         orders_tabs = QTabWidget()
         orders_tabs.setTabPosition(QTabWidget.TabPosition.North)
-
-        open_tab = QWidget()
-        open_layout = QVBoxLayout(open_tab)
-        self.orders_model = QStandardItemModel(0, 8, self)
-        self.orders_model.setHorizontalHeaderLabels(
-            [
-                "time",
-                "side",
-                "price",
-                "qty",
-                "status",
-                "age_ms",
-                "dist_ticks_to_fill",
-                "tag",
-            ]
-        )
-        self.orders_table = QTableView()
-        self.orders_table.setModel(self.orders_model)
-        self.orders_table.verticalHeader().setVisible(False)
-        self.orders_table.setAlternatingRowColors(True)
-        self.orders_table.setSelectionBehavior(QTableView.SelectionBehavior.SelectRows)
-        self.orders_table.setWordWrap(False)
-        self.orders_table.setFont(fixed_font)
-        open_header = self.orders_table.horizontalHeader()
-        open_header.setStretchLastSection(False)
-        open_header.setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
-        column_widths = [90, 55, 110, 110, 90, 80, 120, 260]
-        for idx, width in enumerate(column_widths):
-            self.orders_table.setColumnWidth(idx, width)
-        open_layout.addWidget(self.orders_table, stretch=1)
-        orders_tabs.addTab(open_tab, "OPEN")
 
         fills_tab = QWidget()
         fills_layout = QVBoxLayout(fills_tab)
@@ -680,8 +677,8 @@ class MainWindow(QMainWindow):
         self.start_long_button.setEnabled(False)
         self.start_short_button.setEnabled(False)
         self.stop_button.setEnabled(False)
-        self._orders_model_clear()
         self._fills_model_clear()
+        self._reset_active_orders_summary()
         self._set_hud_defaults()
 
         self._connected = False
@@ -1585,14 +1582,15 @@ class MainWindow(QMainWindow):
             f"minNotional: {self._fmt_price(profile.min_notional)}"
         )
 
-    def _orders_model_clear(self) -> None:
-        self.orders_model.removeRows(0, self.orders_model.rowCount())
-        self._open_order_rows.clear()
-
     def _fills_model_clear(self) -> None:
         self.fills_model.removeRows(0, self.fills_model.rowCount())
         self._fills_history.clear()
         self._last_ledger_table_ts = 0.0
+
+    def _reset_active_orders_summary(self) -> None:
+        self.active_entry_label.setText("—")
+        self.active_tp_label.setText("—")
+        self.active_sl_label.setText("—")
 
     def _refresh_orders(self) -> None:
         if not self._connected or not self._rest or not self._settings:
@@ -1609,9 +1607,6 @@ class MainWindow(QMainWindow):
 
         if not orders_error:
             self._orders_error_logged = False
-        price_state = None
-        if self._router:
-            price_state, _ = self._router.build_price_state()
         if self._trade_executor:
             self._trade_executor.sync_open_orders(open_orders)
         now_ms = int(datetime.utcnow().timestamp() * 1000)
@@ -1622,113 +1617,68 @@ class MainWindow(QMainWindow):
         )
         if self._order_tracker:
             self.order_tracker_sync.emit(orders)
-        self._update_open_orders_table(orders, now_ms, price_state)
+        self._update_active_orders_summary(orders, now_ms)
 
-    def _update_open_orders_table(
-        self,
-        orders: list[dict],
-        now_ms: int,
-        price_state: Optional[PriceState],
-    ) -> None:
-        seen_keys: set[str] = set()
-        bid = price_state.bid if price_state else None
-        ask = price_state.ask if price_state else None
+    def _update_active_orders_summary(self, orders: list[dict], now_ms: int) -> None:
+        entry_order = None
+        tp_orders: list[dict] = []
+        sl_orders: list[dict] = []
         for order in orders:
-            key = self._order_key(order)
-            seen_keys.add(key)
-            row = self._open_order_rows.get(key)
-            order_time = order.get("created_ts")
-            age_ms = None
-            if isinstance(order_time, int):
-                age_ms = max(0, now_ms - order_time)
-            qty = order.get("qty")
-            price = order.get("price")
-            side = str(order.get("side", "—")).upper()
-            dist_ticks = self._dist_ticks_to_fill(side, price, bid, ask)
-            display_time = self._format_time(order_time)
-            row_values = [
-                display_time,
-                side or "—",
-                self._fmt_price(price, width=12),
-                self._fmt_qty(qty, width=8),
-                str(order.get("status", "—")),
-                self._fmt_int(age_ms, width=8),
-                self._fmt_int(dist_ticks, width=6),
-                str(order.get("clientOrderId", "—")),
-            ]
-            if row is None:
-                items = [QStandardItem(value) for value in row_values]
-                for idx, item in enumerate(items):
-                    if idx == 7:
-                        item.setTextAlignment(
-                            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
-                        )
-                        item.setText(self._elide_text(item.text(), self.orders_table, idx))
-                        item.setToolTip(row_values[idx])
-                    else:
-                        item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                items[0].setData(key, Qt.ItemDataRole.UserRole)
-                self.orders_model.appendRow(items)
-                self._open_order_rows[key] = self.orders_model.rowCount() - 1
-            else:
-                for col, value in enumerate(row_values):
-                    item = self.orders_model.item(row, col)
-                    if not item:
-                        continue
-                    if col == 7:
-                        elided = self._elide_text(value, self.orders_table, col)
-                        if item.text() != elided:
-                            item.setText(elided)
-                            item.setToolTip(value)
-                    elif item.text() != value:
-                        item.setText(value)
-                first_item = self.orders_model.item(row, 0)
-                if first_item and first_item.data(Qt.ItemDataRole.UserRole) != key:
-                    first_item.setData(key, Qt.ItemDataRole.UserRole)
-        rows_to_remove = [
-            row for key, row in self._open_order_rows.items() if key not in seen_keys
-        ]
-        for row in sorted(rows_to_remove, reverse=True):
-            self.orders_model.removeRow(row)
-        if rows_to_remove:
-            self._rebuild_open_order_index()
+            role = self._order_role(order)
+            if role == "ENTRY" and entry_order is None:
+                entry_order = order
+            elif role == "TP":
+                tp_orders.append(order)
+            elif role == "SL":
+                sl_orders.append(order)
 
-    def _rebuild_open_order_index(self) -> None:
-        self._open_order_rows.clear()
-        for row in range(self.orders_model.rowCount()):
-            item = self.orders_model.item(row, 0)
-            if item is None:
-                continue
-            key = item.data(Qt.ItemDataRole.UserRole)
-            if isinstance(key, str):
-                self._open_order_rows[key] = row
+        self.active_entry_label.setText(self._format_active_entry(entry_order, now_ms))
+        self.active_tp_label.setText(self._format_active_tp(tp_orders))
+        self.active_sl_label.setText(self._format_active_sl(sl_orders))
 
     @staticmethod
-    def _order_key(order: dict) -> str:
-        order_id = order.get("orderId")
-        client_id = order.get("clientOrderId")
-        created_ts = order.get("created_ts")
-        return str(order_id or client_id or created_ts or id(order))
-
-    def _dist_ticks_to_fill(
-        self,
-        side: str,
-        price: Optional[float],
-        bid: Optional[float],
-        ask: Optional[float],
-    ) -> Optional[int]:
-        tick_size = self._symbol_profile.tick_size
-        if not tick_size or price is None:
-            return None
-        if side == "BUY":
-            if bid is None:
-                return None
-            return max(0, round((price - bid) / tick_size))
-        if side == "SELL":
-            if ask is None:
-                return None
-            return max(0, round((ask - price) / tick_size))
+    def _order_role(order: dict) -> Optional[str]:
+        client_order_id = str(order.get("clientOrderId") or "")
+        if "-ENTRY-" in client_order_id:
+            return "ENTRY"
+        if "-XTP-" in client_order_id:
+            return "TP"
+        if "-XCR-" in client_order_id:
+            return "SL"
         return None
+
+    def _format_active_entry(self, order: Optional[dict], now_ms: int) -> str:
+        if not order:
+            return "—"
+        side = str(order.get("side", "—")).upper()
+        price = self._fmt_price(order.get("price"), width=10)
+        qty = self._fmt_qty(order.get("qty"), width=6)
+        status = str(order.get("status", "—"))
+        age_ms = None
+        order_time = order.get("created_ts")
+        if isinstance(order_time, int):
+            age_ms = max(0, now_ms - order_time)
+        age_label = self._fmt_int(age_ms, width=4)
+        return f"{side} {price} {qty} {status} age={age_label}ms"
+
+    def _format_active_tp(self, orders: list[dict]) -> str:
+        count = len(orders)
+        if not orders:
+            return "count=0"
+        order = orders[0]
+        price = self._fmt_price(order.get("price"), width=10)
+        qty = self._fmt_qty(order.get("qty"), width=6)
+        status = str(order.get("status", "—"))
+        return f"count={count} | {price} {qty} {status}"
+
+    def _format_active_sl(self, orders: list[dict]) -> str:
+        if not orders:
+            return "not armed"
+        order = orders[0]
+        price = self._fmt_price(order.get("price"), width=10)
+        qty = self._fmt_qty(order.get("qty"), width=6)
+        status = str(order.get("status", "—"))
+        return f"armed | {price} {qty} {status}"
 
     @staticmethod
     def _calculate_spread_ticks(
@@ -1841,6 +1791,9 @@ class MainWindow(QMainWindow):
         self.exit_intent_label.setText("—")
         self.exit_policy_label.setText("—")
         self.exit_age_label.setText("—")
+        self.active_entry_label.setText("—")
+        self.active_tp_label.setText("—")
+        self.active_sl_label.setText("—")
         self.cycles_target_label.setText("—")
         self.summary_label.setText(
             "EURIUSDT | SRC NONE | ages —/— | spread — | FSM —/— | pos — | "
@@ -1896,7 +1849,12 @@ class MainWindow(QMainWindow):
         open_deal = ledger.get_open_deal()
         if open_deal:
             rows.append(self._deal_row(open_deal))
-        for deal in ledger.list_closed_deals(limit=200):
+        closed_deals = sorted(
+            ledger.list_closed_deals(limit=200),
+            key=lambda deal: deal.closed_ts or deal.opened_ts or 0,
+            reverse=True,
+        )
+        for deal in closed_deals:
             rows.append(self._deal_row(deal))
         self._fills_history = rows
         self.fills_model.removeRows(0, self.fills_model.rowCount())
@@ -1929,7 +1887,7 @@ class MainWindow(QMainWindow):
             "status": status_upper,
             "realized_pnl": getattr(deal, "realized_pnl", None)
             if status_upper == "CLOSED"
-            else 0.0,
+            else None,
             "unreal_pnl": getattr(deal, "unrealized_pnl", None)
             if status_upper == "OPEN"
             else None,
