@@ -377,11 +377,15 @@ class TradeExecutor:
         if not self._should_dedup_log(f"entry_finalize:{reason}", 2.0):
             self._logger(f"[ENTRY_FINALIZE] reason={reason}")
 
-    def _set_entry_wait_state(self, kind: Optional[str]) -> None:
+    def _set_entry_wait_state(self, kind: Optional[str], force_reset: bool = False) -> None:
         if kind is None:
             self._clear_entry_wait()
             return
-        if self._entry_wait_kind != kind or self._entry_wait_enter_ts_ms is None:
+        if (
+            force_reset
+            or self._entry_wait_kind != kind
+            or self._entry_wait_enter_ts_ms is None
+        ):
             self._entry_wait_kind = kind
             self._entry_wait_enter_ts_ms = int(time.monotonic() * 1000)
             self._entry_wait_deadline_ms = self._resolve_wait_deadline_ms(kind)
@@ -390,11 +394,15 @@ class TradeExecutor:
                 time.monotonic() + (deadline_ms / 1000.0) if deadline_ms > 0 else None
             )
 
-    def _set_exit_wait_state(self, kind: Optional[str]) -> None:
+    def _set_exit_wait_state(self, kind: Optional[str], force_reset: bool = False) -> None:
         if kind is None:
             self._clear_exit_wait()
             return
-        if self._exit_wait_kind != kind or self._exit_wait_enter_ts_ms is None:
+        if (
+            force_reset
+            or self._exit_wait_kind != kind
+            or self._exit_wait_enter_ts_ms is None
+        ):
             self._exit_wait_kind = kind
             self._exit_wait_enter_ts_ms = int(time.monotonic() * 1000)
             self._exit_wait_deadline_ms = self._resolve_wait_deadline_ms(kind)
@@ -403,11 +411,15 @@ class TradeExecutor:
                 time.monotonic() + (deadline_ms / 1000.0) if deadline_ms > 0 else None
             )
 
-    def _set_cancel_wait_state(self, kind: Optional[str]) -> None:
+    def _set_cancel_wait_state(self, kind: Optional[str], force_reset: bool = False) -> None:
         if kind is None:
             self._clear_cancel_wait()
             return
-        if self._cancel_wait_kind != kind or self._cancel_wait_enter_ts_ms is None:
+        if (
+            force_reset
+            or self._cancel_wait_kind != kind
+            or self._cancel_wait_enter_ts_ms is None
+        ):
             self._cancel_wait_kind = kind
             self._cancel_wait_enter_ts_ms = int(time.monotonic() * 1000)
             self._cancel_wait_deadline_ms = self._resolve_wait_deadline_ms(kind)
@@ -650,11 +662,20 @@ class TradeExecutor:
             return False
         return True
 
-    def _set_wait_state(self, kind: Optional[str], deadline_ms: Optional[int]) -> None:
+    def _set_wait_state(
+        self,
+        kind: Optional[str],
+        deadline_ms: Optional[int],
+        force_reset: bool = False,
+    ) -> None:
         if kind is None:
             self._clear_wait_state()
             return
-        if self._wait_state_kind != kind or self._wait_state_enter_ts_ms is None:
+        if (
+            force_reset
+            or self._wait_state_kind != kind
+            or self._wait_state_enter_ts_ms is None
+        ):
             self._wait_state_kind = kind
             self._wait_state_enter_ts_ms = int(time.monotonic() * 1000)
         self._wait_state_deadline_ms = deadline_ms
@@ -671,6 +692,38 @@ class TradeExecutor:
                 return self._resolve_wait_deadline_ms("ENTRY_CANCEL_WAIT")
             return self._resolve_wait_deadline_ms("EXIT_CANCEL_WAIT")
         return 0
+
+    def _log_wait_reset(self, kind: str, reason: str) -> None:
+        if self._should_dedup_log(f"wait_reset:{kind}:{reason}", 1.0):
+            return
+        self._logger(f"[WAIT_RESET] kind={kind} reason={reason}")
+
+    def _reset_entry_wait(self, reason: str) -> None:
+        self._set_entry_wait_state("ENTRY_WAIT", force_reset=True)
+        self._set_wait_state(
+            "ENTRY_WAIT",
+            self._resolve_wait_state_deadline_ms("ENTRY_WAIT"),
+            force_reset=True,
+        )
+        self._log_wait_reset("ENTRY_WAIT", reason)
+
+    def _reset_exit_wait(self, reason: str) -> None:
+        wait_kind = "EXIT_CROSS_WAIT" if self._tp_exit_phase == "CROSS" else "EXIT_MAKER_WAIT"
+        self._set_exit_wait_state(wait_kind, force_reset=True)
+        self._set_wait_state(
+            "EXIT_WAIT",
+            self._resolve_wait_state_deadline_ms("EXIT_WAIT"),
+            force_reset=True,
+        )
+        self._log_wait_reset("EXIT_WAIT", reason)
+
+    def _reset_cancel_wait(self, kind: str) -> None:
+        self._set_cancel_wait_state(kind, force_reset=True)
+        self._set_wait_state(
+            "CANCEL_WAIT",
+            self._resolve_wait_state_deadline_ms("CANCEL_WAIT"),
+            force_reset=True,
+        )
 
     def _check_wait_deadline(self, now: float) -> bool:
         cancel_kind = None
@@ -2185,6 +2238,7 @@ class TradeExecutor:
                         tag=active_sell_order.get("tag", self.TAG),
                     )
                     self.sell_cancel_pending = True
+                    self._reset_cancel_wait("EXIT_CANCEL_WAIT")
                     return
             return
 
@@ -3042,6 +3096,10 @@ class TradeExecutor:
             if reset_retry:
                 self._reset_sell_retry()
             self._start_sell_wait()
+            if exit_role == "EXIT_TP":
+                self._reset_exit_wait("placed")
+            elif reason_upper == "TP_CROSS":
+                self._reset_exit_wait("switch_to_cross")
             now_ms = int(time.time() * 1000)
             self.sell_active_order_id = exit_order_id
             self.sell_cancel_pending = False
@@ -3217,7 +3275,7 @@ class TradeExecutor:
         wait_kind = "EXIT_CROSS_WAIT"
         if self._tp_exit_phase == "MAKER":
             wait_kind = "EXIT_MAKER_WAIT"
-        self._set_exit_wait_state(wait_kind)
+        self._set_exit_wait_state(wait_kind, force_reset=True)
 
     def _reset_buy_retry(self) -> None:
         self._buy_wait_started_ts = None
@@ -3229,7 +3287,7 @@ class TradeExecutor:
 
     def _start_buy_wait(self) -> None:
         self._buy_wait_started_ts = time.monotonic()
-        self._set_entry_wait_state("ENTRY_WAIT")
+        self._set_entry_wait_state("ENTRY_WAIT", force_reset=True)
 
     def _start_entry_cancel(self, reason: str, age_ms: Optional[int] = None) -> bool:
         buy_order = self._get_active_entry_order()
@@ -3263,7 +3321,7 @@ class TradeExecutor:
         self.entry_cancel_pending = True
         self._entry_replace_after_cancel = True
         self._entry_cancel_requested_ts = time.monotonic()
-        self._set_cancel_wait_state("ENTRY_CANCEL_WAIT")
+        self._reset_cancel_wait("ENTRY_CANCEL_WAIT")
         return True
 
     def _attempt_entry_replace_from_cancel(self) -> None:
@@ -3692,6 +3750,9 @@ class TradeExecutor:
         self.entry_active_order_id = entry_order.get("orderId")
         self.entry_active_price = new_price
         self.entry_cancel_pending = False
+        if isinstance(entry_order_id, int):
+            reset_reason = "repriced" if reason in {"reprice", "deadline_replace"} else "placed"
+            self._reset_entry_wait(reset_reason)
         ref_price, _ = self._entry_reference(bid, ask)
         if ref_price is not None:
             self._entry_last_ref_bid = ref_price
@@ -4040,6 +4101,7 @@ class TradeExecutor:
                     return
                 else:
                     self.entry_cancel_pending = True
+                    self._reset_cancel_wait("ENTRY_CANCEL_WAIT")
                     return
         self.active_test_orders = [
             entry for entry in self.active_test_orders if entry.get("orderId") != order_id
@@ -4860,6 +4922,7 @@ class TradeExecutor:
                                 tag=order.get("tag", self.TAG),
                             )
                         self.entry_cancel_pending = True
+                        self._reset_cancel_wait("ENTRY_CANCEL_WAIT")
                     if needs_exit_place:
                         self._ensure_exit_orders(
                             price_state,
@@ -5678,6 +5741,7 @@ class TradeExecutor:
         )
         self.sell_active_order_id = None
         self.sell_cancel_pending = True
+        self._reset_cancel_wait("EXIT_CANCEL_WAIT")
 
     def _override_to_sl(self, bid: Optional[float], ask: Optional[float]) -> None:
         self._cancel_entry_before_exit(timeout_s=1.0)
