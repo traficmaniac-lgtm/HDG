@@ -12,6 +12,7 @@ from typing import Callable, Optional
 import httpx
 
 from src.core.models import HealthState, PriceState, Settings, SymbolProfile
+from src.core.trade_ledger import CycleStatus, TradeLedger
 from src.services.binance_rest import BinanceRestClient
 from src.services.price_router import PriceRouter
 
@@ -74,6 +75,8 @@ class TradeExecutor:
         self.pnl_cycle: Optional[float] = None
         self.pnl_session: float = 0.0
         self.last_exit_reason: Optional[str] = None
+        self.ledger = TradeLedger(logger=self._logger)
+        self._last_ledger_unreal_ts = 0.0
         self._last_buy_price: Optional[float] = None
         self._buy_wait_started_ts: Optional[float] = None
         self._buy_retry_count = 0
@@ -851,6 +854,8 @@ class TradeExecutor:
         }
         self._mark_progress(reason=f"state:{previous.value}->{next_state.value}", reset_reconcile=reset_reconcile)
         self._logger(f"[STATE] {previous.value} → {next_state.value}")
+        if next_state == TradeState.STATE_ERROR:
+            self.ledger.mark_error(notes="STATE_ERROR")
 
     def _exit_state_for_intent(self, intent: Optional[str]) -> TradeState:
         normalized = self._normalize_exit_intent(intent)
@@ -895,6 +900,15 @@ class TradeExecutor:
     def _log_cycle_start(self, cycle_id: int) -> None:
         self._cycle_started_ts = time.monotonic()
         self._logger(f"[CYCLE_START] id={cycle_id}")
+        if self.ledger._next_id <= cycle_id:
+            self.ledger._next_id = cycle_id
+        self.ledger.start_cycle(
+            symbol=self._settings.symbol,
+            direction=self._direction,
+            entry_qty=0.0,
+            entry_avg=0.0,
+            notes="START",
+        )
 
     def _log_cycle_fill(self, cycle_id: Optional[int], side: str, delta: float, cum: float) -> None:
         if cycle_id is None:
@@ -5280,6 +5294,8 @@ class TradeExecutor:
                 self.mark_progress(reason="partial_fill", reset_reconcile=True)
                 self._log_cycle_fill(cycle_id, entry_side, delta, cum_qty)
                 fill_price = avg_price if avg_price > 0 else order.get("price")
+                if fill_price is not None:
+                    self.ledger.on_entry_fill(delta, float(fill_price))
                 if self.position is None:
                     self.position = {
                         "buy_price": fill_price,
@@ -5357,6 +5373,9 @@ class TradeExecutor:
             self._reconcile_position_from_fills()
             if delta > 0:
                 self._log_cycle_fill(cycle_id, exit_side, delta, cum_qty)
+                fill_price = avg_price if avg_price > 0 else order.get("price")
+                if fill_price is not None:
+                    self.ledger.on_exit_fill(delta, float(fill_price))
                 cycle_label = "—" if cycle_id is None else str(cycle_id)
                 self._logger(
                     f"[SELL_PARTIAL] {self._direction_tag()} "
@@ -5444,6 +5463,7 @@ class TradeExecutor:
             delta = max(qty - prev_cum, 0.0)
             if delta > 0:
                 self._log_cycle_fill(cycle_id, entry_side, delta, qty)
+                self.ledger.on_entry_fill(delta, price)
             self._reset_buy_retry()
             self._clear_entry_attempt()
             if self.entry_active_order_id == order_id:
@@ -5529,6 +5549,8 @@ class TradeExecutor:
             delta = max(qty - prev_cum, 0.0)
             if delta > 0:
                 self._log_cycle_fill(cycle_id, exit_side, delta, qty)
+                if fill_price is not None:
+                    self.ledger.on_exit_fill(delta, float(fill_price))
             pnl = self._finalize_close(order)
             self.last_exit_reason = exit_reason
             if exit_reason in {"TP_MAKER", "TP_FORCE", "TP_CROSS", "SL_HARD"}:
@@ -5571,6 +5593,8 @@ class TradeExecutor:
             f"cycle_id={cycle_label} qty={qty:.8f} price={price_label}"
         )
         self._log_cycle_fill(cycle_id, entry_side, qty, qty)
+        if price is not None:
+            self.ledger.on_entry_fill(qty, float(price))
         self._reset_buy_retry()
         self._clear_entry_attempt()
         if self.position is None:
@@ -5629,6 +5653,21 @@ class TradeExecutor:
                 return (entry_price - mid) * qty
             return (mid - entry_price) * qty
         return None
+
+    def update_ledger_unrealized(self, price_state: Optional[PriceState]) -> None:
+        if price_state is None:
+            return
+        active_cycle = self.ledger.active_cycle
+        if not active_cycle or active_cycle.status != CycleStatus.OPEN:
+            return
+        now = time.monotonic()
+        if (now - self._last_ledger_unreal_ts) < 0.25:
+            return
+        self._last_ledger_unreal_ts = now
+        mark_price = price_state.bid if self._direction == "LONG" else price_state.ask
+        if mark_price is None:
+            return
+        self.ledger.update_unrealized(mark_price, mark_side="BOOK")
 
     def _finalize_close(self, sell_order: dict) -> Optional[float]:
         sell_price = sell_order.get("price")
@@ -5989,6 +6028,7 @@ class TradeExecutor:
             if notion > 0:
                 pnl_bps = (pnl / notion) * 10000
         self._log_cycle_close(cycle_id, pnl, pnl_bps, reason)
+        self.ledger.close_cycle(notes=reason)
         duration_ms = None
         if self._cycle_started_ts is not None:
             duration_ms = int((time.monotonic() - self._cycle_started_ts) * 1000.0)
@@ -6305,6 +6345,7 @@ class TradeExecutor:
         self._transition_state(TradeState.STATE_FLAT)
         self._transition_state(TradeState.STATE_IDLE)
         self.last_action = "aborted"
+        self.ledger.mark_error(notes=reason)
         self._handle_cycle_completion(reason=reason, critical=critical)
         self._cleanup_cycle_state(cycle_id)
         return cancelled
