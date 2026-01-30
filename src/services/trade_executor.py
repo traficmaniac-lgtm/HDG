@@ -218,6 +218,27 @@ class TradeExecutor:
     def _direction_tag(self) -> str:
         return f"dir={self._direction}"
 
+    def get_direction(self) -> Optional[str]:
+        direction = str(self._direction or "").upper()
+        if direction in {"LONG", "SHORT"}:
+            return direction
+        return None
+
+    def get_entry_avg_price(self) -> Optional[float]:
+        entry_avg = self._entry_avg_price
+        if entry_avg is None or entry_avg <= 0:
+            return None
+        return entry_avg
+
+    def get_executed_qty_total(self) -> float:
+        return float(self._executed_qty_total or self.position_qty_base or 0.0)
+
+    def get_exit_trigger_prices(self) -> tuple[Optional[float], Optional[float]]:
+        entry_avg = self.get_entry_avg_price()
+        if entry_avg is None:
+            return None, None
+        return self._compute_tp_sl_prices(entry_avg)
+
     def _entry_side(self) -> str:
         return "SELL" if self._direction == "SHORT" else "BUY"
 
@@ -1400,31 +1421,57 @@ class TradeExecutor:
         if entry_avg is None:
             entry_avg = self._entry_avg_price
         tick_size = self._profile.tick_size
-        if entry_avg is None or tick_size is None or tick_size <= 0:
+        if entry_avg is None or entry_avg <= 0 or tick_size is None or tick_size <= 0:
             return None, None
         tp_ticks = int(self._settings.take_profit_ticks)
         sl_ticks = int(self._settings.stop_loss_ticks)
         tp_price = None
         sl_price = None
         position_side = self._position_side()
+        if position_side not in {"LONG", "SHORT"}:
+            return None, None
         if tp_ticks > 0:
             if position_side == "SHORT":
-                tp_price = self._round_to_step(
-                    entry_avg - (tp_ticks * tick_size), tick_size
-                )
+                raw_tp = entry_avg - (tp_ticks * tick_size)
+                tp_price = self._round_to_tick(raw_tp, tick_size, mode="DOWN")
             else:
-                tp_price = self._round_to_step(
-                    entry_avg + (tp_ticks * tick_size), tick_size
-                )
+                raw_tp = entry_avg + (tp_ticks * tick_size)
+                tp_price = self._round_to_tick(raw_tp, tick_size, mode="UP")
         if sl_ticks > 0:
             if position_side == "SHORT":
-                sl_price = self._round_to_step(
-                    entry_avg + (sl_ticks * tick_size), tick_size
-                )
+                raw_sl = entry_avg + (sl_ticks * tick_size)
+                sl_price = self._round_to_tick(raw_sl, tick_size, mode="UP")
             else:
-                sl_price = self._round_to_step(
-                    entry_avg - (sl_ticks * tick_size), tick_size
-                )
+                raw_sl = entry_avg - (sl_ticks * tick_size)
+                sl_price = self._round_to_tick(raw_sl, tick_size, mode="DOWN")
+
+        executed_qty = self.get_executed_qty_total()
+        tp_label = "—" if tp_price is None else f"{tp_price:.8f}"
+        sl_label = "—" if sl_price is None else f"{sl_price:.8f}"
+        self._logger(
+            "[TRIGGERS] "
+            f"dir={position_side} entry_avg={entry_avg:.8f} exec_qty={executed_qty:.8f} "
+            f"tick={tick_size:.8f} tp_ticks={tp_ticks} sl_ticks={sl_ticks} "
+            f"tp={tp_label} sl={sl_label}"
+        )
+
+        invalid = False
+        if position_side == "SHORT":
+            if tp_price is not None and tp_price >= entry_avg:
+                invalid = True
+            if sl_price is not None and sl_price <= entry_avg:
+                invalid = True
+        else:
+            if tp_price is not None and tp_price <= entry_avg:
+                invalid = True
+            if sl_price is not None and sl_price >= entry_avg:
+                invalid = True
+        if invalid:
+            self._logger(
+                "[WARN][TRIGGERS] "
+                f"dir={position_side} entry_avg={entry_avg:.8f} tp={tp_label} sl={sl_label}"
+            )
+            return None, None
         return tp_price, sl_price
 
     def _tp_trigger_price(
@@ -2349,7 +2396,7 @@ class TradeExecutor:
         remaining_qty = self._remaining_qty
         if remaining_qty <= self._epsilon_qty():
             return
-        entry_avg = self._entry_avg_price or self.get_buy_price()
+        entry_avg = self._entry_avg_price
         tp_price, sl_price = self._compute_tp_sl_prices(entry_avg)
         bid = price_state.bid
         ask = price_state.ask
@@ -4676,7 +4723,7 @@ class TradeExecutor:
             f"[EXIT_STUCK_TIMEOUT] waited_ms={elapsed_ms} "
             f"limit_ms={max_wait_ms} side={exit_side}"
         )
-        entry_avg = self._entry_avg_price or self.get_buy_price()
+        entry_avg = self._entry_avg_price
         tp_price, sl_price = self._compute_tp_sl_prices(entry_avg)
         sl_breached = self._sl_breached(price_state, sl_price)
         best_bid, best_ask = self._book_refs(price_state)
@@ -4959,7 +5006,7 @@ class TradeExecutor:
             if force_cross and not have_open_exit:
                 price_state, _ = self._router.build_price_state()
                 best_bid, best_ask = self._book_refs(price_state)
-                entry_avg = self._entry_avg_price or self.get_buy_price()
+                entry_avg = self._entry_avg_price
                 tp_price, _ = self._compute_tp_sl_prices(entry_avg)
                 position_side = self._position_side()
                 tp_triggered = False
@@ -7018,6 +7065,17 @@ class TradeExecutor:
     @staticmethod
     def _round_to_step(value: float, step: float) -> float:
         return round(value / step) * step
+
+    @staticmethod
+    def _round_to_tick(value: float, tick_size: float, mode: str = "NEAREST") -> float:
+        if tick_size <= 0:
+            return value
+        scaled = value / tick_size
+        if mode == "UP":
+            return math.ceil(scaled) * tick_size
+        if mode == "DOWN":
+            return math.floor(scaled) * tick_size
+        return round(scaled) * tick_size
 
     @staticmethod
     def _round_up(value: float, step: float) -> float:

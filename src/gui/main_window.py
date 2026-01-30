@@ -1521,32 +1521,29 @@ class MainWindow(QMainWindow):
         ask: Optional[float],
         mid: Optional[float],
     ) -> None:
-        buy_price = None
         tp_price = None
         sl_price = None
         tp_ready = False
         sl_ready = False
-        tick_size = self._symbol_profile.tick_size if self._symbol_profile else None
         if self._trade_executor and self._settings:
-            buy_price = self._trade_executor.get_buy_price()
-            if buy_price is not None and tick_size:
-                tp_price = buy_price + self._settings.take_profit_ticks * tick_size
-                sl_price = buy_price - self._settings.stop_loss_ticks * tick_size
+            entry_avg = self._trade_executor.get_entry_avg_price()
+            executed_qty = self._trade_executor.get_executed_qty_total()
+            position_side = self._trade_executor.get_direction()
+            if entry_avg is not None and executed_qty > 0 and position_side:
+                tp_price, sl_price = self._trade_executor.get_exit_trigger_prices()
                 best_bid = bid if bid is not None else mid
                 best_ask = ask if ask is not None else mid
-                position_side = (
-                    "SHORT" if self._trade_executor.get_entry_side() == "SELL" else "LONG"
-                )
-                if position_side == "SHORT":
-                    if best_ask is not None and best_ask <= tp_price:
-                        tp_ready = True
-                    if best_bid is not None and best_bid >= sl_price:
-                        sl_ready = True
-                else:
-                    if best_bid is not None and best_bid >= tp_price:
-                        tp_ready = True
-                    if best_ask is not None and best_ask <= sl_price:
-                        sl_ready = True
+                if tp_price is not None and sl_price is not None:
+                    if position_side == "SHORT":
+                        if best_ask is not None and best_ask <= tp_price:
+                            tp_ready = True
+                        if best_bid is not None and best_bid >= sl_price:
+                            sl_ready = True
+                    else:
+                        if best_bid is not None and best_bid >= tp_price:
+                            tp_ready = True
+                        if best_ask is not None and best_ask <= sl_price:
+                            sl_ready = True
 
         self.tp_price_label.setText(self._fmt_price(tp_price, width=12))
         self.sl_price_label.setText(self._fmt_price(sl_price, width=12))
