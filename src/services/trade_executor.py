@@ -183,6 +183,7 @@ class TradeExecutor:
         self._entry_cancel_requested_ts: Optional[float] = None
         self._last_effective_source: Optional[str] = None
         self._last_open_orders_signature: Optional[tuple] = None
+        self._last_open_orders: Optional[list[dict]] = None
         self._recover_cancel_attempts = {"entry": 0, "exit": 0}
         self._last_recover_reason: Optional[str] = None
         self._last_recover_from: Optional[TradeState] = None
@@ -442,6 +443,107 @@ class TradeExecutor:
         if not isinstance(order_id, int):
             return
         self._order_roles.pop(order_id, None)
+
+    def _log_guard_active_order(
+        self,
+        role: str,
+        action: str = "skip_place",
+        reason: str = "active_exists",
+    ) -> None:
+        key = f"guard_active_order:{role}:{action}:{reason}"
+        if self._should_dedup_log(key, 1.0):
+            return
+        self._logger(
+            f"[GUARD_ACTIVE_ORDER] role={role} action={action} reason={reason}"
+        )
+        if role == "ENTRY":
+            if not self._should_dedup_log("guard_active_entry", 1.0):
+                self._logger("[GUARD_ACTIVE_ENTRY] skip_place")
+
+    def _client_order_has_role(self, client_order_id: str, role: str) -> bool:
+        tag = None
+        if role == "ENTRY":
+            tag = self._entry_role_tag()
+        elif role in {"EXIT_TP", "EXIT_CROSS"}:
+            tag = self._exit_role_tag()
+        if not tag:
+            return False
+        return f"-{tag}" in client_order_id
+
+    def _has_active_role(self, role: str) -> bool:
+        role_upper = role.upper()
+        for order in self.active_test_orders:
+            order_role = str(order.get("role") or "").upper()
+            if order_role != role_upper:
+                continue
+            if role_upper == "ENTRY":
+                if not self._entry_order_is_final(order):
+                    return True
+            elif role_upper in {"EXIT_TP", "EXIT_CROSS"}:
+                if not self._sell_order_is_final(order):
+                    return True
+            else:
+                status = str(order.get("status") or "").upper()
+                if status not in {"FILLED", "CANCELED", "REJECTED", "EXPIRED"}:
+                    return True
+        open_orders = self._last_open_orders or []
+        if open_orders:
+            open_map = {order.get("orderId"): order for order in open_orders}
+            for order_id, role_entry in self._order_roles.items():
+                if str(role_entry.get("role") or "").upper() != role_upper:
+                    continue
+                if order_id in open_map:
+                    return True
+            for order in open_orders:
+                client_order_id = str(order.get("clientOrderId") or "")
+                if self._client_order_has_role(client_order_id, role_upper):
+                    return True
+        return False
+
+    def _should_skip_recover_for_active_order(
+        self,
+        reason: str,
+        from_state: TradeState,
+    ) -> bool:
+        guard_reasons = {
+            "deadline",
+            "progress_deadline_entry",
+            "progress_deadline_exit",
+            "watchdog_timeout",
+        }
+        if reason not in guard_reasons:
+            return False
+        price_state, _ = self._router.build_price_state()
+        self._update_data_blind_state(price_state)
+        self._note_effective_source(price_state.source)
+        effective_source = self._last_effective_source or price_state.source
+        if price_state.data_blind or effective_source == "NONE":
+            return False
+        roles_to_check: list[str] = []
+        if from_state == TradeState.STATE_ENTRY_WORKING:
+            roles_to_check = ["ENTRY"]
+        elif from_state in {
+            TradeState.STATE_EXIT_TP_WORKING,
+            TradeState.STATE_EXIT_SL_WORKING,
+        } or self._in_exit_workflow():
+            if self._tp_exit_phase == "CROSS":
+                roles_to_check = ["EXIT_CROSS"]
+            else:
+                roles_to_check = ["EXIT_TP", "EXIT_CROSS"]
+        if not roles_to_check:
+            return False
+        for role in roles_to_check:
+            if self._has_active_role(role):
+                if not self._should_dedup_log(
+                    f"recover_skip_active:{from_state.value}:{role}",
+                    1.0,
+                ):
+                    self._logger(
+                        "[RECOVER_SKIP_ACTIVE] "
+                        f"state={from_state.value} role={role} reason={reason}"
+                    )
+                return True
+        return False
 
     def _resolve_fill_role(
         self, order_id: Optional[int], side_upper: str
@@ -1315,6 +1417,10 @@ class TradeExecutor:
                 return 0
             entry_side = self._entry_side()
             exit_side = self._exit_side()
+            if self._has_active_role("ENTRY"):
+                self._log_guard_active_order("ENTRY")
+                self.last_action = "entry_active_guard"
+                return 0
             if self._has_active_order(exit_side) or self.sell_active_order_id is not None:
                 self._logger(
                     f"[ERROR] active {exit_side} detected during PLACE_{entry_side} -> SAFE_STOP"
@@ -2493,6 +2599,22 @@ class TradeExecutor:
         if self.sell_cancel_pending:
             self.last_action = "sell_cancel_pending"
             return 0
+        reason_upper = reason.upper()
+        intent = self._normalize_exit_intent(exit_intent or self.exit_intent or reason)
+        exit_order_type = self._resolve_exit_order_type(intent, reason_upper)
+        is_cross_intent = (
+            exit_order_type == "MARKET"
+            or reason_upper in {"TP_CROSS", "TP_FORCE", "SL_HARD", "EMERGENCY", "RECOVERY"}
+            or self._tp_exit_phase == "CROSS"
+        )
+        if self._has_active_role("EXIT_CROSS"):
+            self._log_guard_active_order("EXIT_CROSS")
+            self.last_action = "exit_cross_active_guard"
+            return 0
+        if self._has_active_role("EXIT_TP") and not is_cross_intent:
+            self._log_guard_active_order("EXIT_TP")
+            self.last_action = "exit_tp_active_guard"
+            return 0
         active_sell_order = self._get_active_sell_order()
         if active_sell_order and not self._sell_order_is_final(active_sell_order):
             self._logger("[SELL_SKIP_DUPLICATE] reason=active_sell")
@@ -2954,6 +3076,10 @@ class TradeExecutor:
 
     def _place_emergency_market_sell(self, qty: float, force: bool = False) -> int:
         exit_side = self._exit_side()
+        if self._has_active_role("EXIT_CROSS"):
+            self._log_guard_active_order("EXIT_CROSS")
+            self.last_action = "exit_cross_active_guard"
+            return 0
         active_sell_order = self._get_active_sell_order()
         if active_sell_order and not self._sell_order_is_final(active_sell_order):
             if not force:
@@ -3487,6 +3613,10 @@ class TradeExecutor:
         entry_context: str,
         reason: str,
     ) -> bool:
+        if reason not in {"reprice", "deadline_replace"} and self._has_active_role("ENTRY"):
+            self._log_guard_active_order("ENTRY")
+            self.last_action = "entry_active_guard"
+            return False
         if not self._profile.tick_size or not self._profile.step_size:
             return False
         new_price = self._calculate_entry_price(price)
@@ -4121,6 +4251,11 @@ class TradeExecutor:
         return self._start_reconcile_from_watchdog(state_age_ms, no_progress_ms)
 
     def _start_reconcile_from_watchdog(self, state_age_ms: int, no_progress_ms: int) -> bool:
+        if self._should_skip_recover_for_active_order(
+            reason="watchdog_timeout",
+            from_state=self.state,
+        ):
+            return False
         self._logger(
             "[WD] "
             f"stuck state={self.state.value} age_ms={state_age_ms} "
@@ -4148,6 +4283,8 @@ class TradeExecutor:
         wait_kind: Optional[str] = None,
         age_ms: Optional[int] = None,
     ) -> bool:
+        if self._should_skip_recover_for_active_order(reason, self.state):
+            return False
         from_state = self.state
         order_id = self.entry_active_order_id or self.sell_active_order_id
         age_label = age_ms if age_ms is not None else self._state_age_ms()
@@ -4391,6 +4528,7 @@ class TradeExecutor:
         except Exception as exc:
             self._logger(f"[RECONCILE] open_orders error: {exc}")
             return None
+        self._last_open_orders = open_orders
         trades = self._fetch_recent_trades()
         balance = self._get_base_balance_snapshot()
         return {
@@ -4912,6 +5050,7 @@ class TradeExecutor:
     def sync_open_orders(self, open_orders: list[dict]) -> None:
         if self._handle_stop_interrupt(open_orders=open_orders, reason="tick_stop"):
             return
+        self._last_open_orders = open_orders
         self._update_open_orders_signature(open_orders)
         if not self.active_test_orders:
             self.orders_count = 0
