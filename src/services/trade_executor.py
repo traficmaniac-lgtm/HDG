@@ -39,6 +39,8 @@ class TradeExecutor:
     TAG = "PRE_V0_8_0"
     PRICE_MOVE_TICK_THRESHOLD = 1
     MAX_FILL_KEYS = 50_000
+    MAX_SEEN_FILL_KEYS = 10_000
+    SEEN_FILL_TTL_S = 15 * 60
     ORPHAN_FILL_TTL_S = 5.0
     ENTRY_WAIT_DEADLINE_MS = 12000
     ENTRY_CANCEL_TIMEOUT_MS = 5000
@@ -120,6 +122,8 @@ class TradeExecutor:
         self._current_cycle_id: Optional[int] = None
         self._processed_fill_keys: set[tuple[object, ...]] = set()
         self._processed_fill_queue: deque[tuple[object, ...]] = deque()
+        self._seen_fill_keys: set[tuple[object, ...]] = set()
+        self._seen_fill_queue: deque[tuple[tuple[object, ...], float]] = deque()
         self._orphan_fills: deque[dict[str, object]] = deque()
         self._orphan_fill_keys: set[tuple[object, ...]] = set()
         self.wins = 0
@@ -1729,6 +1733,78 @@ class TradeExecutor:
                 return order.get(key)
         return None
 
+    @staticmethod
+    def _fill_dedupe_bucket(ts_ms: Optional[int]) -> int:
+        if ts_ms is None:
+            ts_ms = int(time.time() * 1000)
+        return int(ts_ms / 1000)
+
+    def _fill_dedupe_key(
+        self,
+        order_id: Optional[int],
+        qty: float,
+        price: float,
+        ts_ms: Optional[int],
+        trade_id: Optional[object],
+    ) -> Optional[tuple[object, ...]]:
+        if trade_id is not None:
+            return ("trade", trade_id)
+        if order_id is None:
+            return None
+        return (
+            int(order_id),
+            float(qty),
+            float(price),
+            self._fill_dedupe_bucket(ts_ms),
+        )
+
+    def _prune_seen_fills(self, now: Optional[float] = None) -> None:
+        if now is None:
+            now = time.monotonic()
+        while self._seen_fill_queue and (
+            now - self._seen_fill_queue[0][1] > self.SEEN_FILL_TTL_S
+            or len(self._seen_fill_queue) > self.MAX_SEEN_FILL_KEYS
+        ):
+            key, _ = self._seen_fill_queue.popleft()
+            self._seen_fill_keys.discard(key)
+
+    def _log_fill_dedup(
+        self,
+        action: str,
+        order_id: Optional[int],
+        qty: float,
+        price: float,
+        trade_id: Optional[object],
+        ts_ms: Optional[int],
+    ) -> None:
+        order_label = "—" if order_id is None else str(order_id)
+        trade_label = "—" if trade_id is None else str(trade_id)
+        ts_label = "—" if ts_ms is None else str(ts_ms)
+        self._logger(
+            f"[FILL_DEDUP_{action}] order_id={order_label} "
+            f"qty={qty:.8f} price={price:.8f} trade_id={trade_label} ts={ts_label}"
+        )
+
+    def _should_apply_fill_dedup(
+        self,
+        order_id: Optional[int],
+        qty: float,
+        price: float,
+        ts_ms: Optional[int],
+        trade_id: Optional[object],
+    ) -> bool:
+        key = self._fill_dedupe_key(order_id, qty, price, ts_ms, trade_id)
+        self._prune_seen_fills()
+        if key is not None and key in self._seen_fill_keys:
+            self._log_fill_dedup("SKIP", order_id, qty, price, trade_id, ts_ms)
+            return False
+        if key is not None:
+            self._seen_fill_keys.add(key)
+            self._seen_fill_queue.append((key, time.monotonic()))
+            self._prune_seen_fills()
+        self._log_fill_dedup("APPLY", order_id, qty, price, trade_id, ts_ms)
+        return True
+
     def _fill_event_key(
         self,
         order_id: Optional[int],
@@ -2206,6 +2282,8 @@ class TradeExecutor:
         self._entry_last_ws_bad_ts = None
         self._processed_fill_keys = set()
         self._processed_fill_queue.clear()
+        self._seen_fill_keys = set()
+        self._seen_fill_queue.clear()
         self._last_progress_bid = None
         self._last_progress_ask = None
         self._data_blind_since_ts = None
@@ -6175,6 +6253,9 @@ class TradeExecutor:
         )
         if meta is None:
             return
+        trade_id = self._extract_trade_id(order)
+        if not self._should_apply_fill_dedup(order_id, qty, price, ts_ms, trade_id):
+            return
         side_upper = str(side).upper()
         cycle_id = meta.cycle_id
         role = meta.role.value
@@ -6194,7 +6275,6 @@ class TradeExecutor:
                     self._log_tp_fill(cycle_id, qty, price)
             self._update_registry_status_by_order(order_id, "FILLED")
             return
-        trade_id = self._extract_trade_id(order)
         if not self._should_process_fill(order_id, side_upper, qty, price, cycle_id, trade_id):
             return
         if order.get("status") == "FILLED":
@@ -6236,6 +6316,11 @@ class TradeExecutor:
         )
         if meta is None:
             return
+        trade_id = self._extract_trade_id(order)
+        if not self._should_apply_fill_dedup(
+            order_id, cum_qty, avg_price, ts_ms, trade_id
+        ):
+            return
         side_upper = str(side).upper()
         cycle_id = meta.cycle_id
         if order is None:
@@ -6258,7 +6343,6 @@ class TradeExecutor:
                         self._log_tp_fill(cycle_id, cum_qty, fill_price)
                 self._update_registry_status_by_order(order_id, "PARTIAL", cum_qty)
             return
-        trade_id = self._extract_trade_id(order)
         if not self._should_process_fill(
             order_id, side_upper, cum_qty, avg_price, cycle_id, trade_id
         ):
@@ -6463,6 +6547,11 @@ class TradeExecutor:
         cycle_id = meta.cycle_id
         if not dedup_checked:
             trade_id = self._extract_trade_id(order)
+            ts_ms = int(order.get("updated_ts") or time.time() * 1000)
+            if not self._should_apply_fill_dedup(
+                order_id, qty, price, ts_ms, trade_id
+            ):
+                return
             if not self._should_process_fill(
                 order_id, side_label, qty, price, cycle_id, trade_id
             ):
@@ -6635,18 +6724,21 @@ class TradeExecutor:
         if qty <= 0:
             return
         entry_side = self._entry_side()
+        ts_ms = int(time.time() * 1000)
         meta = self._get_meta_for_fill(
             order_id,
             qty,
             price or 0.0,
             side=entry_side,
             kind="PARTIAL",
-            ts_ms=int(time.time() * 1000),
+            ts_ms=ts_ms,
         )
         if meta is None:
             return
         cycle_id = meta.cycle_id
         avg_price = price if price is not None else 0.0
+        if not self._should_apply_fill_dedup(order_id, qty, avg_price, ts_ms, None):
+            return
         if not self._should_process_fill(order_id, entry_side, qty, avg_price, cycle_id):
             return
         price_label = "?" if price is None else f"{price:.8f}"
