@@ -167,21 +167,26 @@ class MainWindow(QMainWindow):
         self.status_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self.status_label.setFixedWidth(120)
         self.status_label.setStyleSheet("color: #3ad07d; font-weight: 600;")
-        self.start_button = QPushButton("START")
-        self.start_button.clicked.connect(self._start_trading)
+        self.start_long_button = QPushButton("START LONG")
+        self.start_long_button.clicked.connect(self._start_trading_long)
+        self.start_short_button = QPushButton("START SHORT")
+        self.start_short_button.clicked.connect(self._start_trading_short)
         self.stop_button = QPushButton("STOP")
         self.stop_button.clicked.connect(self._stop_trading)
         self.settings_button = QPushButton("SETTINGS")
         self.settings_button.clicked.connect(self._open_trade_settings)
         self.connect_button.setFixedHeight(28)
         self.connect_button.setFixedWidth(130)
-        self.start_button.setFixedHeight(28)
-        self.start_button.setFixedWidth(110)
+        self.start_long_button.setFixedHeight(28)
+        self.start_long_button.setFixedWidth(130)
+        self.start_short_button.setFixedHeight(28)
+        self.start_short_button.setFixedWidth(130)
         self.stop_button.setFixedHeight(28)
         self.stop_button.setFixedWidth(110)
         self.settings_button.setFixedHeight(28)
         self.settings_button.setFixedWidth(120)
-        self.start_button.setEnabled(False)
+        self.start_long_button.setEnabled(False)
+        self.start_short_button.setEnabled(False)
         self.stop_button.setEnabled(False)
 
         buttons_panel = QWidget()
@@ -189,7 +194,8 @@ class MainWindow(QMainWindow):
         buttons_layout.setContentsMargins(0, 0, 0, 0)
         buttons_layout.setSpacing(8)
         buttons_layout.addWidget(self.connect_button)
-        buttons_layout.addWidget(self.start_button)
+        buttons_layout.addWidget(self.start_long_button)
+        buttons_layout.addWidget(self.start_short_button)
         buttons_layout.addWidget(self.stop_button)
         buttons_layout.addWidget(self.settings_button)
 
@@ -617,7 +623,8 @@ class MainWindow(QMainWindow):
             self._order_tracker.order_done.connect(self._on_order_done)
             self._update_trading_controls()
         else:
-            self.start_button.setEnabled(False)
+            self.start_long_button.setEnabled(False)
+            self.start_short_button.setEnabled(False)
             self.stop_button.setEnabled(False)
             if not self._has_valid_api_credentials(api_credentials):
                 self._append_log("[API] missing, trading disabled")
@@ -666,7 +673,8 @@ class MainWindow(QMainWindow):
             self._http_service.close()
 
         self._trade_executor = None
-        self.start_button.setEnabled(False)
+        self.start_long_button.setEnabled(False)
+        self.start_short_button.setEnabled(False)
         self.stop_button.setEnabled(False)
         self._orders_model_clear()
         self._fills_model_clear()
@@ -857,7 +865,8 @@ class MainWindow(QMainWindow):
         orders_snapshot = (
             self._trade_executor.get_orders_snapshot() if self._trade_executor else []
         )
-        entry_order = self._find_active_order(orders_snapshot, "BUY")
+        entry_side = self._trade_executor.get_entry_side() if self._trade_executor else "BUY"
+        entry_order = self._find_active_order(orders_snapshot, entry_side)
         entry_price = entry_order.get("price") if entry_order else None
         if entry_price is None and self._trade_executor:
             entry_price = self._trade_executor.get_buy_price()
@@ -870,8 +879,8 @@ class MainWindow(QMainWindow):
 
         exit_intent = self._trade_executor.exit_intent if self._trade_executor else None
         exit_policy = "—"
-        if exit_intent:
-            exit_policy, _ = TradeExecutor._resolve_exit_policy(exit_intent)
+        if exit_intent and self._trade_executor:
+            exit_policy, _ = self._trade_executor.resolve_exit_policy(exit_intent)
         self.exit_intent_label.setText(exit_intent or "—")
         self.exit_policy_label.setText(exit_policy or "—")
         self.exit_age_label.setText(self._fmt_int(self._exit_age_ms(), width=8))
@@ -911,9 +920,12 @@ class MainWindow(QMainWindow):
             and self._has_valid_api_credentials(self._api_credentials)
         )
         state_label = self._trade_executor.get_state_label() if self._trade_executor else "—"
-        self.start_button.setEnabled(
-            can_trade and self._margin_api_access and state_label == "IDLE"
+        run_active = self._trade_executor.run_active if self._trade_executor else False
+        can_start = (
+            can_trade and self._margin_api_access and state_label == "IDLE" and not run_active
         )
+        self.start_long_button.setEnabled(can_start)
+        self.start_short_button.setEnabled(can_start)
         self.stop_button.setEnabled(can_trade)
 
     def _check_margin_permissions(self) -> None:
@@ -957,16 +969,24 @@ class MainWindow(QMainWindow):
             )
 
     @Slot()
-    def _start_trading(self) -> None:
+    def _start_trading(self, direction: str) -> None:
         if not self._trade_executor:
             return
         if not self._margin_api_access:
             self._append_log("[TRADE] blocked: margin_not_authorized")
             self._trade_executor.last_action = "margin_not_authorized"
             return
-        placed = self._trade_executor.start_cycle_run()
+        placed = self._trade_executor.start_cycle_run(direction=direction)
         if placed:
             self._refresh_orders()
+
+    @Slot()
+    def _start_trading_long(self) -> None:
+        self._start_trading(direction="LONG")
+
+    @Slot()
+    def _start_trading_short(self) -> None:
+        self._start_trading(direction="SHORT")
 
     @Slot()
     def _close_position(self) -> None:
@@ -1342,7 +1362,8 @@ class MainWindow(QMainWindow):
             return
         if not self._has_valid_api_credentials(self._api_credentials):
             self._trade_executor = None
-            self.start_button.setEnabled(False)
+            self.start_long_button.setEnabled(False)
+            self.start_short_button.setEnabled(False)
             self.stop_button.setEnabled(False)
             self._append_log("[API] missing, trading disabled")
             return
