@@ -138,6 +138,23 @@ class PriceRouter:
         )
         ws_fresh = ws_age_ms is not None and ws_age_ms <= self._settings.ws_fresh_ms
         http_fresh = http_age_ms is not None and http_age_ms <= self._settings.http_fresh_ms
+        http_blind_ms = int(
+            getattr(
+                self._settings,
+                "http_blind_ms",
+                max(self._settings.http_fresh_ms * 2, 1500),
+            )
+        )
+        ws_blind_ms = int(
+            getattr(
+                self._settings,
+                "ws_blind_ms",
+                max(self._settings.ws_stale_ms * 2, self._settings.ws_fresh_ms),
+            )
+        )
+        http_blind = http_age_ms is None or http_age_ms > http_blind_ms
+        ws_blind = ws_age_ms is None or ws_age_ms > ws_blind_ms
+        data_blind = http_blind and ws_blind
 
         stable_ms = (
             int((now - self._ws_stable_since) * 1000)
@@ -268,11 +285,12 @@ class PriceRouter:
             self._last_good_ts = now
             self._last_good_source = quote_source
 
-        data_blind = False
+        if data_blind:
+            effective_source = "NONE"
+            quote_source = "NONE"
         from_cache = False
         cache_age_ms = None
         if mid is None:
-            data_blind = True
             if self._last_good_ts is not None:
                 cache_age_ms = int((now - self._last_good_ts) * 1000)
                 bid = self._last_good_bid
@@ -280,6 +298,8 @@ class PriceRouter:
                 mid = self._last_good_mid
                 quote_source = self._last_good_source
                 from_cache = True
+        if data_blind:
+            quote_source = "NONE"
         if mid is not None:
             min_interval_s = 0.2
             should_update = (
@@ -357,8 +377,17 @@ class PriceRouter:
                 )
             self._last_effective_source = source
 
-        if now - self._last_summary_log_ts >= 5.0:
+        summary_payload = (
+            source,
+            data_blind,
+            self._ws_connected,
+            ws_age_ms,
+            http_age_ms,
+        )
+        summary_due = now - self._last_summary_log_ts >= 1.5
+        if summary_due or summary_payload != self._last_summary_payload:
             self._last_summary_log_ts = now
+            self._last_summary_payload = summary_payload
             ws_age_label = ws_age_ms if ws_age_ms is not None else "?"
             http_age_label = http_age_ms if http_age_ms is not None else "?"
             ws_state = "up" if self._ws_connected else "down"
@@ -366,7 +395,7 @@ class PriceRouter:
                 "[DATA_SUMMARY] "
                 f"ws_state={ws_state} last_reason={self._last_switch_reason} "
                 f"ws_age_ms={ws_age_label} http_age_ms={http_age_label} "
-                f"effective_source={source}"
+                f"effective_source={source} data_blind={data_blind}"
             )
 
         price_state = PriceState(

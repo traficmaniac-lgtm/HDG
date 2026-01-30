@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 
 from src.core.models import HealthState, PriceState, Settings, SymbolProfile
+from src.services import trade_executor as trade_executor_module
 from src.services.trade_executor import TradeExecutor, TradeState
 
 
@@ -236,3 +237,96 @@ def test_entry_reprice_on_1_tick_when_http_fresh() -> None:
 
     assert executor.entry_active_order_id == 2
     assert abs(executor.entry_active_price - 1.1983) <= 1e-9
+
+
+def test_entry_not_blocked_by_data_blind() -> None:
+    price_state = PriceState(
+        bid=1.1001,
+        ask=1.1002,
+        mid=1.10015,
+        source="HTTP",
+        mid_age_ms=2000,
+        data_blind=True,
+    )
+    health_state = HealthState(ws_connected=False, ws_age_ms=None, http_age_ms=200)
+    executor = make_executor(DummyRouter(price_state, health_state))
+    executor.state = TradeState.STATE_ENTRY_WORKING
+    executor.active_test_orders = [
+        {
+            "orderId": 1,
+            "side": "BUY",
+            "price": 1.1000,
+            "qty": 10.0,
+            "cum_qty": 0.0,
+            "avg_fill_price": 0.0,
+            "status": "NEW",
+            "tag": executor.TAG,
+            "clientOrderId": "test",
+            "cycle_id": 1,
+        }
+    ]
+    executor.entry_active_order_id = 1
+    executor.entry_active_price = 1.1000
+    executor._entry_last_ref_bid = 1.1000
+
+    executor._cancel_margin_order = lambda *args, **kwargs: True  # type: ignore[assignment]
+    executor._get_margin_order_snapshot = (  # type: ignore[assignment]
+        lambda _order_id: {"status": "CANCELED"}
+    )
+
+    def fake_place_margin_order(*_args, **_kwargs) -> dict:
+        return {"orderId": 2, "clientOrderId": "test-2"}
+
+    executor._place_margin_order = fake_place_margin_order  # type: ignore[assignment]
+
+    executor._handle_entry_follow_top({1: {"orderId": 1, "status": "NEW"}})
+
+    assert executor.entry_active_order_id == 2
+
+
+def test_entry_wait_deadline_triggers_cancel(monkeypatch) -> None:
+    price_state = PriceState(
+        bid=1.2000,
+        ask=1.2001,
+        mid=1.20005,
+        source="HTTP",
+        mid_age_ms=10,
+        data_blind=False,
+    )
+    health_state = HealthState(ws_connected=False, ws_age_ms=None, http_age_ms=10)
+    executor = make_executor(DummyRouter(price_state, health_state))
+    executor.state = TradeState.STATE_ENTRY_WORKING
+    executor.active_test_orders = [
+        {
+            "orderId": 1,
+            "side": "BUY",
+            "price": 1.2000,
+            "qty": 10.0,
+            "cum_qty": 0.0,
+            "avg_fill_price": 0.0,
+            "status": "NEW",
+            "tag": executor.TAG,
+            "clientOrderId": "test",
+            "cycle_id": 1,
+        }
+    ]
+    executor.entry_active_order_id = 1
+
+    now_s = 20.0
+    monkeypatch.setattr(trade_executor_module.time, "monotonic", lambda: now_s)
+    executor._wait_state_kind = "ENTRY_WAIT"
+    executor._wait_state_enter_ts_ms = int((now_s * 1000) - 13000)
+    executor._wait_state_deadline_ms = executor.ENTRY_WAIT_DEADLINE_MS
+    executor._last_progress_ts = now_s - 13.0
+
+    cancelled: list[int] = []
+
+    def fake_cancel(*_args, **_kwargs) -> bool:
+        cancelled.append(1)
+        return True
+
+    executor._cancel_margin_order = fake_cancel  # type: ignore[assignment]
+
+    assert executor._check_wait_deadline(now_s) is True
+    assert executor.entry_cancel_pending is True
+    assert cancelled == [1]
