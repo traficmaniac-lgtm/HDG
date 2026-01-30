@@ -108,11 +108,13 @@ class MainWindow(QMainWindow):
         self._cycle_id_counter = 0
         self._last_buy_fill_price: Optional[float] = None
         self._profile_info_text = "—"
-        self._log_queue = deque(maxlen=5000)
+        self._log_queue = deque()
         self._log_lock = threading.Lock()
+        self._log_dropped_lines = 0
         self._last_log_message: Optional[str] = None
         self._last_log_ts = 0.0
         self._log_max_lines = 3000
+        self._log_max_buffer = 5000
         self._log_flush_limit = 200
         self._auth_warning_pending = False
 
@@ -998,6 +1000,7 @@ class MainWindow(QMainWindow):
     def _clear_log(self) -> None:
         with self._log_lock:
             self._log_queue.clear()
+            self._log_dropped_lines = 0
         self._last_log_message = None
         self._last_log_ts = 0.0
         self.log.clear()
@@ -1014,15 +1017,28 @@ class MainWindow(QMainWindow):
         if self._should_warn_invalid_api(message):
             self._auth_warning_pending = True
         with self._log_lock:
+            overflow = len(self._log_queue) + 1 - self._log_max_buffer
+            if overflow > 0:
+                for _ in range(overflow):
+                    self._log_queue.popleft()
+                self._log_dropped_lines += overflow
             self._log_queue.append(message)
 
     def _flush_log_queue(self) -> None:
         batch: list[str] = []
         with self._log_lock:
+            if self._log_dropped_lines:
+                dropped = self._log_dropped_lines
+                self._log_dropped_lines = 0
+                batch.append(f"[LOG] dropped {dropped} lines (buffer overflow)")
             while self._log_queue and len(batch) < self._log_flush_limit:
                 batch.append(self._log_queue.popleft())
         if batch:
-            self.log.appendPlainText("\n".join(batch))
+            self.log.setUpdatesEnabled(False)
+            try:
+                self.log.appendPlainText("\n".join(batch))
+            finally:
+                self.log.setUpdatesEnabled(True)
         if self._auth_warning_pending:
             self._auth_warning_pending = False
             self._show_auth_warning_once()

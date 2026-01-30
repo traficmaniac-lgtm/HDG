@@ -80,6 +80,8 @@ class TradeExecutor:
         self._entry_last_ref_bid: Optional[float] = None
         self._entry_last_ref_ts_ms: Optional[int] = None
         self._entry_order_price: Optional[float] = None
+        self._entry_ref_not_moved_log_ts = 0.0
+        self._entry_ref_not_moved_payload: Optional[tuple[object, ...]] = None
         self._sell_wait_started_ts: Optional[float] = None
         self._sell_retry_count = 0
         self._exit_reprice_last_ts = 0.0
@@ -2761,7 +2763,7 @@ class TradeExecutor:
         self._note_price_progress(bid, ask)
         self._clear_price_wait("ENTRY")
         elapsed_ms = self._entry_attempt_elapsed_ms()
-        if elapsed_ms is not None and not self._should_dedup_log("entry_wait", 0.8):
+        if elapsed_ms is not None and not self._should_dedup_log("entry_wait", 1.5):
             self._logger(f"[ENTRY_WAIT] ms={elapsed_ms} {entry_context}")
         if not self._profile.tick_size or not self._profile.step_size:
             return
@@ -2823,13 +2825,29 @@ class TradeExecutor:
             ws_bad=ws_bad,
         )
         if not can_reprice:
-            if not self._should_dedup_log("entry_reprice_skip", 0.8):
-                new_price_label = "?" if new_price is None else f"{new_price:.8f}"
-                self._logger(
-                    "[ENTRY_REPRICE] action=SKIP "
-                    f"reason={reason_label} old_price={order_price_label} "
-                    f"new_price={new_price_label} {entry_context}"
+            if reason_label == "ref_not_moved":
+                now = time.monotonic()
+                payload = (
+                    self._normalize_entry_float(current_price),
+                    self._normalize_entry_float(bid),
                 )
+                should_log = (
+                    payload != self._entry_ref_not_moved_payload
+                    or now - self._entry_ref_not_moved_log_ts >= 1.5
+                )
+                if not should_log:
+                    return
+                self._entry_ref_not_moved_payload = payload
+                self._entry_ref_not_moved_log_ts = now
+            else:
+                if self._should_dedup_log("entry_reprice_skip", 0.8):
+                    return
+            new_price_label = "?" if new_price is None else f"{new_price:.8f}"
+            self._logger(
+                "[ENTRY_REPRICE] action=SKIP "
+                f"reason={reason_label} old_price={order_price_label} "
+                f"new_price={new_price_label} {entry_context}"
+            )
             return
         if not self._should_dedup_log("entry_reprice_do", 0.4):
             new_price_label = "?" if new_price is None else f"{new_price:.8f}"

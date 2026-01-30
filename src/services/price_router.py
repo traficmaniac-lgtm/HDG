@@ -377,20 +377,19 @@ class PriceRouter:
                 )
             self._last_effective_source = source
 
+        ws_state = "up" if self._ws_connected else "down"
         summary_payload = (
+            ws_state,
             source,
             data_blind,
-            self._ws_connected,
-            ws_age_ms,
-            http_age_ms,
+            self._last_switch_reason,
         )
-        summary_due = now - self._last_summary_log_ts >= 1.5
+        summary_due = now - self._last_summary_log_ts >= 2.0
         if summary_due or summary_payload != self._last_summary_payload:
             self._last_summary_log_ts = now
             self._last_summary_payload = summary_payload
             ws_age_label = ws_age_ms if ws_age_ms is not None else "?"
             http_age_label = http_age_ms if http_age_ms is not None else "?"
-            ws_state = "up" if self._ws_connected else "down"
             self._log_queue.append(
                 "[DATA_SUMMARY] "
                 f"ws_state={ws_state} last_reason={self._last_switch_reason} "
