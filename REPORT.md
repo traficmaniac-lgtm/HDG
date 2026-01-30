@@ -16,3 +16,6 @@
     - C) Simulate sharp price jump → UI stays responsive; reconcile recovers without SAFE_STOP loop.
     - D) Force exit timeout without SL breach → verify no emergency market; cross attempts occur; market only after SL breach.
     - E) Check UI log: responsive, last 500 lines retained, INFO_EVENT/major INFO only; debug spam in logs/debug.log.
+- 0.7.30.5: Sessionized log folders with size-rotated, gz-compressed app/debug logs and buffered flushes to reduce UI lag.
+  - Logs live in logs/sessions/{SESSION_ID}/ with app.log, debug.log, and session.json (version/symbol/mode/start_time).
+  - Rotation: app.log 5 MB (keep 3), debug.log 10 MB (keep 5), rotated parts compressed as .gz.
