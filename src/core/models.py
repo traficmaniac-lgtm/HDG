@@ -60,6 +60,8 @@ class Settings:
     max_budget: float
     budget_reserve: float
     verbose_ui_log: bool = False
+    tp_missing_watchdog_ms: int = 1500
+    idle_guard_ms: int = 6000
 
 
 @dataclass

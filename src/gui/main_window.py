@@ -788,6 +788,15 @@ class MainWindow(QMainWindow):
                 "RECOVERY",
                 "RECONCILE",
                 "SAFE_STOP",
+                "ARM_ENTRY",
+                "WAIT_ENTRY_FILL",
+                "ARM_EXIT",
+                "WAIT_EXIT",
+                "FINALIZE_DEAL",
+                "NEXT_DEAL",
+                "STOPPING",
+                "STOPPED",
+                "ERROR",
             }
             if not in_position and not self._router.is_ws_stale():
                 return

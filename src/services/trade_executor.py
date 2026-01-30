@@ -35,6 +35,19 @@ class TradeState(Enum):
     STATE_ERROR = "ERROR"
 
 
+class PipelineState(Enum):
+    IDLE = "IDLE"
+    ARM_ENTRY = "ARM_ENTRY"
+    WAIT_ENTRY_FILL = "WAIT_ENTRY_FILL"
+    ARM_EXIT = "ARM_EXIT"
+    WAIT_EXIT = "WAIT_EXIT"
+    FINALIZE_DEAL = "FINALIZE_DEAL"
+    NEXT_DEAL = "NEXT_DEAL"
+    STOPPING = "STOPPING"
+    STOPPED = "STOPPED"
+    ERROR = "ERROR"
+
+
 class TradeExecutor:
     TAG = "PRE_V0_8_0"
     PRICE_MOVE_TICK_THRESHOLD = 1
@@ -50,7 +63,7 @@ class TradeExecutor:
     HARD_STALL_MS = 20000
     EXIT_CROSS_MAX_ATTEMPTS = 3
     EXIT_STATUS_MISSING_MS = 3500
-    EXIT_SL_EMERGENCY_TICKS = 1
+    EXIT_SL_EMERGENCY_TICKS = 0
     MAX_TP_ORDERS = 5
 
     def __init__(
@@ -119,6 +132,7 @@ class TradeExecutor:
         self._last_place_error_code: Optional[int] = None
         self._last_place_error_msg: Optional[str] = None
         self.state = TradeState.STATE_IDLE
+        self._pipeline_state = PipelineState.IDLE
         self._cycle_id_counter = 0
         self._current_cycle_id: Optional[int] = None
         self._processed_fill_keys: set[tuple[object, ...]] = set()
@@ -180,6 +194,7 @@ class TradeExecutor:
         self._entry_missing_since_ts: Optional[float] = None
         self._exit_missing_since_ts: Optional[float] = None
         self._data_blind_since_ts: Optional[float] = None
+        self._tp_missing_since_ts: Optional[float] = None
         self._wait_state_kind: Optional[str] = None
         self._wait_state_enter_ts_ms: Optional[int] = None
         self._wait_state_deadline_ms: Optional[int] = None
@@ -285,7 +300,7 @@ class TradeExecutor:
         deal = self.ledger.deals_by_cycle_id.get(cycle_id or -1)
         deal_label = deal.deal_id if deal else cycle_id
         self._logger(
-            f"[ENTRY_FILL] deal={deal_label} qty={qty:.8f} price={price:.8f}"
+            f"[ENTRY_FILL_APPLY] deal={deal_label} qty={qty:.8f} price={price:.8f}"
         )
 
     def _log_tp_place(
@@ -306,7 +321,7 @@ class TradeExecutor:
         deal = self.ledger.deals_by_cycle_id.get(cycle_id or -1)
         deal_label = deal.deal_id if deal else cycle_id
         self._logger(
-            f"[TP_FILL] deal={deal_label} qty={qty:.8f} price={price:.8f}"
+            f"[TP_FILL_APPLY] deal={deal_label} qty={qty:.8f} price={price:.8f}"
         )
 
     def _log_tp_skip_dup(self, cycle_id: Optional[int], tp_key: tuple[object, ...]) -> None:
@@ -535,6 +550,7 @@ class TradeExecutor:
         self._log_sl_sync(exchange_qty)
         if exchange_qty <= tolerance:
             self._sl_close_retries = 0
+            self._logger("[SL_DONE] exchange_qty=0")
             return True
         max_retries = 2
         while exchange_qty > tolerance and self._sl_close_retries < max_retries:
@@ -621,31 +637,28 @@ class TradeExecutor:
 
     def _tp_price_from_book(
         self,
+        entry_avg: Optional[float],
         best_bid: Optional[float],
         best_ask: Optional[float],
     ) -> Optional[float]:
         tick_size = self._profile.tick_size
         if tick_size is None or tick_size <= 0:
             return None
-        ticks = int(self._settings.take_profit_ticks)
-        if ticks <= 0:
+        tp_trigger, _ = self._compute_tp_sl_prices(entry_avg)
+        if tp_trigger is None:
             return None
         if self._position_side() == "SHORT":
-            if best_bid is None:
-                return None
-            target_price = best_bid - (ticks * tick_size)
-            raw_price = min(best_bid, target_price)
-        else:
-            if best_ask is None:
-                return None
-            target_price = best_ask + (ticks * tick_size)
-            raw_price = max(best_ask, target_price)
-        return self._round_to_step(raw_price, tick_size)
+            raw_price = tp_trigger if best_bid is None else min(best_bid, tp_trigger)
+            return self._round_to_tick(raw_price, tick_size, mode="DOWN")
+        raw_price = tp_trigger if best_ask is None else max(best_ask, tp_trigger)
+        return self._round_to_tick(raw_price, tick_size, mode="UP")
 
     def _place_tp_for_fill(self, fill_qty: float, price_state: PriceState) -> None:
         if fill_qty <= 0:
             return
         if self._normalize_exit_intent(self.exit_intent or "") == "SL":
+            return
+        if self._executed_qty_total <= self._epsilon_qty():
             return
         if not self._can_trade_now(
             price_state,
@@ -654,7 +667,8 @@ class TradeExecutor:
         ):
             return
         best_bid, best_ask = self._book_refs(price_state)
-        tp_price = self._tp_price_from_book(best_bid, best_ask)
+        entry_avg = self._entry_avg_price or self.get_buy_price()
+        tp_price = self._tp_price_from_book(entry_avg, best_bid, best_ask)
         if tp_price is None:
             return
         remaining_qty = self._resolve_remaining_qty_raw()
@@ -680,6 +694,8 @@ class TradeExecutor:
             ref_bid=best_bid,
             ref_ask=best_ask,
         )
+        if placed:
+            self._transition_pipeline_state(PipelineState.WAIT_EXIT, reason="tp_placed")
         if placed and self._entry_order_active():
             self._transition_to_position_state()
 
@@ -783,6 +799,8 @@ class TradeExecutor:
         return "best_ask" if self._direction == "SHORT" else "best_bid"
 
     def get_state_label(self) -> str:
+        if self._pipeline_state is not None:
+            return self._pipeline_state.value
         return self.state.value
 
     def get_entry_side(self) -> str:
@@ -1775,7 +1793,7 @@ class TradeExecutor:
             return True
         return False
 
-    def _transition_state(self, next_state: TradeState) -> None:
+    def _transition_state(self, next_state: TradeState, reason: str = "auto") -> None:
         if self.state == next_state:
             return
         previous = self.state
@@ -1798,7 +1816,15 @@ class TradeExecutor:
             TradeState.STATE_SAFE_STOP,
         }
         self._mark_progress(reason=f"state:{previous.value}->{next_state.value}", reset_reconcile=reset_reconcile)
-        self._logger(f"[STATE] {previous.value} → {next_state.value}")
+        self._logger(
+            f"[STATE] from={previous.value} to={next_state.value} reason={reason}"
+        )
+        if next_state == TradeState.STATE_STOPPING:
+            self._transition_pipeline_state(PipelineState.STOPPING, reason="state")
+        elif next_state == TradeState.STATE_STOPPED:
+            self._transition_pipeline_state(PipelineState.STOPPED, reason="state")
+        elif next_state == TradeState.STATE_ERROR:
+            self._transition_pipeline_state(PipelineState.ERROR, reason="state")
         if next_state == TradeState.STATE_ERROR:
             self.ledger.mark_error(notes="STATE_ERROR")
 
@@ -1830,6 +1856,18 @@ class TradeExecutor:
             TradeState.STATE_EXIT_SL_WORKING,
             TradeState.STATE_RECOVERY,
         }
+
+    def _transition_pipeline_state(
+        self, next_state: PipelineState, reason: str = "auto"
+    ) -> None:
+        if self._pipeline_state == next_state:
+            return
+        previous = self._pipeline_state
+        self._pipeline_state = next_state
+        prev_label = previous.value if previous else "—"
+        self._logger(
+            f"[FSM] from={prev_label} to={next_state.value} reason={reason}"
+        )
 
     def _cycle_id_label(self) -> str:
         return "—" if self._current_cycle_id is None else str(self._current_cycle_id)
@@ -1960,10 +1998,16 @@ class TradeExecutor:
             return ("trade", trade_id)
         if order_id is None:
             return None
+        qty_key = qty
+        price_key = price
+        if self._profile.step_size and self._profile.step_size > 0:
+            qty_key = self._round_down(qty, self._profile.step_size)
+        if self._profile.tick_size and self._profile.tick_size > 0:
+            price_key = self._round_to_tick(price, self._profile.tick_size)
         return (
             int(order_id),
-            float(qty),
-            float(price),
+            float(qty_key),
+            float(price_key),
             self._fill_dedupe_bucket(ts_ms),
         )
 
@@ -2797,6 +2841,14 @@ class TradeExecutor:
             return 0
         self._set_direction(direction)
         self._logger(f"[START] {self._direction_tag()}")
+        self._logger(
+            "[PARAMS] "
+            f"dir={self._direction} target_usd={float(self._settings.order_quote):.8f} "
+            f"max_budget={float(self._settings.max_budget):.8f} "
+            f"reserve={float(self._settings.budget_reserve):.8f} "
+            f"tp_ticks={int(self._settings.take_profit_ticks)} "
+            f"sl_ticks={int(self._settings.stop_loss_ticks)}"
+        )
         if self.state not in {TradeState.STATE_IDLE, TradeState.STATE_STOPPED}:
             self._logger(f"[START_IGNORED] reason=state={self.state.value}")
             self._clear_start_inflight()
@@ -2808,6 +2860,7 @@ class TradeExecutor:
         self.cycles_done = 0
         self.cycles_target = self._normalize_cycle_target(self._settings.cycle_count)
         self._next_cycle_ready_ts = None
+        self._transition_pipeline_state(PipelineState.ARM_ENTRY, reason="start_run")
         placed = self._attempt_cycle_start()
         if not placed:
             self._clear_start_inflight()
@@ -2934,6 +2987,7 @@ class TradeExecutor:
     def _attempt_cycle_start(self) -> int:
         if self.state != TradeState.STATE_IDLE:
             return 0
+        self._transition_pipeline_state(PipelineState.ARM_ENTRY, reason="attempt_cycle_start")
         if self._entry_blocked_by_active_position():
             return 0
         if not self._purge_open_orders_before_cycle():
@@ -2987,20 +3041,24 @@ class TradeExecutor:
         if not self.run_active:
             self._next_cycle_ready_ts = None
             self._logger("[CYCLE] done -> auto_next state=IDLE reason=stop_requested")
+            self._transition_pipeline_state(PipelineState.IDLE, reason="stop_requested")
             return
         if not self._is_continuous_run() and self.cycles_done >= self.cycles_target:
             self.run_active = False
             self._next_cycle_ready_ts = None
             self._logger("[CYCLE] done -> auto_next state=IDLE reason=target_reached")
+            self._transition_pipeline_state(PipelineState.IDLE, reason="target_reached")
             return
         price_state, _ = self._router.build_price_state()
         if price_state.data_blind:
             self._next_cycle_ready_ts = time.monotonic() + self._cycle_cooldown_s
             self._logger("[CYCLE] done -> auto_next state=IDLE reason=data_blind")
+            self._transition_pipeline_state(PipelineState.NEXT_DEAL, reason="data_blind")
             return
         if self._next_cycle_ready_ts is None:
             self._next_cycle_ready_ts = time.monotonic() + self._cycle_cooldown_s
         self._logger("[CYCLE] done -> auto_next state=IDLE")
+        self._transition_pipeline_state(PipelineState.NEXT_DEAL, reason="auto_next")
 
     def close_position(self) -> int:
         if self._inflight_trade_action:
@@ -3038,6 +3096,7 @@ class TradeExecutor:
             return
         self._watchdog_inflight()
         price_state, health_state = self._router.build_price_state()
+        self._watchdog_exit_arm(price_state)
         if self._dust_accumulate and not self._entry_order_active():
             remaining_qty = self._remaining_qty
             if remaining_qty > self._epsilon_qty():
@@ -3466,6 +3525,41 @@ class TradeExecutor:
         if configured <= 0:
             configured = 8000
         return self._clamp_int(configured, 6000, 9000)
+
+    def _resolve_tp_watchdog_ms(self) -> int:
+        configured = int(
+            getattr(self._settings, "tp_missing_watchdog_ms", 1500) or 1500
+        )
+        return self._clamp_int(configured, 250, 20000)
+
+    def _watchdog_exit_arm(self, price_state: PriceState) -> None:
+        executed_qty = self.get_executed_qty_total()
+        remaining_qty = self._resolve_remaining_qty_raw()
+        if executed_qty <= self._epsilon_qty() or remaining_qty <= self._epsilon_qty():
+            self._tp_missing_since_ts = None
+            return
+        if self._normalize_exit_intent(self.exit_intent or "") == "SL":
+            self._tp_missing_since_ts = None
+            return
+        if self._count_active_tp_orders() > 0:
+            self._tp_missing_since_ts = None
+            return
+        now = time.monotonic()
+        if self._tp_missing_since_ts is None:
+            self._tp_missing_since_ts = now
+            return
+        elapsed_ms = int((now - self._tp_missing_since_ts) * 1000.0)
+        watchdog_ms = self._resolve_tp_watchdog_ms()
+        if elapsed_ms < watchdog_ms:
+            return
+        self._logger(
+            "[WATCHDOG_EXIT_ARM] "
+            f"deal={self._resolve_deal_id(self._current_cycle_id)} "
+            f"reason=no_tp_active exec={executed_qty:.8f} rem={remaining_qty:.8f}"
+        )
+        self._transition_pipeline_state(PipelineState.ARM_EXIT, reason="tp_watchdog")
+        self._place_tp_for_fill(remaining_qty, price_state)
+        self._tp_missing_since_ts = now
 
     def _book_refs(self, price_state: PriceState) -> tuple[Optional[float], Optional[float]]:
         bid = self.get_best_bid(price_state)
@@ -4368,6 +4462,9 @@ class TradeExecutor:
                     f"[ORDER] {exit_side} placed cycle_id={cycle_label} qty={qty:.8f} "
                     f"price={price_label} id={exit_order_id}"
                 )
+            self._transition_pipeline_state(
+                PipelineState.WAIT_EXIT, reason=f"exit_place:{reason_upper}"
+            )
             self._transition_state(self._exit_state_for_intent(intent))
             if reset_retry:
                 self._reset_sell_retry()
@@ -5051,6 +5148,10 @@ class TradeExecutor:
             f"[ORDER] {entry_side} placed cycle_id={cycle_label} qty={qty:.8f} "
             f"price={new_price:.8f} id={entry_order.get('orderId')}"
         )
+        self._logger(
+            f"[ENTRY_PLACE] cycle_id={cycle_label} side={entry_side} "
+            f"price={new_price:.8f} qty={qty:.8f} reason={reason}"
+        )
         if reason == "deadline_replace":
             self._logger(
                 f"[ENTRY] {self._direction_tag()} replaced cycle_id={cycle_label} price={new_price:.8f}"
@@ -5079,6 +5180,9 @@ class TradeExecutor:
                 "role": "ENTRY",
             }
         ]
+        self._transition_pipeline_state(
+            PipelineState.WAIT_ENTRY_FILL, reason="entry_placed"
+        )
         self.entry_active_order_id = entry_order.get("orderId")
         self.entry_active_price = new_price
         self.entry_cancel_pending = False
@@ -5614,6 +5718,23 @@ class TradeExecutor:
             self._sell_inflight_deadline_ts = None
             self._refresh_after_watchdog()
 
+    def _maybe_idle_guard(self, now: float) -> None:
+        if self._wait_state_kind is None or self._wait_state_enter_ts_ms is None:
+            return
+        idle_guard_ms = int(getattr(self._settings, "idle_guard_ms", 6000) or 6000)
+        age_ms = int(now * 1000) - self._wait_state_enter_ts_ms
+        if age_ms < idle_guard_ms:
+            return
+        if self._should_dedup_log(f"idle_guard:{self._wait_state_kind}", 2.0):
+            return
+        self._logger(
+            "[IDLE_GUARD] "
+            f"wait={self._wait_state_kind} age_ms={age_ms} "
+            f"state={self.state.value} last_progress={self._last_progress_reason} "
+            f"entry_active={self._entry_order_active()} "
+            f"exit_active={self._has_active_order(self._exit_side())}"
+        )
+
     def watchdog_tick(self) -> bool:
         if self._reconcile_inflight or self._safe_stop_issued:
             return False
@@ -5626,6 +5747,7 @@ class TradeExecutor:
         }:
             return False
         now = time.monotonic()
+        self._maybe_idle_guard(now)
         if self._check_wait_deadline(now):
             return True
         if self._check_progress_deadline(now):
@@ -6988,6 +7110,9 @@ class TradeExecutor:
             self._sync_cycle_qty_from_ledger(cycle_id)
             self._log_fill_applied(meta, qty, float(price))
             self._log_entry_fill(cycle_id, qty, float(price))
+            self._transition_pipeline_state(
+                PipelineState.ARM_EXIT, reason="entry_partial_fill"
+            )
             price_state, _ = self._router.build_price_state()
             self._place_tp_for_fill(qty, price_state)
         self._update_registry_status_by_order(order_id, "PARTIAL", qty)
@@ -7333,6 +7458,7 @@ class TradeExecutor:
     def _sync_sell_for_partial(self, delta_qty: float, allow_replace: bool = True) -> tuple[str, float]:
         if delta_qty <= 0:
             return "SKIP_EMPTY", 0.0
+        self._transition_pipeline_state(PipelineState.ARM_EXIT, reason="entry_fill")
         self._reconcile_position_from_fills()
         if self._adaptive_mode:
             price_state, _ = self._router.build_price_state()
@@ -7437,6 +7563,31 @@ class TradeExecutor:
         buy_price: Optional[float],
         cycle_id: Optional[int],
     ) -> None:
+        cycle = self.ledger.get_cycle(cycle_id)
+        remaining_qty = (
+            cycle.remaining_qty
+            if cycle and cycle.status == CycleStatus.OPEN
+            else self._remaining_qty
+        )
+        tolerance = self._get_step_size_tolerance()
+        if remaining_qty > tolerance:
+            self._logger(
+                "[DEAL_CLOSE_BLOCKED] "
+                f"reason=remaining qty={remaining_qty:.8f} tolerance={tolerance:.8f}"
+            )
+            self._transition_pipeline_state(PipelineState.WAIT_EXIT, reason="remaining")
+            self._transition_to_position_state()
+            return
+        exchange_qty = self._resolve_exchange_qty(self._get_base_balance_snapshot())
+        if exchange_qty > tolerance:
+            self._logger(
+                "[DEAL_CLOSE_BLOCKED] "
+                f"reason=exchange_qty qty={exchange_qty:.8f} tolerance={tolerance:.8f}"
+            )
+            self._restore_position_from_exchange(exchange_qty, entry_avg=self._entry_avg_price)
+            self._transition_pipeline_state(PipelineState.ARM_EXIT, reason="exchange_qty")
+            self._transition_to_position_state()
+            return
         if reason == "SL_HARD":
             self.losses += 1
         elif pnl is not None:
@@ -7449,6 +7600,7 @@ class TradeExecutor:
             notion = buy_price * qty
             if notion > 0:
                 pnl_bps = (pnl / notion) * 10000
+        self._transition_pipeline_state(PipelineState.FINALIZE_DEAL, reason=reason)
         self._log_cycle_close(cycle_id, pnl, pnl_bps, reason)
         self.ledger.close_cycle(cycle_id, notes=reason)
         duration_ms = None
