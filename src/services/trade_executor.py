@@ -3796,6 +3796,14 @@ class TradeExecutor:
             return TradeExecutor._round_to_step(raw_price, tick_size)
         return tp_price
 
+    def _tp_hybrid_params(self) -> tuple[int, int, int]:
+        tp_max_age_ms = int(getattr(self._settings, "tp_max_age_ms", 400) or 400)
+        tp_cross_after_ms = int(
+            getattr(self._settings, "tp_cross_after_ms", 900) or 900
+        )
+        tp_cross_ticks = int(getattr(self._settings, "tp_cross_ticks", 0) or 0)
+        return tp_max_age_ms, tp_cross_after_ms, tp_cross_ticks
+
     def _compute_tp_cross_price(
         self,
         bid: Optional[float],
