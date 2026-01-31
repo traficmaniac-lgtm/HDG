@@ -47,6 +47,7 @@ OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "output")
 
 @dataclass
 class WorkerResult:
+    job: str
     df: pd.DataFrame
 
 
@@ -55,8 +56,9 @@ class Worker(QObject):
     errored = Signal(str)
     status = Signal(str)
 
-    def __init__(self, func: Callable[[Callable[[str], None]], pd.DataFrame]) -> None:
+    def __init__(self, job: str, func: Callable[[Callable[[str], None]], pd.DataFrame]) -> None:
         super().__init__()
+        self.job = job
         self.func = func
 
     def run(self) -> None:
@@ -65,7 +67,7 @@ class Worker(QObject):
         except Exception as exc:  # noqa: BLE001
             self.errored.emit(str(exc))
             return
-        self.finished.emit(WorkerResult(result))
+        self.finished.emit(WorkerResult(self.job, result))
 
 
 class RadarWindow(QMainWindow):
@@ -163,6 +165,8 @@ class RadarWindow(QMainWindow):
         self.setCentralWidget(container)
 
         self._active_thread: Optional[QThread] = None
+        self._active_worker: Optional[Worker] = None
+        self._active_job: Optional[str] = None
 
     def update_status(self, message: str) -> None:
         timestamp = time.strftime("%H:%M:%S")
@@ -230,12 +234,12 @@ class RadarWindow(QMainWindow):
                 if item is not None:
                     item.setBackground(color)
 
-    def _start_worker(self, func: Callable[[Callable[[str], None]], pd.DataFrame]) -> None:
+    def _start_worker(self, job: str, func: Callable[[Callable[[str], None]], pd.DataFrame]) -> None:
         if self._active_thread is not None and self._active_thread.isRunning():
             self.update_status("Worker already running")
             return
         thread = QThread()
-        worker = Worker(func)
+        worker = Worker(job, func)
         worker.moveToThread(thread)
         worker.finished.connect(self._on_worker_finished)
         worker.errored.connect(self._on_worker_error)
@@ -247,16 +251,46 @@ class RadarWindow(QMainWindow):
         worker.errored.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
         self._active_thread = thread
+        self._active_worker = worker
+        self._active_job = job
+        self._set_worker_buttons_enabled(False)
         thread.start()
 
     def _on_worker_finished(self, result: WorkerResult) -> None:
         self._active_thread = None
-        self.update_status("Done")
+        self._active_worker = None
+        self._active_job = None
+        self._set_worker_buttons_enabled(True)
+
+        if result.job == "build_universe":
+            self.universe_df = result.df
+            self.candidates_df = pd.DataFrame()
+            self.results_df = pd.DataFrame()
+            self.show_dataframe(self.universe_df)
+            self.plot_canvas.update_plot(None)
+            self.update_status(f"Universe ready: {len(self.universe_df)} pairs")
+            return
+
+        if result.job == "enrich":
+            self.results_df = result.df
+            self.show_dataframe(self.results_df)
+            self.plot_canvas.update_plot(None)
+            self.update_status(f"Enrichment complete: {len(self.results_df)} tokens")
+            return
+
         self.show_dataframe(result.df)
+        self.update_status("Done")
 
     def _on_worker_error(self, error: str) -> None:
         self._active_thread = None
+        self._active_worker = None
+        self._active_job = None
+        self._set_worker_buttons_enabled(True)
         self.update_status(f"Error: {error}")
+
+    def _set_worker_buttons_enabled(self, enabled: bool) -> None:
+        self.build_button.setEnabled(enabled)
+        self.enrich_button.setEnabled(enabled)
 
     def handle_build_universe(self) -> None:
         min_liq = self._get_float(self.min_liq_input, DEFAULT_MIN_LIQ)
@@ -276,14 +310,10 @@ class RadarWindow(QMainWindow):
                 exclude_stable_pairs=exclude_stable,
                 status_callback=status_callback,
             )
-            self.universe_df = frame
-            self.candidates_df = pd.DataFrame()
-            self.results_df = pd.DataFrame()
-            self.plot_canvas.update_plot(None)
             status_callback(f"Universe ready: {len(frame)} pairs")
             return frame
 
-        self._start_worker(task)
+        self._start_worker("build_universe", task)
 
     def handle_select_candidates(self) -> None:
         if self.universe_df.empty:
@@ -325,12 +355,11 @@ class RadarWindow(QMainWindow):
                 config,
                 status_callback=status_callback,
             )
-            self.results_df = apply_signals(enriched, lookback)
-            status_callback(f"Enrichment complete: {len(self.results_df)} tokens")
-            self.plot_canvas.update_plot(None)
-            return self.results_df
+            result = apply_signals(enriched, lookback)
+            status_callback(f"Enrichment complete: {len(result)} tokens")
+            return result
 
-        self._start_worker(task)
+        self._start_worker("enrich", task)
 
     def _selected_row(self) -> Optional[dict]:
         frame = self._current_df()
