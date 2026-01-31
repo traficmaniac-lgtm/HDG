@@ -1,9 +1,48 @@
+import faulthandler
 import json
 import os
 import sys
+import threading
 import time
+import traceback
 from dataclasses import dataclass
 from typing import Callable, Optional
+
+LOG_DIR = os.path.join(os.path.dirname(__file__), "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+CRASH_JOURNAL = os.path.join(LOG_DIR, "crash_journal.txt")
+CRASH_TRACE = os.path.join(LOG_DIR, "faulthandler.log")
+
+
+def journal(msg: str) -> None:
+    try:
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        with open(CRASH_JOURNAL, "a", encoding="utf-8") as f:
+            f.write(f"[{ts}] {msg}\n")
+            f.flush()
+    except Exception:
+        pass
+
+
+try:
+    _crash_trace_file = open(CRASH_TRACE, "a", buffering=1, encoding="utf-8")
+    faulthandler.enable(file=_crash_trace_file, all_threads=True)
+    journal("faulthandler enabled")
+except Exception as e:
+    journal(f"faulthandler enable failed: {e}")
+
+
+def excepthook(exctype, value, tb):
+    journal("UNCAUGHT PYTHON EXCEPTION:")
+    journal("".join(traceback.format_exception(exctype, value, tb)))
+    sys.__excepthook__(exctype, value, tb)
+
+
+sys.excepthook = excepthook
+
+# Force matplotlib backend early (Qt6)
+os.environ.setdefault("MPLBACKEND", "qtagg")
+journal(f"MPLBACKEND={os.environ.get('MPLBACKEND')}")
 
 import pandas as pd
 import requests
@@ -62,6 +101,7 @@ class Worker(QObject):
         self.func = func
 
     def run(self) -> None:
+        journal(f"WORKER START job={self.job} thread={threading.current_thread().name}")
         try:
             result = self.func(self.status.emit)
         except Exception as exc:  # noqa: BLE001
@@ -172,6 +212,7 @@ class RadarWindow(QMainWindow):
         timestamp = time.strftime("%H:%M:%S")
         self.status_bar.showMessage(message)
         self.log_output.append(f"[{timestamp}] {message}")
+        journal(f"STATUS thread={threading.current_thread().name}: {message}")
         QApplication.processEvents()
 
     def _get_int(self, field: QLineEdit, default: int) -> int:
@@ -239,6 +280,7 @@ class RadarWindow(QMainWindow):
             self.update_status("Worker already running")
             return
 
+        journal(f"WORKER QUEUED job={job} thread={threading.current_thread().name}")
         thread = QThread()
         worker = Worker(job, func)
         worker.moveToThread(thread)
@@ -265,6 +307,7 @@ class RadarWindow(QMainWindow):
         self._active_thread = None
         self._active_worker = None
         self._active_job = None
+        journal(f"WORKER FINISHED job={result.job} rows={len(result.df)}")
 
         if result.job == "build_universe":
             self.universe_df = result.df
@@ -289,9 +332,11 @@ class RadarWindow(QMainWindow):
         self._active_thread = None
         self._active_worker = None
         self._active_job = None
+        journal(f"WORKER ERROR: {error}")
         self.update_status(f"ERROR: {error}")
 
     def handle_build_universe(self) -> None:
+        journal("CLICK: Build Universe")
         min_liq = self._get_float(self.min_liq_input, DEFAULT_MIN_LIQ)
         min_vol = self._get_float(self.min_vol_input, DEFAULT_MIN_VOL_1H)
         target = self._get_int(self.universe_target_input, DEFAULT_UNIVERSE_TARGET)
@@ -315,6 +360,7 @@ class RadarWindow(QMainWindow):
         self._start_worker("build_universe", task)
 
     def handle_select_candidates(self) -> None:
+        journal("CLICK: Select Candidates")
         if self.universe_df.empty:
             self.update_status("Build universe first")
             return
@@ -329,6 +375,7 @@ class RadarWindow(QMainWindow):
         self.plot_canvas.update_plot(None)
 
     def handle_enrich(self) -> None:
+        journal("CLICK: Enrich Onchain")
         if self.candidates_df.empty:
             self.update_status("Select candidates first")
             return
@@ -378,6 +425,7 @@ class RadarWindow(QMainWindow):
         if row_data is None:
             self.update_status("Select a row first")
             return
+        journal("TABLE: row selected -> plot")
         self.plot_canvas.update_plot(row_data)
         self.update_status("Plot updated")
 
