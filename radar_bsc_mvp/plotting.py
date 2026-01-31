@@ -1,6 +1,6 @@
 from typing import Optional
 
-from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 
 
@@ -54,7 +54,10 @@ def update_summary_plot(fig: Figure, row: Optional[dict]) -> None:
     fig.clear()
     axes = fig.subplots(3, 1)
     if row is None:
-        fig.canvas.draw_idle()
+        try:
+            fig.canvas.draw_idle()
+        except Exception:
+            pass
         return
 
     _plot_snapshot(axes[0], row)
@@ -68,7 +71,10 @@ def update_summary_plot(fig: Figure, row: Optional[dict]) -> None:
     for ax in axes:
         ax.grid(alpha=0.2)
 
-    fig.canvas.draw_idle()
+    try:
+        fig.canvas.draw_idle()
+    except Exception:
+        pass
 
 
 class PlotCanvas(FigureCanvas):
