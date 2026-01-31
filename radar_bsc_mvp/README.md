@@ -1,28 +1,33 @@
-# BSC Radar MVP (v0.3.0)
+# BSC Radar MVP v0.2.0 (DexScreener + BSC RPC)
 
-Desktop PySide6 app that builds a rolling DexScreener universe, selects candidates, enriches with BSC onchain Transfer logs, and generates simple signals with charts.
+Desktop GUI app that builds a DexScreener universe, selects candidates, enriches with BSC onchain Transfer logs, and plots signals.
 
-## Install
+## Key features
 
-```bash
-pip install PySide6 requests pandas matplotlib python-dateutil
-```
+- Correct DexScreener endpoints (`/latest/dex/search`, `/latest/dex/pairs/{chain}/{pair}`)
+- Separate DexScreener base URL + BSC RPC URL inputs
+- Simple signal scoring (HOT/WARM/NEUTRAL/RISKY) with color tags
+- Saves CSV/JSONL to `radar_bsc_mvp/output/` with timestamps
 
-## Run (PowerShell)
+## Windows запуск
 
 ```powershell
-./run.ps1
+cd $env:USERPROFILE\Desktop\HDG\radar_bsc_mvp
+py -m venv .venv
+.\.venv\Scripts\activate
+pip install -r requirements.txt
+python app.py
 ```
 
 ## Typical workflow
 
-1. **Build Universe** (pulls DexScreener `/latest/dex/pairs`, filters BSC + liquidity/volume).
-2. **Select Candidates** (Top-N composite score).
-3. **Enrich Onchain** (BSC RPC `eth_getLogs` Transfer events).
-4. **Save CSV** or **Save JSONL**.
+1. **Build Universe** (DexScreener search по запросам: usdt bsc, wbnb bsc, busd bsc, pancakeswap bsc, meme bsc, ai bsc, trending bsc)
+2. **Select Candidates** (фильтр по min liquidity / min volume + Top N)
+3. **Enrich Onchain** (BSC RPC `eth_getLogs` Transfer события)
+4. **Plot Selected** (графики для выбранной строки)
+5. **Save CSV / Save JSONL** (в `output/`)
 
 ## Notes
 
-- Universe uses rolling polling to avoid 404 and collect 300–600 unique BSC pairs.
-- If RPC rate limits, reduce **Top N** and/or **Lookback minutes**.
-- Signals are simple: TX_SPIKE, VOL_SPIKE, PRICE_MOVE, HOT, RISK.
+- DexScreener отдаёт snapshot-данные; график цены рисуется в snapshot-режиме.
+- Если RPC начинает ограничивать, уменьшите Top N, Lookback minutes, или Max logs per token.

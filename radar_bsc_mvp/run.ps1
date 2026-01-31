@@ -1,8 +1,8 @@
 Set-Location -Path $PSScriptRoot
 
-python -m pip install PySide6 requests pandas matplotlib python-dateutil
+python -m pip install -r requirements.txt
 
-python radar_app.py
+python app.py
 if ($LASTEXITCODE -ne 0) {
     Write-Host "App exited with code $LASTEXITCODE"
     Pause
