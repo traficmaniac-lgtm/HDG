@@ -235,32 +235,36 @@ class RadarWindow(QMainWindow):
                     item.setBackground(color)
 
     def _start_worker(self, job: str, func: Callable[[Callable[[str], None]], pd.DataFrame]) -> None:
-        if self._active_thread is not None and self._active_thread.isRunning():
+        if self._active_thread and self._active_thread.isRunning():
             self.update_status("Worker already running")
             return
+
         thread = QThread()
         worker = Worker(job, func)
         worker.moveToThread(thread)
+
+        self._active_thread = thread
+        self._active_worker = worker
+        self._active_job = job
+
+        thread.started.connect(worker.run)
         worker.finished.connect(self._on_worker_finished)
         worker.errored.connect(self._on_worker_error)
-        worker.status.connect(self.update_status)
-        thread.started.connect(worker.run)
+
         worker.finished.connect(thread.quit)
         worker.errored.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
         worker.errored.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
-        self._active_thread = thread
-        self._active_worker = worker
-        self._active_job = job
-        self._set_worker_buttons_enabled(False)
+
+        worker.status.connect(self.update_status)
+
         thread.start()
 
     def _on_worker_finished(self, result: WorkerResult) -> None:
         self._active_thread = None
         self._active_worker = None
         self._active_job = None
-        self._set_worker_buttons_enabled(True)
 
         if result.job == "build_universe":
             self.universe_df = result.df
@@ -268,14 +272,14 @@ class RadarWindow(QMainWindow):
             self.results_df = pd.DataFrame()
             self.show_dataframe(self.universe_df)
             self.plot_canvas.update_plot(None)
-            self.update_status(f"Universe ready: {len(self.universe_df)} pairs")
+            self.update_status(f"Universe ready: {len(self.universe_df)}")
             return
 
         if result.job == "enrich":
             self.results_df = result.df
             self.show_dataframe(self.results_df)
             self.plot_canvas.update_plot(None)
-            self.update_status(f"Enrichment complete: {len(self.results_df)} tokens")
+            self.update_status(f"Enrich done: {len(self.results_df)}")
             return
 
         self.show_dataframe(result.df)
@@ -285,12 +289,7 @@ class RadarWindow(QMainWindow):
         self._active_thread = None
         self._active_worker = None
         self._active_job = None
-        self._set_worker_buttons_enabled(True)
-        self.update_status(f"Error: {error}")
-
-    def _set_worker_buttons_enabled(self, enabled: bool) -> None:
-        self.build_button.setEnabled(enabled)
-        self.enrich_button.setEnabled(enabled)
+        self.update_status(f"ERROR: {error}")
 
     def handle_build_universe(self) -> None:
         min_liq = self._get_float(self.min_liq_input, DEFAULT_MIN_LIQ)
@@ -310,7 +309,7 @@ class RadarWindow(QMainWindow):
                 exclude_stable_pairs=exclude_stable,
                 status_callback=status_callback,
             )
-            status_callback(f"Universe ready: {len(frame)} pairs")
+            status_callback(f"Universe built: {len(frame)}")
             return frame
 
         self._start_worker("build_universe", task)
@@ -347,7 +346,7 @@ class RadarWindow(QMainWindow):
         )
 
         def task(status_callback: Callable[[str], None]) -> pd.DataFrame:
-            status_callback("Enriching onchain data...")
+            status_callback("Enriching onchain...")
             rpc_client = BscRpcClient(rpc_url, session=self.session)
             enriched = enrich_candidates(
                 self.candidates_df,
@@ -356,7 +355,7 @@ class RadarWindow(QMainWindow):
                 status_callback=status_callback,
             )
             result = apply_signals(enriched, lookback)
-            status_callback(f"Enrichment complete: {len(result)} tokens")
+            status_callback("Enrich finished")
             return result
 
         self._start_worker("enrich", task)
