@@ -4,10 +4,11 @@ from typing import Optional
 NO_PLOT = os.environ.get("NO_PLOT", "0") == "1"
 
 if NO_PLOT:
+    from PySide6.QtWidgets import QWidget
 
-    class PlotCanvas:
+    class PlotCanvas(QWidget):
         def __init__(self, *args, **kwargs) -> None:
-            pass
+            super().__init__()
 
         def update_plot(self, *args, **kwargs) -> None:
             pass
