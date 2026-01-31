@@ -1,3 +1,4 @@
+import atexit
 import faulthandler
 import json
 import os
@@ -43,6 +44,8 @@ sys.excepthook = excepthook
 # Force matplotlib backend early (Qt6)
 os.environ.setdefault("MPLBACKEND", "qtagg")
 journal(f"MPLBACKEND={os.environ.get('MPLBACKEND')}")
+
+atexit.register(lambda: journal("ATEXIT: python exit reached"))
 
 import pandas as pd
 import requests
@@ -275,6 +278,10 @@ class RadarWindow(QMainWindow):
                 if item is not None:
                     item.setBackground(color)
 
+    def closeEvent(self, event) -> None:  # noqa: N802
+        journal("WINDOW closeEvent fired")
+        super().closeEvent(event)
+
     def _start_worker(self, job: str, func: Callable[[Callable[[str], None]], pd.DataFrame]) -> None:
         if self._active_thread and self._active_thread.isRunning():
             self.update_status("Worker already running")
@@ -454,6 +461,7 @@ class RadarWindow(QMainWindow):
 
 def main() -> None:
     app = QApplication(sys.argv)
+    app.aboutToQuit.connect(lambda: journal("Qt aboutToQuit fired"))
     window = RadarWindow()
     window.show()
     sys.exit(app.exec())
